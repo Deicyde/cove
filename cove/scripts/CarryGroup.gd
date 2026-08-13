@@ -212,11 +212,13 @@ func _update_indicators(delta: float) -> void:
 	# label text
 	_tag.text = _agent if _agent != "shell" else ""
 	_tag.add_theme_color_override("font_color", col.lightened(0.3))
-	# aura: coloured glow behind the terminal, pulsing while busy
-	_aura.modulate = col
+	# aura: coloured glow behind the terminal, pulsing while busy. Only tint the
+	# RGB — keep the lerped alpha so it fully fades out when the agent isn't busy
+	# (otherwise it reads as a permanent grey shadow behind every terminal).
 	var pulse := 0.5 + 0.35 * sin(_t * 4.0)
 	var target_a := (pulse if _busy else 0.0)
-	_aura.modulate.a = lerp(_aura.modulate.a, target_a * 0.5, 6.0 * delta)
+	var a: float = lerp(_aura.modulate.a, target_a * 0.5, 6.0 * delta)
+	_aura.modulate = Color(col.r, col.g, col.b, a)
 	_aura.position.y = -_carry_h()
 	# attention: bouncing "!" + we let Cove pulse the border via focus
 	_bang.visible = _attention
