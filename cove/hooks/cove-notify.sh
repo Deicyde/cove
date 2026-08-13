@@ -27,19 +27,7 @@ printf '{"ts":%s,"pane":%s,"event":%s,"cwd":%s,"project":%s,"reason":%s}\n' \
   "$(jq -cn --arg v "$REASON" '$v')" \
   >> "$DIR/notify.jsonl" 2>/dev/null
 
-# Post a clickable macOS notification: clicking switches to the Cove and makes
-# its camera focus + follow this agent. Additive to notify-stop.sh's own alert.
-if command -v terminal-notifier >/dev/null 2>&1; then
-  case "$EVENT" in
-    Notification) BODY="${REASON:-needs your attention} — click to jump to it in the Cove" ;;
-    *)            BODY="ready for your input — click to jump to it in the Cove" ;;
-  esac
-  terminal-notifier \
-    -title "🐚 Cove · ${PROJECT:-termling}" \
-    -message "$BODY" \
-    -group "cove-${KITTY_WINDOW_ID}" \
-    -execute "$HOME/.claude/hooks/cove-focus.sh ${KITTY_WINDOW_ID}" \
-    >/dev/null 2>&1 &
-fi
+# The clickable macOS banner is posted by notify-stop.sh (Cove-aware), so this
+# hook only feeds the on-stage panel + camera to avoid a duplicate notification.
 
 exit 0
