@@ -1,7 +1,13 @@
 #!/usr/bin/env python
 # Build the cove GDExtension (IOSurface -> Metal -> Texture2DRD).
-# Requires godot-cpp checked out at /tmp/godot-cpp (see godot/README.md).
+# Requires godot-cpp checked out at /tmp/godot-cpp (see cove/README.md).
 import os
+from SCons.Script import ARGUMENTS
+
+# Pin a universal build so the dylib name is deterministic and always matches
+# the path in cove.gdextension (a host-arch build would produce e.g. .arm64 and
+# silently fail to load). Override with `scons arch=...` if you really need to.
+ARGUMENTS.setdefault("arch", "universal")
 
 env = SConscript("/tmp/godot-cpp/SConstruct")
 

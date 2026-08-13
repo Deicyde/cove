@@ -25,6 +25,7 @@ var _rescan_accum := 0.0
 # camera / interaction
 var _cam: Camera2D
 var _panning := false
+var _gesture_accum := 0.0     # trackpad pan-gesture steps accumulated for resize
 var _tracking_id := -1       # term id the camera is following (double-click), or -1
 var _press_group: Node2D = null
 var _press_pos := Vector2.ZERO
@@ -70,6 +71,9 @@ func _ready() -> void:
 	if ClassDB.class_exists("CoveInput"):
 		_sock = ClassDB.instantiate("CoveInput")
 		_try_connect_sock()
+		print("cove: fast input via CoveInput extension")
+	else:
+		push_warning("cove: CoveInput extension not loaded — input falls back to `kitten @ send` (slow). Check cove.gdextension / rebuild gdext.")
 	_load_layout()   # restore positions/names/camera from the previous run
 	_build_world()
 	_build_ui()
@@ -291,18 +295,37 @@ func _unhandled_input(event: InputEvent) -> void:
 				_press_group.set_lift_target(_world_mouse())
 		elif _panning:
 			_cam.position -= event.relative / _cam.zoom
+	elif event is InputEventPanGesture:
+		# macOS trackpad two-finger scroll. Over a terminal: resize it (in cell
+		# steps); over empty ground: zoom the camera toward the cursor. Wheel
+		# events don't fire for trackpads, so this is the only path on macOS.
+		var g := _group_at(_world_mouse())
+		if g != null:
+			_gesture_accum += event.delta.y
+			while _gesture_accum >= 1.5:
+				_resize_group(g, -1); _gesture_accum -= 1.5
+			while _gesture_accum <= -1.5:
+				_resize_group(g, 1); _gesture_accum += 1.5
+		else:
+			_zoom_by(pow(1.08, -event.delta.y))
+	elif event is InputEventMagnifyGesture:
+		# trackpad pinch (event.factor > 1 = fingers spreading = zoom in)
+		_zoom_by(event.factor)
 	elif event is InputEventKey and event.pressed and not event.echo:
 		_on_key(event)
 
 
-# Zoom the camera toward the given screen point.
-func _zoom_at(screen_pos: Vector2, dir: int) -> void:
+# Zoom the camera toward the cursor by a multiplicative factor (>1 zooms in).
+func _zoom_by(factor: float) -> void:
 	var before := _cam.get_global_mouse_position()
-	var factor := 1.12 if dir > 0 else 1.0 / 1.12
 	var z := clampf(_cam.zoom.x * factor, MIN_ZOOM, MAX_ZOOM)
 	_cam.zoom = Vector2(z, z)
 	var after := _cam.get_global_mouse_position()
 	_cam.position += before - after  # keep the point under the cursor stable
+
+
+func _zoom_at(_screen_pos: Vector2, dir: int) -> void:
+	_zoom_by(1.12 if dir > 0 else 1.0 / 1.12)
 
 
 func _on_key(event: InputEventKey) -> void:
