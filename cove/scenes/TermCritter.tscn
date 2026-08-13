@@ -1,0 +1,30 @@
+[gd_scene load_steps=3 format=3 uid="uid://cove_termcritter"]
+
+[ext_resource type="Script" path="res://scripts/TermCritter.gd" id="1_term"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_border"]
+bg_color = Color(0, 0, 0, 0)
+border_width_left = 3
+border_width_top = 3
+border_width_right = 3
+border_width_bottom = 3
+border_color = Color(0.45, 0.85, 1, 0.9)
+corner_radius_top_left = 4
+corner_radius_top_right = 4
+corner_radius_bottom_right = 4
+corner_radius_bottom_left = 4
+
+[node name="TermCritter" type="Node2D"]
+script = ExtResource("1_term")
+
+[node name="Screen" type="Sprite2D" parent="."]
+
+[node name="Border" type="Panel" parent="."]
+visible = false
+mouse_filter = 2
+theme_override_styles/panel = SubResource("StyleBoxFlat_border")
+
+[node name="Nameplate" type="Label" parent="."]
+theme_override_colors/font_color = Color(0.8, 0.86, 0.95, 1)
+theme_override_font_sizes/font_size = 13
+text = "terminal"

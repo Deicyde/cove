@@ -1,0 +1,258 @@
+# Two carriers hauling one terminal. Wanders autonomously, but can be commanded
+# (move to a point / follow another group) by the control channel, and shows the
+# terminal's agent state (claude/codex/opencode) + an attention marker. Grab and
+# drag to pick it up; the carriers hang on and it falls to the ground on release.
+extends Node2D
+
+const TERM := preload("res://scenes/TermCritter.tscn")
+const CarrierScript := preload("res://scripts/Carrier.gd")
+const ShadowUtil := preload("res://scripts/ShadowUtil.gd")
+
+const SPEED := 90.0
+const GRAVITY := 2800.0
+const BOUNCE := 0.30
+const LIFT_H := 250.0
+
+const AGENT_COLORS := {
+	"claude": Color(0.90, 0.58, 0.30),
+	"codex": Color(0.30, 0.80, 0.70),
+	"opencode": Color(0.62, 0.52, 0.92),
+	"shell": Color(0.5, 0.5, 0.55),
+}
+
+var term_id := -1
+var terminal: Node2D
+var bounds := Rect2(0, 0, 1280, 800)
+
+var _rig: Node2D
+var _left: Node2D
+var _right: Node2D
+var _term_shadow: Sprite2D
+var _aura: Sprite2D
+var _tag: Label
+var _bang: Label
+
+var _state := "wander"    # wander | lifted | falling
+var _target := Vector2.ZERO
+var _wait := 0.0
+var _t := 0.0
+var _fall_vel := 0.0
+var _recover := 0.0
+
+var _agent := "shell"
+var _busy := false
+var _attention := false
+var _goal = null          # Vector2 commanded target, or null = wander
+
+
+func setup(id: int, path: String, world_bounds: Rect2) -> void:
+	term_id = id
+	bounds = world_bounds
+
+	_aura = ShadowUtil.make(360.0, 1.0, 0.0)  # round soft glow, coloured per agent
+	add_child(_aura)
+	_term_shadow = ShadowUtil.make(200.0, 0.4, 0.34)
+	add_child(_term_shadow)
+
+	_rig = Node2D.new()
+	add_child(_rig)
+	_left = CarrierScript.new(); _rig.add_child(_left)
+	_right = CarrierScript.new(); _rig.add_child(_right)
+	terminal = TERM.instantiate()
+	terminal.setup(id, path)
+	_rig.add_child(terminal)
+
+	_tag = _make_label(13, Color(0.85, 0.88, 0.95))
+	_rig.add_child(_tag)
+	_bang = _make_label(28, Color(1.0, 0.85, 0.3))
+	_bang.text = "!"
+	_bang.visible = false
+	_rig.add_child(_bang)
+
+	_pick_target()
+
+
+func _make_label(sz: int, col: Color) -> Label:
+	var l := Label.new()
+	l.add_theme_font_size_override("font_size", sz)
+	l.add_theme_color_override("font_color", col)
+	l.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.8))
+	l.add_theme_constant_override("outline_size", 4)
+	return l
+
+
+# --- agent state (from Cove's kitty poll / notifications) ---------------
+
+func set_agent(agent: String, busy: bool) -> void:
+	_agent = agent
+	_busy = busy
+
+
+func set_attention(on: bool) -> void:
+	_attention = on
+
+
+func get_ground_pos() -> Vector2:
+	return position
+
+
+# --- commands ---------------------------------------------------------------
+
+func command_move(world_pos: Vector2) -> void:
+	_goal = world_pos
+
+
+func command_stop() -> void:
+	_goal = null
+	_pick_target()
+
+
+func _pick_target() -> void:
+	_target = Vector2(
+		randf_range(bounds.position.x + 160, bounds.end.x - 160),
+		randf_range(bounds.position.y + 160, bounds.end.y - 120))
+
+
+func _carry_h() -> float:
+	return terminal.onscreen_size().y * 0.5 + 58.0
+
+
+func _process(delta: float) -> void:
+	_t += delta
+	terminal.poll()
+	_layout(delta)
+	_update_indicators(delta)
+
+	match _state:
+		"lifted":
+			_left.set_state("panic"); _right.set_state("panic")
+		"falling":
+			_left.set_state("panic"); _right.set_state("panic")
+			_fall_vel += GRAVITY * delta
+			_rig.position.y += _fall_vel * delta
+			if _rig.position.y >= 0.0:
+				if _fall_vel > 700.0:
+					_rig.position.y = 0.0
+					_fall_vel = -_fall_vel * BOUNCE
+				else:
+					_rig.position.y = 0.0
+					_fall_vel = 0.0
+					_state = "wander"
+					_recover = 0.9
+					_left.set_airborne(false); _right.set_airborne(false)
+			_restore_shadow(delta)
+		_:  # wander / commanded
+			_rig.position.y = lerp(_rig.position.y, 0.0, 12.0 * delta)
+			if _recover > 0.0:
+				_recover -= delta
+				_left.set_state("surprised"); _right.set_state("surprised")
+			else:
+				_navigate(delta)
+			position += _separation() * delta
+			_restore_shadow(delta)
+
+
+func _navigate(delta: float) -> void:
+	var tgt: Vector2 = _goal if _goal != null else _target
+	var to := tgt - position
+	var dist := to.length()
+	var stop_d := 8.0 if _goal != null else 6.0
+	if dist > stop_d:
+		var dir := to / dist
+		# agents that are busy scurry a little faster
+		var spd := SPEED * (1.25 if _busy else 1.0)
+		position += dir * spd * delta
+		_left.set_state("walk"); _right.set_state("walk")
+		_left.set_facing(dir.x); _right.set_facing(dir.x)
+	else:
+		_left.set_state("idle"); _right.set_state("idle")
+		if _goal == null:
+			_wait -= delta
+			if _wait <= 0.0:
+				_pick_target()
+				_wait = randf_range(1.2, 3.5)
+
+
+# Push away from nearby groups so terminals don't clip, but let them be close.
+func _separation() -> Vector2:
+	var push := Vector2.ZERO
+	var parent := get_parent()
+	if parent == null:
+		return push
+	var min_d: float = terminal.onscreen_size().x * 0.6 + 150.0
+	for sib in parent.get_children():
+		if sib == self or not sib.has_method("get_ground_pos"):
+			continue
+		var d: Vector2 = position - sib.get_ground_pos()
+		var dist := d.length()
+		if dist > 0.5 and dist < min_d:
+			push += (d / dist) * (min_d - dist) * 2.2
+	return push
+
+
+func _layout(_delta: float) -> void:
+	var ts: Vector2 = terminal.onscreen_size()
+	if ts.x <= 0:
+		return
+	var sep := ts.x * 0.5 + 24.0
+	var carry_h := _carry_h()
+	_left.position = Vector2(-sep, 0)
+	_right.position = Vector2(sep, 0)
+	var bob := 0.0
+	if _state == "wander" and _recover <= 0.0 and (_target - position).length() > 6.0 and _goal == null:
+		bob = sin(_t * 9.0) * 3.0
+	terminal.position = Vector2(0, -carry_h + bob)
+	# tag under the terminal, bang above it
+	_tag.position = Vector2(-ts.x * 0.5, 6.0)
+	_bang.position = Vector2(-8, -carry_h - ts.y * 0.5 - 40.0)
+
+
+func _update_indicators(delta: float) -> void:
+	var col: Color = AGENT_COLORS.get(_agent, AGENT_COLORS["shell"])
+	# label text
+	_tag.text = _agent if _agent != "shell" else ""
+	_tag.add_theme_color_override("font_color", col.lightened(0.3))
+	# aura: coloured glow behind the terminal, pulsing while busy
+	_aura.modulate = col
+	var pulse := 0.5 + 0.35 * sin(_t * 4.0)
+	var target_a := (pulse if _busy else 0.0)
+	_aura.modulate.a = lerp(_aura.modulate.a, target_a * 0.5, 6.0 * delta)
+	_aura.position.y = -_carry_h()
+	# attention: bouncing "!" + we let Cove pulse the border via focus
+	_bang.visible = _attention
+	if _attention:
+		_bang.position.y += -absf(sin(_t * 8.0)) * 8.0
+
+
+func _restore_shadow(delta: float) -> void:
+	if not _term_shadow:
+		return
+	var ts: Vector2 = terminal.onscreen_size()
+	var base := maxf(ts.x, 40.0) * 0.95 / 128.0
+	_term_shadow.scale = _term_shadow.scale.lerp(Vector2(base, base * 0.4), 8.0 * delta)
+	_term_shadow.modulate.a = lerp(_term_shadow.modulate.a, 0.34, 8.0 * delta)
+
+
+# --- lift / drop ------------------------------------------------------------
+
+func lift() -> void:
+	_state = "lifted"
+	_left.set_airborne(true); _right.set_airborne(true)
+
+
+func drop() -> void:
+	if _state != "lifted":
+		return
+	_state = "falling"
+	_fall_vel = 0.0
+
+
+func set_lift_target(world_pos: Vector2) -> void:
+	if _state != "lifted":
+		return
+	position = world_pos + Vector2(0, LIFT_H)
+	_rig.position.y = _carry_h() - LIFT_H
+	var ts: Vector2 = terminal.onscreen_size()
+	var base := maxf(ts.x, 40.0) * 0.95 / 128.0
+	_term_shadow.scale = Vector2(base * 0.5, base * 0.5 * 0.4)
+	_term_shadow.modulate.a = 0.2

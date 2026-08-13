@@ -1,0 +1,23 @@
+#!/usr/bin/env python
+# Build the cove GDExtension (IOSurface -> Metal -> Texture2DRD).
+# Requires godot-cpp checked out at /tmp/godot-cpp (see godot/README.md).
+import os
+
+env = SConscript("/tmp/godot-cpp/SConstruct")
+
+env.Append(CPPPATH=["src/"])
+sources = Glob("src/*.cpp") + Glob("src/*.mm")
+
+# Apple frameworks for Metal + IOSurface interop.
+env.Append(LINKFLAGS=[
+    "-framework", "Metal",
+    "-framework", "IOSurface",
+    "-framework", "Foundation",
+    "-framework", "QuartzCore",
+])
+# .mm files are Objective-C++.
+env.Append(CXXFLAGS=["-ObjC++"])
+
+libname = "libcove{}{}".format(env["suffix"], env["SHLIBSUFFIX"])
+library = env.SharedLibrary("../bin/" + libname, source=sources)
+Default(library)

@@ -1,0 +1,10 @@
+# Godot editor cache (regenerated on import)
+.godot/
+# GDExtension build artifacts (rebuild with scons; see cove-dev skill)
+gdext/src/*.os
+gdext/src/*.o
+gdext/godot-cpp/
+# runtime
+*.log
+gdext/.sconsign.dblite
+gdext/*.dblite

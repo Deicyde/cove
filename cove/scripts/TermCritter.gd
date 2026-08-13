@@ -1,0 +1,168 @@
+# One live terminal as a scene you can decorate in the editor. The terminal
+# pixels land on the $Screen sprite; add sibling nodes (glow, border, particles,
+# an AnimationPlayer) in scenes/TermCritter.tscn and they ride along with every
+# terminal. See godot/DESIGN.md.
+extends Node2D
+class_name TermCritter
+
+# Shared-file header layout (see kitty/cove.c).
+const MAGIC := 0x4B4D454E
+const HEADER := 64
+const FLAG_BOTTOM_UP := 0x1
+
+# On-screen pixels per native terminal pixel. Fixed, so resizing (changing
+# cols/rows) grows/shrinks the whole window rather than rescaling the text.
+var zoom := 0.30
+
+@onready var screen: Sprite2D = $Screen
+@onready var _nameplate: Label = get_node_or_null("Nameplate")
+@onready var _border: Panel = get_node_or_null("Border")
+
+var term_id := -1        # kitty OS-window id (from the file name)
+var pane_id := 0         # kitty window/pane id (for `@ --match id:`)
+var frame_path := ""
+var custom_name := ""    # user/agent-assigned name shown on the nameplate
+var cols := 0
+var rows := 0
+var mouse_mode := 0      # 0 none, 1 button, 2 motion, 3 any
+var mouse_proto := 0     # 2 = SGR, 4 = SGR-pixel
+var iosurface_id := 0
+
+var _tex: ImageTexture
+var _size := Vector2i.ZERO
+var _last_seq := -1
+# Zero-copy path: two importers/textures (double-buffered), swapped per frame.
+var _importers: Array = []          # [CoveIOSurface, CoveIOSurface]
+var _rd_tex: Array = [null, null]   # [Texture2DRD, Texture2DRD]
+var _io_ids := Vector2i.ZERO        # (id_a, id_b) currently imported
+
+
+func setup(id: int, path: String) -> void:
+	term_id = id
+	frame_path = path
+	if ClassDB.class_exists("CoveIOSurface"):
+		_importers = [ClassDB.instantiate("CoveIOSurface"), ClassDB.instantiate("CoveIOSurface")]
+
+
+func poll() -> void:
+	if not FileAccess.file_exists(frame_path):
+		return
+	var f := FileAccess.open(frame_path, FileAccess.READ)
+	if f == null:
+		return
+	var head := f.get_buffer(HEADER)
+	if head.size() < HEADER or head.decode_u32(0) != MAGIC:
+		return
+	var w := int(head.decode_u32(4))
+	var h := int(head.decode_u32(8))
+	var seq := int(head.decode_u32(12))
+	var flags := int(head.decode_u32(20))
+	pane_id = int(head.decode_u32(24)) | (int(head.decode_u32(28)) << 32)
+	cols = int(head.decode_u32(32))
+	rows = int(head.decode_u32(36))
+	mouse_mode = int(head.decode_u32(40))
+	mouse_proto = int(head.decode_u32(44))
+	iosurface_id = int(head.decode_u32(48))
+	var iosurface_id_b := int(head.decode_u32(52))
+	var ready_index := int(head.decode_u32(56))
+	if w <= 0 or h <= 0 or seq == _last_seq:
+		return
+	_last_seq = seq
+
+	if iosurface_id != 0 and not _importers.is_empty():
+		_apply_iosurface(w, h, iosurface_id, iosurface_id_b, ready_index)
+	else:
+		f.seek(HEADER)
+		var px := f.get_buffer(w * h * 4)
+		if px.size() < w * h * 4:
+			return
+		var img := Image.create_from_data(w, h, false, Image.FORMAT_RGBA8, px)
+		if flags & FLAG_BOTTOM_UP:
+			img.flip_y()
+		if _tex == null or _size != Vector2i(w, h):
+			_tex = ImageTexture.create_from_image(img)
+			_size = Vector2i(w, h)
+			screen.flip_v = false
+			screen.texture = _tex
+			screen.scale = Vector2.ONE * zoom
+			_layout_decorations()
+		else:
+			_tex.update(img)
+
+
+func _apply_iosurface(w: int, h: int, id_a: int, id_b: int, ready: int) -> void:
+	# Import both buffers once (ids are stable); then each frame just point the
+	# sprite at whichever buffer kitty says holds the latest complete frame.
+	if _io_ids != Vector2i(id_a, id_b) or _size != Vector2i(w, h):
+		_rd_tex[0] = _importers[0].call("import_surface", id_a, w, h)
+		_rd_tex[1] = _importers[1].call("import_surface", id_b, w, h)
+		_io_ids = Vector2i(id_a, id_b)
+		_size = Vector2i(w, h)
+		screen.flip_v = true  # IOSurface holds GL bottom-up pixels
+		screen.scale = Vector2.ONE * zoom
+		_layout_decorations()
+	var t = _rd_tex[ready] if ready >= 0 and ready < 2 else null
+	if t != null:
+		screen.texture = t
+
+
+func _layout_decorations() -> void:
+	var half := onscreen_size() * 0.5
+	if _border:
+		_border.position = -half
+		_border.size = onscreen_size()
+	if _nameplate:
+		_nameplate.position = Vector2(-half.x, -half.y - 22.0)
+		_update_nameplate()
+
+
+func _update_nameplate() -> void:
+	if _nameplate == null:
+		return
+	var base := custom_name if custom_name != "" else "termling %d" % term_id
+	_nameplate.text = "%s  (%d×%d)" % [base, cols, rows]
+
+
+func set_custom_name(n: String) -> void:
+	custom_name = n
+	_update_nameplate()
+
+
+# On-screen size of the terminal quad (native px * zoom).
+func onscreen_size() -> Vector2:
+	return Vector2(_size) * zoom
+
+
+func native_size() -> Vector2i:
+	return _size
+
+
+# Hit test in world space (accounts for position/scale/rotation).
+func contains_point(world_pos: Vector2) -> bool:
+	if screen.texture == null:
+		return false
+	return screen.get_rect().has_point(screen.to_local(world_pos))
+
+
+# Is world_pos over the resize handle (bottom-right corner)?
+func over_resize_handle(world_pos: Vector2) -> bool:
+	if screen.texture == null:
+		return false
+	var corner := position + onscreen_size() * 0.5
+	return world_pos.distance_to(corner) < 22.0
+
+
+func set_focused(focused: bool) -> void:
+	# Focus is shown by brightness + border only. Don't touch z_index -- it would
+	# override the world's y-sorting and make the focused terminal ignore depth.
+	screen.modulate = Color.WHITE if focused else Color(0.62, 0.62, 0.68)
+	if _border:
+		_border.visible = focused
+
+
+# Map a world position to a terminal cell (col,row), clamped. Used for mouse.
+func cell_at(world_pos: Vector2) -> Vector2i:
+	var local := screen.to_local(world_pos) + Vector2(_size) * 0.5  # 0..native
+	var c := int(clampf(local.x / max(1.0, float(_size.x)) * cols, 0, cols - 1))
+	var r := int(clampf(local.y / max(1.0, float(_size.y)) * rows, 0, rows - 1))
+	return Vector2i(c, r)

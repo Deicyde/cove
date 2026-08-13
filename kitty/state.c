@@ -7,6 +7,7 @@
 
 #include "cleanup.h"
 #include "dnd.h"
+#include "cove.h"
 #include "options/to-c-generated.h"
 #include <math.h>
 #include <sys/mman.h>
@@ -594,6 +595,7 @@ destroy_os_window_item(OSWindow *w) {
 
 bool
 remove_os_window(id_type os_window_id) {
+    cove_remove_window(os_window_id);
     bool found = false;
     WITH_OS_WINDOW(os_window_id)
     found = true;

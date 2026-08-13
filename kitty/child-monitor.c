@@ -10,6 +10,7 @@
 #include "state.h"
 #include "threading.h"
 #include "screen.h"
+#include "cove.h"
 #include "monotonic.h"
 #include <termios.h>
 #include <unistd.h>
@@ -808,7 +809,8 @@ prepare_to_render_os_window(
     bool was_previously_rendered_with_layers = os_window->needs_layers;
     os_window->needs_layers =
         (!global_state.supports_framebuffer_srgb || effective_os_window_alpha(os_window) < 1.f || os_window->live_resize.in_progress ||
-         (background_image_for_os_window(os_window) != NULL) || os_window->has_active_custom_shaders);
+         (background_image_for_os_window(os_window) != NULL) || os_window->has_active_custom_shaders
+         || cove_enabled());  // cove: render into indirect FBO so we can read it back while hidden
     if (TD.screen && os_window->num_tabs && !os_window->has_too_few_tabs) {
         if (!os_window->tab_bar_data_updated) {
             call_boss(update_tab_bar_data, "K", os_window->id);
@@ -1025,7 +1027,10 @@ render_prepared_os_window(
         thumbnail_callback(os_window);
         global_state.thumbnail_callback.os_window = 0;
     }
-    swap_window_buffers(os_window);
+    cove_publish_frame(os_window);
+    // In cove mode the window is hidden; presenting it is pointless (and
+    // swaps aren't allowed for a hidden window), we export via the FBO instead.
+    if (!cove_enabled()) swap_window_buffers(os_window);
     os_window->last_active_tab = os_window->active_tab;
     os_window->last_num_tabs = os_window->num_tabs;
     os_window->last_active_window_id = active_window_id;
@@ -1105,7 +1110,7 @@ render(monotonic_t now, bool input_read) {
     EVDBG("input_read: %d, check_for_active_animated_images: %d\n", input_read, global_state.check_for_active_animated_images);
     static monotonic_t last_render_at = MONOTONIC_T_MIN;
     monotonic_t time_since_last_render = last_render_at == MONOTONIC_T_MIN ? OPT(repaint_delay) : now - last_render_at;
-    if (!input_read && time_since_last_render < OPT(repaint_delay) && !global_state.thumbnail_callback.os_window) {
+    if (!input_read && time_since_last_render < OPT(repaint_delay) && !global_state.thumbnail_callback.os_window && !cove_has_pending_control()) {
         set_maximum_wait(OPT(repaint_delay) - time_since_last_render);
         return;
     }
@@ -1113,6 +1118,7 @@ render(monotonic_t now, bool input_read) {
     const bool scan_for_animated_images = global_state.check_for_active_animated_images;
     global_state.check_for_active_animated_images = false;
     call_boss(cache_process_data, "O", Py_True);
+    cove_drain_control();  // apply any queued resizes (main thread, GIL held)
 
     for (size_t i = 0; i < global_state.num_os_windows; i++) {
         OSWindow *w = global_state.os_windows + i;

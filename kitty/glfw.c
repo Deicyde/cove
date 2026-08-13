@@ -5,6 +5,7 @@
  */
 
 #include "state.h"
+#include "cove.h"
 #include "cleanup.h"
 #include "monotonic.h"
 #include "dnd.h"
@@ -1936,6 +1937,8 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     }
     if (PyErr_Occurred()) return NULL;
     if (lsc && window_state != WINDOW_HIDDEN) window_state = WINDOW_NORMAL;
+    // cove: never show a real terminal window; it lives only inside Godot.
+    if (cove_enabled()) window_state = WINDOW_HIDDEN;
 
     static bool is_first_window = true;
     if (is_first_window) {
@@ -2785,6 +2788,9 @@ is_os_window_potentially_visible(OSWindow *w) {
 
 bool
 should_os_window_be_rendered(OSWindow *w) {
+    // cove: the window is intentionally hidden; render it anyway so we can
+    // export its offscreen FBO to the external compositor.
+    if (cove_enabled()) return true;
     return is_os_window_potentially_visible(w) && glfwAreSwapsAllowed(w->handle);
 }
 
