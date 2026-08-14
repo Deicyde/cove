@@ -173,6 +173,30 @@ The IOSurface transport is **double-buffered**: kitty ping-pongs between two
 surfaces and publishes which one holds the latest complete frame, so Godot never
 samples a half-blitted frame.
 
+## Remote termlings (multi-device)
+
+See another laptop's live termlings inside your own Cove, marked remote. The
+transport is **differential text**, not rendered frames — cheap over Tailscale,
+and the text stays selectable. It rides on wwid's multi-device sync (see
+`what-was-I-doing/REMOTE_TERMLINGS_PLAN.md`).
+
+- **Origin** (the machine being watched): run `cove/cove-relay.sh`. Per
+  cove-kitty window it registers a wwid session (`wwid session register`) and,
+  every ~0.3s, snapshots the window text (`kitten @ get-text`) and pushes it to
+  the local wwid server (`wwid termling publish`). wwid diffs the text and serves
+  only the changed rows at `GET /termlings/:key` (api_key + Tailscale, same gate
+  as `/sync`). Needs `wwid start` with sync enabled and an `api_key` set.
+- **Viewer**: run `cove/cove-remote.sh <peer>` (a sync-peer name from your wwid
+  config). It lists the peer's termlings and opens one local cove-kitty window
+  per termling running `wwid termling watch`, which reconstructs the screen from
+  the deltas (read-only). Each shadow window is titled `◈ <name> @ <peer>`.
+- **Remote indicator**: `Cove.gd` recognises the `◈` title marker and gives the
+  termling a cool-blue tint and a `◈` nameplate (`TermCritter.set_remote`) so a
+  remote shadow is never mistaken for a local termling.
+
+Driving a remote termling (forwarding your keystrokes back to its origin) is the
+next slice; the read path above is one-way.
+
 ## Known limitations
 
 - Frames only advance when a terminal re-renders (i.e. when its content changes).

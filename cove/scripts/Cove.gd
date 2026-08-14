@@ -6,6 +6,7 @@
 #   - click a terminal to focus it, then type (keyboard -> focused shell)
 #   - press-drag a terminal to LIFT it off the ground: it rises to the cursor,
 #     its shadow shrinks, and the carriers panic; release to drop it (they recover)
+#     (the *focused* terminal drag-selects its text instead; Alt-drag lifts it)
 #   - Cmd/Ctrl+N spawns another terminal
 extends Node2D
 
@@ -37,8 +38,13 @@ var _scroll_accum := 0.0      # trackpad pan-gesture steps accumulated for termi
 var _tracking_id := -1       # term id the camera is following (double-click), or -1
 var _press_group: Node2D = null
 var _press_pos := Vector2.ZERO
+var _press_world := Vector2.ZERO
 var _lifting := false
+# Drag-select on the focused terminal: text selection instead of lifting it.
+var _selecting := false        # this press should select, not lift
+var _sel_started := false      # the selection has actually begun (dragged past the deadzone)
 const LIFT_THRESHOLD := 10.0
+const SELECT_DEADZONE := 3.0
 const MIN_ZOOM := 0.35
 const MAX_ZOOM := 3.0
 
@@ -61,11 +67,31 @@ var _attn_ids := {}          # term_id -> true (needs attention)
 var _pan_once := -1          # term id to pan the camera to once (input required)
 var _names := {}             # term_id -> custom name (persists across re-spawn)
 var _saved := {}             # layout restored from the previous run's state.json
+var _sessions := {}          # term_id -> abduco session name (once learned from ls)
+var _pos_by_session := {}    # session -> [x,y], to restore across a kitty restart
+var _name_by_session := {}   # session -> custom name, ditto
+var _pos_restored := {}      # term_id -> true once its position has been restored
 
 # rename dialog
 var _rename_panel: PanelContainer
 var _rename_edit: LineEdit
 var _rename_id := -1
+
+# search overlay (Cmd/Ctrl+K): fuzzy-as-you-type + semantic "jump" via cove-find
+var _search_panel: PanelContainer
+var _search_edit: LineEdit
+var _search_list: VBoxContainer
+var _search_hint: Label
+var _search_open := false
+var _search_rows := []        # [{id, why, source}] currently displayed, best-first
+var _search_sel := 0          # highlighted row index
+var _search_awaiting := ""    # query we're waiting on cove-find for ("" = idle)
+var _search_poll := 0.0
+var _search_preview_id := -1  # termling the camera is previewing while stepping
+var _search_return_cam := Vector2.ZERO  # camera to restore if the search is escaped
+var _cam_return := false       # true while swooping the camera back after an Esc
+const SEARCH_HINT := "↵ jump  ·  ⇥ ✨ ask AI  ·  esc"
+const SEARCH_DIM := 0.2       # alpha for termlings occluding the previewed one
 
 # proof mode
 var _shot_path := ""
@@ -142,14 +168,22 @@ func _process(delta: float) -> void:
 	_apply_follows()
 	_pump_commands(delta)
 	_pump_notify()
+	_poll_search(delta)
 	_state_accum += delta
 	if _state_accum > 0.2:
 		_state_accum = 0.0
 		_write_state()
-	# Camera follows the tracked terminal (double-click to start). Track the
-	# terminal's centre, not the group's ground point (which sits well below it).
-	if _tracking_id != -1 and _groups.has(_tracking_id):
+	# While previewing a search hit the camera swoops onto it; otherwise it follows
+	# the tracked terminal (double-click / committed jump). Track the terminal's
+	# centre, not the group's ground point (which sits well below it).
+	if _search_open and _search_preview_id != -1 and _groups.has(_search_preview_id):
+		_cam.position = _cam.position.lerp(_groups[_search_preview_id].terminal.global_position, 8.0 * delta)
+	elif _tracking_id != -1 and _groups.has(_tracking_id):
 		_cam.position = _cam.position.lerp(_groups[_tracking_id].terminal.global_position, 6.0 * delta)
+	elif _cam_return:
+		_cam.position = _cam.position.lerp(_search_return_cam, 8.0 * delta)
+		if _cam.position.distance_to(_search_return_cam) < 2.0:
+			_cam_return = false
 	_frames += 1
 	if _shot_path != "" and _frames == 320:
 		var img := get_viewport().get_texture().get_image()
@@ -185,6 +219,7 @@ func _add_group(id: int) -> void:
 		# Restore where it was on the previous run (hot-reload keeps positions).
 		var p = _saved["pos"][id]
 		g.position = Vector2(p[0], p[1])
+		_pos_restored[id] = true
 	else:
 		# Spawn near the camera so new terminals appear in view, then they wander off.
 		var center := _cam.position if _cam else Vector2.ZERO
@@ -283,6 +318,22 @@ func _order_by_proximity(from_id: int) -> Array:
 func _input(event: InputEvent) -> void:
 	if not (event is InputEventKey and event.pressed and not event.echo):
 		return
+	# While the search overlay is open, drive it: Esc closes, Up/Down move the
+	# highlight, Tab asks the AI, Enter commits. Every other key falls through to
+	# the focused LineEdit so typing the query works normally.
+	if _search_open:
+		match event.keycode:
+			KEY_ESCAPE:
+				_close_search(true); get_viewport().set_input_as_handled()
+			KEY_UP:
+				_move_search_sel(-1); get_viewport().set_input_as_handled()
+			KEY_DOWN:
+				_move_search_sel(1); get_viewport().set_input_as_handled()
+			KEY_TAB:
+				_run_semantic_search(); get_viewport().set_input_as_handled()
+			KEY_ENTER, KEY_KP_ENTER:
+				_commit_search(); get_viewport().set_input_as_handled()
+		return
 	# While the rename dialog is open, Esc cancels it and other keys go to it.
 	if _rename_id != -1:
 		if event.keycode == KEY_ESCAPE:
@@ -301,6 +352,12 @@ func _input(event: InputEvent) -> void:
 	# next chord re-freezes a fresh proximity order.
 	if not _is_modifier_key(event.keycode):
 		_cycle_active = false
+	# Cmd+F opens the search overlay. Meta only (not Ctrl) so it never shadows the
+	# emacs editing keys (C-f/C-k/C-n...) or Cmd+K, which the user drives elsewhere.
+	if event.keycode == KEY_F and event.meta_pressed and not event.ctrl_pressed:
+		_open_search()
+		get_viewport().set_input_as_handled()
+		return
 	if event.keycode == KEY_N and (event.meta_pressed or event.ctrl_pressed):
 		_spawn_terminal()
 		get_viewport().set_input_as_handled()
@@ -308,6 +365,21 @@ func _input(event: InputEvent) -> void:
 
 func _world_mouse() -> Vector2:
 	return get_global_mouse_position()
+
+
+# Drive kitty's own text selection on the focused terminal. phase: 0 start,
+# 1 drag-update, 2 end (kitty copies the selection to the clipboard on end).
+# Only the fast socket carries this; there's no kitten fallback for selection.
+func _send_select(g: Node2D, world: Vector2, phase: int) -> void:
+	if g == null or _sock == null or not _sock.call("is_connected"):
+		return
+	var t = g.terminal
+	var pane: int = t.pane_id
+	if pane == 0:
+		return
+	var ch: Dictionary = t.cell_and_half(world)
+	var cell: Vector2i = ch["cell"]
+	_sock.call("send_mouse", pane, phase, cell.x, cell.y, ch["left"])
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -343,6 +415,11 @@ func _unhandled_input(event: InputEvent) -> void:
 			if event.pressed:
 				_press_group = _group_at(wpos)
 				_press_pos = event.position
+				_press_world = wpos
+				_sel_started = false
+				# Drag on the *focused* terminal selects its text; Alt-drag lifts
+				# it instead (the escape hatch for moving the focused one around).
+				_selecting = _press_group != null and _press_group.term_id == _focused_id and not event.alt_pressed and not event.double_click
 				_lifting = false
 				_panning = _press_group == null  # empty-space left-drag pans
 				if _panning:
@@ -351,15 +428,27 @@ func _unhandled_input(event: InputEvent) -> void:
 					_set_focus(_press_group.term_id)
 					_tracking_id = _press_group.term_id  # double-click: focus + follow
 			else:
-				if _press_group != null and _lifting:
+				if _sel_started and _press_group != null:
+					_send_select(_press_group, _world_mouse(), 2)  # end drag -> copy selection
+				elif _press_group != null and _lifting:
 					_press_group.drop()
 				elif _press_group != null:
 					_set_focus(_press_group.term_id)
 				_press_group = null
 				_lifting = false
+				_selecting = false
+				_sel_started = false
 				_panning = false
 	elif event is InputEventMouseMotion:
-		if _press_group != null:
+		if _selecting and _press_group != null:
+			# Begin selecting once past the deadzone so a plain click still just
+			# focuses; anchor at the press cell, then track the cursor as we drag.
+			if not _sel_started and event.position.distance_to(_press_pos) > SELECT_DEADZONE:
+				_sel_started = true
+				_send_select(_press_group, _press_world, 0)  # start at the anchor cell
+			if _sel_started:
+				_send_select(_press_group, _world_mouse(), 1)  # drag update
+		elif _press_group != null:
 			if not _lifting and event.position.distance_to(_press_pos) > LIFT_THRESHOLD:
 				_lifting = true
 				_press_group.lift()
@@ -582,6 +671,13 @@ func _load_layout() -> void:
 			_names[id] = str(t["name"])
 		if t.get("following", null) != null:
 			follows[id] = int(t["following"])
+		# Session-keyed restore survives a kitty restart: abduco keeps the shells
+		# alive but kitty hands out fresh window ids, so id-keying alone misses.
+		var sess := str(t.get("session", ""))
+		if sess != "":
+			_pos_by_session[sess] = t.get("pos", [0, 0])
+			if str(t.get("name", "")) != "":
+				_name_by_session[sess] = str(t["name"])
 	_saved = {"pos": pos, "cam": d.get("camera", null), "follows": follows, "focused": int(d.get("focused", -1))}
 	if _saved["cam"] == null:
 		_saved.erase("cam")
@@ -611,23 +707,112 @@ func _ls_loop() -> void:
 		var out := []
 		OS.execute(kitten_exe, ["@", "--to", kitty_socket, "ls"], out, false)
 		var txt: String = out[0] if out.size() > 0 else ""
-		var data := _parse_ls(txt)
+		var pout := []
+		OS.execute("/bin/ps", ["-Ao", "pid=,ppid=,command="], pout, false)
+		var ptxt: String = pout[0] if pout.size() > 0 else ""
+		var sess_info := _scan_sessions(ptxt)
+		var data := _parse_ls(txt, sess_info)
 		_ls_mutex.lock()
 		_ls_data = data
 		_ls_mutex.unlock()
 		OS.delay_msec(1000)
 
 
-func _detect_agent(procs) -> String:
+# Each termling's shell runs inside an abduco session (see cove-shell.sh) so it
+# survives a kitty restart. The shell/agent is then a child of the abduco master,
+# not of the kitty window, so `kitten @ ls` can't see it -- we recover the agent
+# and cwd by walking the process tree from each abduco master instead.
+func _scan_sessions(ptxt: String) -> Dictionary:
+	var cmd := {}    # pid -> command
+	var kids := {}   # ppid -> [pid]
+	for raw in ptxt.split("\n", false):
+		var line := raw.strip_edges()
+		if line == "":
+			continue
+		var sp := line.split(" ", false, 2)
+		if sp.size() < 3:
+			continue
+		var pid := int(sp[0])
+		var ppid := int(sp[1])
+		cmd[pid] = sp[2]
+		if not kids.has(ppid):
+			kids[ppid] = []
+		kids[ppid].append(pid)
+	var res := {}
+	for pid in cmd:
+		var c: String = cmd[pid]
+		# The abduco *master* holds the session: its argv carries the session name
+		# and (unlike the attach client) it is the parent of the shell subtree.
+		if not c.contains("abduco") or not kids.has(pid):
+			continue
+		var sess := _session_token(c)
+		if sess == "":
+			continue
+		var agent := "shell"
+		var agent_pid := -1
+		var direct: Array = kids.get(pid, [])
+		var shell_pid: int = direct[0] if direct.size() > 0 else -1
+		var queue: Array = direct.duplicate()
+		var guard := 0
+		while not queue.is_empty() and guard < 256:
+			guard += 1
+			var cur: int = queue.pop_front()
+			var lc: String = str(cmd.get(cur, "")).to_lower()
+			if lc.contains("opencode"):
+				agent = "opencode"; agent_pid = cur
+			elif lc.contains("codex") and agent == "shell":
+				agent = "codex"; agent_pid = cur
+			elif lc.contains("claude") and agent == "shell":
+				agent = "claude"; agent_pid = cur
+			for k in kids.get(cur, []):
+				queue.append(k)
+		var src := agent_pid if agent_pid != -1 else shell_pid
+		res[sess] = {"agent": agent, "busy": agent != "shell", "cwd": _cwd_of(src)}
+	return res
+
+
+# The session name is the argv token like `cove-12345` on an abduco command line.
+# We extract `cove-<digits>` strictly so trailing junk in a ps line (quotes or
+# newlines from a wrapped command) can't yield a bogus session key.
+func _session_token(c: String) -> String:
+	for tok in c.split(" ", false):
+		if not tok.begins_with("cove-"):
+			continue
+		var digits := ""
+		for i in range(5, tok.length()):
+			var ch := tok[i]
+			if ch >= "0" and ch <= "9":
+				digits += ch
+			else:
+				break
+		if digits != "":
+			return "cove-" + digits
+	return ""
+
+
+func _cwd_of(pid: int) -> String:
+	if pid <= 0:
+		return ""
+	var out := []
+	OS.execute("/usr/sbin/lsof", ["-a", "-p", str(pid), "-d", "cwd", "-Fn"], out, false)
+	var txt: String = out[0] if out.size() > 0 else ""
+	for line in txt.split("\n", false):
+		if line.begins_with("n"):
+			return line.substr(1)
+	return ""
+
+
+func _session_from_procs(procs) -> String:
 	for p in procs:
-		var cl := " ".join(p.get("cmdline", [])).to_lower()
-		if cl.contains("opencode"): return "opencode"
-		if cl.contains("codex"): return "codex"
-		if cl.contains("claude"): return "claude"
-	return "shell"
+		var cl := " ".join(p.get("cmdline", []))
+		if cl.contains("abduco"):
+			var sess := _session_token(cl)
+			if sess != "":
+				return sess
+	return ""
 
 
-func _parse_ls(txt: String) -> Dictionary:
+func _parse_ls(txt: String, sess_info: Dictionary) -> Dictionary:
 	var arr = JSON.parse_string(txt)
 	var res := {}
 	if typeof(arr) != TYPE_ARRAY:
@@ -636,12 +821,15 @@ func _parse_ls(txt: String) -> Dictionary:
 		for tab in osw.get("tabs", []):
 			for w in tab.get("windows", []):
 				var pane := int(w.get("id", 0))
-				var agent := _detect_agent(w.get("foreground_processes", []))
+				var session := _session_from_procs(w.get("foreground_processes", []))
+				var si: Dictionary = sess_info.get(session, {})
 				res[pane] = {
-					"agent": agent,
-					"busy": agent != "shell",
+					"session": session,
+					"agent": str(si.get("agent", "shell")),
+					"busy": bool(si.get("busy", false)),
 					"attention": bool(w.get("needs_attention", false)),
-					"cwd": str(w.get("cwd", "")),
+					"cwd": str(si.get("cwd", w.get("cwd", ""))),
+					"title": str(w.get("title", "")),
 				}
 	return res
 
@@ -661,7 +849,11 @@ func _apply_agent_state() -> void:
 	for id in _groups:
 		var g = _groups[id]
 		var info = _agents.get(g.terminal.pane_id, {})
+		_learn_session(id, g, str(info.get("session", "")))
 		g.set_agent(info.get("agent", "shell"), info.get("busy", false))
+		# A shadow pane opened by cove-remote.sh titles itself "◈ <name> @ <peer>";
+		# recognise it and give the termling the remote treatment.
+		_apply_remote_marker(g, str(info.get("title", "")))
 		if info.get("attention", false):
 			_attn_ids[id] = true
 		g.set_attention(_attn_ids.has(id))
@@ -671,6 +863,45 @@ func _apply_agent_state() -> void:
 		_cam.position = _cam.position.lerp(tp, 5.0 * get_process_delta_time())
 		if _cam.position.distance_to(tp) < 24.0:
 			_pan_once = -1
+
+
+# A remote shadow pane (from cove-remote.sh) carries the title
+# "◈ <name> @ <peer>". Parse that and toggle the termling's remote treatment;
+# any other title clears it. Also seeds the nameplate name once.
+func _apply_remote_marker(g: Node2D, title: String) -> void:
+	if g.terminal == null:
+		return
+	if not title.begins_with("◈"):
+		if g.terminal.remote:
+			g.terminal.set_remote(false, "")
+		return
+	var body := title.substr(1).strip_edges()  # "<name> @ <peer>"
+	var name := body
+	var peer := ""
+	var at := body.rfind(" @ ")
+	if at != -1:
+		name = body.substr(0, at).strip_edges()
+		peer = body.substr(at + 3).strip_edges()
+	g.terminal.set_remote(true, peer)
+	if name != "" and g.terminal.custom_name == "":
+		g.terminal.set_custom_name(name)
+
+
+# Once we learn a termling's abduco session (from the ls poll) remember it for
+# state.json, and if the id-keyed restore didn't fire (i.e. kitty was restarted
+# and handed out fresh ids) snap it to its saved spot/name, just once.
+func _learn_session(id: int, g: Node2D, session: String) -> void:
+	if session == "":
+		return
+	_sessions[id] = session
+	if _pos_restored.has(id):
+		return
+	_pos_restored[id] = true
+	if _pos_by_session.has(session):
+		var p = _pos_by_session[session]
+		g.position = Vector2(p[0], p[1])
+	if _name_by_session.has(session) and g.terminal.custom_name == "":
+		g.terminal.set_custom_name(_name_by_session[session])
 
 
 func _apply_follows() -> void:
@@ -763,13 +994,21 @@ func _exec_command(c: Dictionary) -> void:
 # --- state.json (world -> agents) -------------------------------------------
 
 func _write_state() -> void:
+	# newest hook event per terminal, so state.json says what each is working on
+	var note_by_id := {}
+	for n in _notes:
+		var nid: int = n.get("term_id", -1)
+		if nid != -1 and not note_by_id.has(nid):
+			note_by_id[nid] = n
 	var terms := []
 	for id in _groups:
 		var g = _groups[id]
 		var info = _agents.get(g.terminal.pane_id, {})
+		var note = note_by_id.get(id, {})
 		terms.append({
 			"id": id,
 			"pane_id": g.terminal.pane_id,
+			"session": _sessions.get(id, ""),
 			"name": g.terminal.custom_name,
 			"pos": [snappedf(g.position.x, 0.1), snappedf(g.position.y, 0.1)],
 			"cols": g.terminal.cols,
@@ -779,6 +1018,9 @@ func _write_state() -> void:
 			"attention": _attn_ids.has(id),
 			"following": _follows.get(id, null),
 			"cwd": info.get("cwd", ""),
+			"title": str(info.get("title", "")),
+			"project": str(note.get("project", "")),
+			"last_event": str(note.get("event", "")),
 		})
 	var st := {
 		"terminals": terms,
@@ -879,6 +1121,7 @@ func _build_ui() -> void:
 	_panel_vbox.add_child(title)
 	_update_panel()
 	_build_rename_dialog()
+	_build_search_dialog()
 
 
 func _themed_box(border := Color(0.45, 0.85, 1.0, 0.6)) -> StyleBoxFlat:
@@ -962,6 +1205,293 @@ func _close_rename() -> void:
 	if _rename_panel:
 		_rename_panel.visible = false
 	_rename_id = -1
+
+
+# --- search overlay ---------------------------------------------------------
+# Cmd/Ctrl+K opens a search bar. As you type we fuzzy-match locally over every
+# termling's name/title/project/last-event/cwd (instant). Enter jumps to the
+# highlighted hit; Tab (or Enter on an empty list) asks cove-find to resolve the
+# query semantically via the Anthropic API, then re-ranks. Choosing a result
+# focuses that termling and sets the camera to track it.
+
+func _build_search_dialog() -> void:
+	var layer := CanvasLayer.new()
+	layer.layer = 6
+	add_child(layer)
+	var center := CenterContainer.new()
+	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	layer.add_child(center)
+
+	_search_panel = PanelContainer.new()
+	_search_panel.add_theme_stylebox_override("panel", _themed_box(Color(0.55, 0.95, 0.75, 0.7)))
+	_search_panel.visible = false
+	_search_panel.custom_minimum_size = Vector2(470, 0)
+	center.add_child(_search_panel)
+
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", 10)
+	_search_panel.add_child(vb)
+
+	var title := Label.new()
+	title.text = "🔎 find a termling"
+	title.add_theme_font_size_override("font_size", 16)
+	title.add_theme_color_override("font_color", Color(0.9, 0.8, 0.55))
+	vb.add_child(title)
+
+	_search_edit = LineEdit.new()
+	_search_edit.custom_minimum_size = Vector2(440, 0)
+	_search_edit.placeholder_text = "who's running the tests? · the auth refactor · logs"
+	_search_edit.add_theme_color_override("font_color", Color(0.95, 0.95, 0.98))
+	_search_edit.text_changed.connect(_on_search_text)
+	vb.add_child(_search_edit)
+
+	_search_list = VBoxContainer.new()
+	_search_list.add_theme_constant_override("separation", 3)
+	vb.add_child(_search_list)
+
+	_search_hint = Label.new()
+	_search_hint.text = SEARCH_HINT
+	_search_hint.add_theme_font_size_override("font_size", 11)
+	_search_hint.add_theme_color_override("font_color", Color(0.6, 0.62, 0.66))
+	vb.add_child(_search_hint)
+
+
+func _open_search() -> void:
+	if _search_panel == null:
+		return
+	_search_open = true
+	_search_awaiting = ""
+	_search_sel = 0
+	_search_preview_id = -1
+	_search_return_cam = _cam.position   # so Esc can put the view back
+	_search_hint.text = SEARCH_HINT
+	_search_panel.visible = true
+	_search_edit.text = ""
+	_search_edit.grab_focus()
+	_on_search_text("")   # seed with the full roster
+
+
+# restore_view: on Esc we pan back to where we started and drop any preview; on a
+# committed jump we keep the camera on the chosen termling instead.
+func _close_search(restore_view := false) -> void:
+	_clear_preview()
+	# Swoop back to the pre-search view on Esc, but only if we weren't already
+	# tracking a termling (in which case the tracker reclaims the camera).
+	_cam_return = restore_view and _tracking_id == -1
+	if _search_panel:
+		_search_panel.visible = false
+	_search_open = false
+	_search_awaiting = ""
+	_search_preview_id = -1
+
+
+# One searchable record per termling -- the same fields cove-find reasons over.
+func _search_cards() -> Array:
+	var note_by_id := {}
+	for n in _notes:
+		var nid: int = n.get("term_id", -1)
+		if nid != -1 and not note_by_id.has(nid):
+			note_by_id[nid] = n
+	var cards := []
+	for id in _groups:
+		var g = _groups[id]
+		var info = _agents.get(g.terminal.pane_id, {})
+		var note = note_by_id.get(id, {})
+		cards.append({
+			"id": id,
+			"name": g.terminal.custom_name,
+			"agent": str(info.get("agent", "shell")),
+			"title": str(info.get("title", "")),
+			"project": str(note.get("project", "")),
+			"last_event": str(note.get("event", "")),
+			"cwd": str(info.get("cwd", "")),
+		})
+	return cards
+
+
+func _search_why(c: Dictionary) -> String:
+	var bits := []
+	if str(c.agent) != "shell":
+		bits.append(str(c.agent))
+	if str(c.project) != "":
+		bits.append(str(c.project))
+	elif str(c.title) != "":
+		bits.append(str(c.title))
+	elif str(c.cwd) != "":
+		bits.append(str(c.cwd).get_file())
+	return "  ·  ".join(bits)
+
+
+func _on_search_text(text: String) -> void:
+	_search_awaiting = ""   # typing supersedes any pending semantic reply
+	_clear_preview()        # a fresh query stops previewing (camera stays put)
+	_search_hint.text = SEARCH_HINT
+	var q := text.strip_edges().to_lower()
+	var words := q.split(" ", false)
+	var scored := []
+	for c in _search_cards():
+		var hay := (str(c.name) + " " + str(c.agent) + " " + str(c.title) + " "
+			+ str(c.project) + " " + str(c.last_event) + " " + str(c.cwd)).to_lower()
+		var score := 0.0
+		if q == "":
+			score = 1.0   # no query -> show the whole roster
+		else:
+			if hay.contains(q):
+				score += 5.0
+			for w in words:
+				if w != "" and hay.contains(w):
+					score += 1.0
+				if w != "" and str(c.name).to_lower().contains(w):
+					score += 2.0
+		if score > 0:
+			scored.append({"id": c.id, "why": _search_why(c), "score": score})
+	scored.sort_custom(func(a, b): return a.score > b.score)
+	_search_sel = 0
+	_render_search(scored)
+
+
+func _render_search(rows: Array) -> void:
+	_search_rows = rows
+	if _search_sel >= rows.size():
+		_search_sel = maxi(0, rows.size() - 1)
+	while _search_list.get_child_count() > 0:
+		var ch := _search_list.get_child(0)
+		_search_list.remove_child(ch)
+		ch.queue_free()
+	if rows.is_empty():
+		var empty := Label.new()
+		empty.text = "no match — press ⇥ to ask AI"
+		empty.add_theme_font_size_override("font_size", 12)
+		empty.add_theme_color_override("font_color", Color(0.6, 0.62, 0.66))
+		_search_list.add_child(empty)
+		return
+	var i := 0
+	for r in rows:
+		var b := Button.new()
+		b.alignment = HORIZONTAL_ALIGNMENT_LEFT
+		b.focus_mode = Control.FOCUS_NONE   # keep keyboard focus in the LineEdit
+		b.add_theme_font_size_override("font_size", 13)
+		var why := str(r.get("why", ""))
+		b.text = ("▸ " if i == _search_sel else "   ") + _term_label(int(r.id)) \
+			+ ("   —   " + why if why != "" else "")
+		var rid := int(r.id)
+		b.pressed.connect(func(): _search_choose(rid))
+		_search_list.add_child(b)
+		i += 1
+
+
+func _term_label(id: int) -> String:
+	if _groups.has(id) and _groups[id].terminal.custom_name != "":
+		return _groups[id].terminal.custom_name
+	return "termling %d" % id
+
+
+func _move_search_sel(d: int) -> void:
+	if _search_rows.is_empty():
+		return
+	_search_sel = wrapi(_search_sel + d, 0, _search_rows.size())
+	_render_search(_search_rows)
+	_preview_selected()   # stepping the list previews that termling
+
+
+func _commit_search() -> void:
+	# Enter jumps to the highlighted hit; with nothing to jump to, ask the AI.
+	if _search_rows.is_empty():
+		_run_semantic_search()
+		return
+	_search_choose(int(_search_rows[_search_sel].id))
+
+
+func _search_choose(id: int) -> void:
+	if _groups.has(id):
+		_set_focus(id)
+		_tracking_id = id   # the camera keeps tracking the one we jumped to
+	_close_search(false)
+
+
+# --- search preview: camera + occluder fade while stepping the results -------
+
+# Point the preview at the highlighted row: fade the termlings occluding it and
+# let _process pan the camera onto it. Camera is restored on Esc, kept on Enter.
+func _preview_selected() -> void:
+	if _search_sel < 0 or _search_sel >= _search_rows.size():
+		return
+	var id := int(_search_rows[_search_sel].id)
+	if not _groups.has(id):
+		return
+	_search_preview_id = id
+	var target = _groups[id]
+	for oid in _groups:
+		var g = _groups[oid]
+		g.terminal.set_dimmed(SEARCH_DIM if oid != id and _occludes(g, target) else 1.0)
+
+
+func _clear_preview() -> void:
+	_search_preview_id = -1
+	for oid in _groups:
+		_groups[oid].terminal.set_dimmed(1.0)
+
+
+func _term_rect(g: Node2D) -> Rect2:
+	var sz: Vector2 = g.terminal.onscreen_size()
+	return Rect2(g.terminal.global_position - sz * 0.5, sz)
+
+
+# a occludes target if it draws in front (greater y in the world's y-sort) and
+# its on-screen quad overlaps the target's.
+func _occludes(a: Node2D, target: Node2D) -> bool:
+	if a.terminal.global_position.y <= target.terminal.global_position.y:
+		return false
+	return _term_rect(a).intersects(_term_rect(target))
+
+
+# Ask cove-find (Anthropic API) to resolve the query. Fire-and-forget: it writes
+# find-result.json, which _poll_search picks up. Runs off the main thread so the
+# ~1-2s round trip never stalls the app.
+func _run_semantic_search() -> void:
+	var q := _search_edit.text.strip_edges()
+	if q == "":
+		return
+	var res_path := DIR + "/find-result.json"
+	if FileAccess.file_exists(res_path):
+		DirAccess.remove_absolute(res_path)  # drop any stale answer
+	_search_awaiting = q
+	_search_poll = 0.0
+	_search_hint.text = "✨ finding…"
+	var script := ProjectSettings.globalize_path("res://mcp/cove_find.py")
+	OS.create_process("/usr/bin/python3", [script, "--json", q])
+
+
+func _poll_search(delta: float) -> void:
+	if not _search_open or _search_awaiting == "":
+		return
+	_search_poll += delta
+	if _search_poll < 0.15:
+		return
+	_search_poll = 0.0
+	var path := DIR + "/find-result.json"
+	if not FileAccess.file_exists(path):
+		return
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return
+	var res = JSON.parse_string(f.get_as_text())
+	f.close()
+	if typeof(res) != TYPE_DICTIONARY or str(res.get("query", "")) != _search_awaiting:
+		return   # stale, partial, or a different query
+	_search_awaiting = ""
+	_search_hint.text = SEARCH_HINT
+	var rows := []
+	for r in res.get("ranked", []):
+		if typeof(r) == TYPE_DICTIONARY and _groups.has(int(r.get("id", -1))):
+			rows.append({"id": int(r.get("id")), "why": str(r.get("why", ""))})
+	if rows.is_empty() and res.get("id") != null and _groups.has(int(res.get("id"))):
+		rows.append({"id": int(res.get("id")), "why": str(res.get("why", ""))})
+	_search_sel = 0
+	if rows.is_empty():
+		_search_hint.text = "✨ no match: " + str(res.get("why", "")).left(40)
+	_render_search(rows)
 
 
 func _update_panel() -> void:

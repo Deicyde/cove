@@ -22,6 +22,9 @@ var term_id := -1        # kitty OS-window id (from the file name)
 var pane_id := 0         # kitty window/pane id (for `@ --match id:`)
 var frame_path := ""
 var custom_name := ""    # user/agent-assigned name shown on the nameplate
+var remote := false      # a read-only shadow of a termling on another device
+var remote_peer := ""    # which device it lives on (shown on the nameplate)
+var _focused := false     # last focus state, so set_remote can re-tint
 var cols := 0
 var rows := 0
 var mouse_mode := 0      # 0 none, 1 button, 2 motion, 3 any
@@ -120,12 +123,29 @@ func _update_nameplate() -> void:
 	if _nameplate == null:
 		return
 	var base := custom_name if custom_name != "" else "termling %d" % term_id
-	_nameplate.text = "%s  (%d×%d)" % [base, cols, rows]
+	if remote:
+		var who := (" @ " + remote_peer) if remote_peer != "" else ""
+		_nameplate.text = "◈ %s%s  (%d×%d)" % [base, who, cols, rows]
+		_nameplate.add_theme_color_override("font_color", Color(0.66, 0.78, 1.0))
+	else:
+		_nameplate.text = "%s  (%d×%d)" % [base, cols, rows]
+		_nameplate.remove_theme_color_override("font_color")
 
 
 func set_custom_name(n: String) -> void:
 	custom_name = n
 	_update_nameplate()
+
+
+# Mark this termling a remote shadow (or clear it). Remote termlings get a cool
+# blue tint and a "◈" nameplate so they're never mistaken for a local one.
+func set_remote(on: bool, peer: String = "") -> void:
+	if remote == on and remote_peer == peer:
+		return
+	remote = on
+	remote_peer = peer
+	_update_nameplate()
+	set_focused(_focused)  # re-apply the tint for the current focus state
 
 
 # On-screen size of the terminal quad (native px * zoom).
@@ -155,9 +175,23 @@ func over_resize_handle(world_pos: Vector2) -> bool:
 func set_focused(focused: bool) -> void:
 	# Focus is shown by brightness + border only. Don't touch z_index -- it would
 	# override the world's y-sorting and make the focused terminal ignore depth.
-	screen.modulate = Color.WHITE if focused else Color(0.62, 0.62, 0.68)
+	# Preserve any active search-preview transparency (alpha) across focus changes.
+	_focused = focused
+	var a := screen.modulate.a
+	if remote:
+		# Remote shadows always read cool/blue, brighter when focused.
+		screen.modulate = Color(0.80, 0.86, 1.0) if focused else Color(0.50, 0.55, 0.72)
+	else:
+		screen.modulate = Color.WHITE if focused else Color(0.62, 0.62, 0.68)
+	screen.modulate.a = a
 	if _border:
 		_border.visible = focused
+
+
+# Temporary transparency used while previewing a search hit: an occluding
+# termling fades so you can see the one behind it. 1.0 = fully opaque.
+func set_dimmed(alpha: float) -> void:
+	screen.modulate.a = alpha
 
 
 # Map a world position to a terminal cell (col,row), clamped. Used for mouse.
@@ -166,3 +200,14 @@ func cell_at(world_pos: Vector2) -> Vector2i:
 	var c := int(clampf(local.x / max(1.0, float(_size.x)) * cols, 0, cols - 1))
 	var r := int(clampf(local.y / max(1.0, float(_size.y)) * rows, 0, rows - 1))
 	return Vector2i(c, r)
+
+
+# Cell (col,row) plus which half of the cell the point falls in -- kitty uses the
+# half to place the selection edge precisely. Used for drag-to-select.
+func cell_and_half(world_pos: Vector2) -> Dictionary:
+	var local := screen.to_local(world_pos) + Vector2(_size) * 0.5  # 0..native
+	var fx: float = local.x / maxf(1.0, float(_size.x)) * cols
+	var fy: float = local.y / maxf(1.0, float(_size.y)) * rows
+	var c := int(clampf(fx, 0, cols - 1))
+	var r := int(clampf(fy, 0, rows - 1))
+	return {"cell": Vector2i(c, r), "left": (fx - floorf(fx)) <= 0.5}
