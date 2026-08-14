@@ -25,6 +25,8 @@ var custom_name := ""    # user/agent-assigned name shown on the nameplate
 var remote := false      # a read-only shadow of a termling on another device
 var remote_peer := ""    # which device it lives on (shown on the nameplate)
 var _focused := false     # last focus state, so set_remote can re-tint
+var _default_border_sb: StyleBox = null  # the local (blue) border style
+var _remote_border_sb: StyleBox = null   # a red variant for remote shadows
 var cols := 0
 var rows := 0
 var mouse_mode := 0      # 0 none, 1 button, 2 motion, 3 any
@@ -137,15 +139,34 @@ func set_custom_name(n: String) -> void:
 	_update_nameplate()
 
 
-# Mark this termling a remote shadow (or clear it). Remote termlings get a cool
-# blue tint and a "◈" nameplate so they're never mistaken for a local one.
+# Mark this termling a remote shadow (or clear it). Remote termlings get a red
+# border (always on), a cool-blue screen tint, and a "◈" nameplate so they're
+# never mistaken for a local one.
 func set_remote(on: bool, peer: String = "") -> void:
 	if remote == on and remote_peer == peer:
 		return
 	remote = on
 	remote_peer = peer
+	_ensure_border_styles()
+	if _border:
+		if on and _remote_border_sb:
+			_border.add_theme_stylebox_override("panel", _remote_border_sb)
+		elif _default_border_sb:
+			_border.add_theme_stylebox_override("panel", _default_border_sb)
 	_update_nameplate()
-	set_focused(_focused)  # re-apply the tint for the current focus state
+	set_focused(_focused)  # re-apply tint + border visibility for current focus
+
+
+# Build the red border style once, from the default blue one, so remote shadows
+# read red without disturbing the local border.
+func _ensure_border_styles() -> void:
+	if _border == null or _default_border_sb != null:
+		return
+	_default_border_sb = _border.get_theme_stylebox("panel")
+	if _default_border_sb is StyleBoxFlat:
+		var red: StyleBoxFlat = (_default_border_sb as StyleBoxFlat).duplicate()
+		red.border_color = Color(0.95, 0.25, 0.25, 0.95)
+		_remote_border_sb = red
 
 
 # On-screen size of the terminal quad (native px * zoom).
@@ -185,7 +206,8 @@ func set_focused(focused: bool) -> void:
 		screen.modulate = Color.WHITE if focused else Color(0.62, 0.62, 0.68)
 	screen.modulate.a = a
 	if _border:
-		_border.visible = focused
+		# A remote shadow keeps its red border on even when unfocused.
+		_border.visible = focused or remote
 
 
 # Temporary transparency used while previewing a search hit: an occluding
