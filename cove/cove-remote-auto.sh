@@ -19,6 +19,17 @@ MARK="◈"
 command -v "$WWID" >/dev/null 2>&1 || { echo "cove-remote-auto: wwid not on PATH" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "cove-remote-auto: python3 required" >&2; exit 1; }
 
+# Singleton: two viewers racing would each open shadows and duplicate them.
+PIDF="$DIR/remote-auto.pid"
+if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+    echo "cove-remote-auto: already running (pid $(cat "$PIDF")); exiting" >&2
+    exit 0
+fi
+echo $$ > "$PIDF"
+trap 'rm -f "$PIDF"' EXIT
+
+TAB="$(printf '\t')"
+
 echo "cove-remote-auto: mirroring peers' termlings every ${INTERVAL}s" >&2
 
 # Peer names from the wwid config's sync.peers.
@@ -53,6 +64,15 @@ while true; do
         done
     )"
 
+    current="$(open_shadows)"
+
+    # Close duplicate shadows of the same termling (keep the lowest id). Belt to
+    # the singleton's braces: a hiccup could still leave two of one title.
+    printf '%s\n' "$current" | sort -t"$TAB" -k2 | awk -F"$TAB" \
+        'NF{ if ($2==last) print $1; else last=$2 }' | while IFS= read -r dupid; do
+        [ -n "$dupid" ] || continue
+        "$KITTEN" @ --to "$SOCK" close-window --match "id:$dupid" >/dev/null 2>&1 || true
+    done
     current="$(open_shadows)"
 
     # Open any desired shadow that isn't open yet.
