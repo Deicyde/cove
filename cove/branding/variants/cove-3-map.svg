@@ -1,0 +1,66 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1c2a33"/>
+      <stop offset="55%" stop-color="#16212a"/>
+      <stop offset="100%" stop-color="#101820"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#9fe9ff"/>
+      <stop offset="100%" stop-color="#4bb8e6"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffe89a"/>
+      <stop offset="52%" stop-color="#f2bd48"/>
+      <stop offset="100%" stop-color="#c17f24"/>
+    </linearGradient>
+    <linearGradient id="parch" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f3e3b0"/>
+      <stop offset="100%" stop-color="#d6bb7e"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#8a5230"/>
+      <stop offset="45%" stop-color="#5f3a22"/>
+      <stop offset="100%" stop-color="#3f2716"/>
+    </linearGradient>
+    <linearGradient id="feather" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#b98ad6"/>
+      <stop offset="100%" stop-color="#7d51a8"/>
+    </linearGradient>
+    <linearGradient id="hatg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3a3550"/>
+      <stop offset="100%" stop-color="#221f2e"/>
+    </linearGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="9"/>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <ellipse cx="256" cy="252" rx="150" ry="150" fill="#63d6ff" opacity="0.15" filter="url(#soft)"/>
+
+  <rect x="96" y="126" width="320" height="260" rx="40" fill="url(#ring)"/>
+  <rect x="108" y="138" width="296" height="236" rx="30" fill="#0f1419"/>
+  <rect x="108" y="138" width="296" height="52" rx="30" fill="#182029"/>
+  <rect x="108" y="168" width="296" height="22" fill="#182029"/>
+  <circle cx="140" cy="164" r="9" fill="#ff6f6f"/>
+  <circle cx="170" cy="164" r="9" fill="#ffd166"/>
+  <circle cx="200" cy="164" r="9" fill="#7ee787"/>
+
+  <path d="M150 236 l46 34 -46 34" stroke="#8fe3ff" stroke-width="20" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M262 250 c-14 -22 -50 -14 -50 14 c0 26 40 46 54 58 c14 -12 54 -32 54 -58 c0 -28 -36 -36 -50 -14 c-2 3 -6 3 -8 0 z" fill="#ff7aa2"/>
+  <path d="M292 236 a30 30 0 0 1 8 6" stroke="#ffd0df" stroke-width="7" fill="none" stroke-linecap="round" opacity="0.85"/>
+
+  <g transform="rotate(-7 356 350)">
+    <rect x="298" y="298" width="116" height="100" rx="10" fill="url(#parch)"/>
+    <rect x="298" y="298" width="116" height="100" rx="10" fill="none" stroke="#b9975a" stroke-width="3"/>
+    <path d="M312 330 q18 -14 34 4 q16 18 40 -2" stroke="#7a5a2a" stroke-width="3" fill="none" stroke-dasharray="6 7" stroke-linecap="round"/>
+    <path d="M382 322 l12 12 M394 322 l-12 12" stroke="#c0392b" stroke-width="5" stroke-linecap="round"/>
+    <circle cx="322" cy="372" r="9" fill="none" stroke="#7a5a2a" stroke-width="3"/>
+    <path d="M322 366 l0 12 M316 372 l12 0" stroke="#7a5a2a" stroke-width="2"/>
+    <ellipse cx="290" cy="348" rx="12" ry="52" fill="#e6cf92" stroke="#b9975a" stroke-width="3"/>
+    <ellipse cx="290" cy="348" rx="5" ry="52" fill="#cbaf72"/>
+  </g>
+
+  <text x="256" y="446" text-anchor="middle" font-family="Menlo, monospace" font-size="66" font-weight="700" fill="#ffe6a3" letter-spacing="4">cove</text>
+</svg>

@@ -1,0 +1,69 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bgA" cx="50%" cy="42%" r="75%">
+      <stop offset="0%" stop-color="#332c26"/>
+      <stop offset="60%" stop-color="#241f1b"/>
+      <stop offset="100%" stop-color="#171310"/>
+    </radialGradient>
+    <linearGradient id="screenA" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#15181c"/>
+      <stop offset="100%" stop-color="#0d0f12"/>
+    </linearGradient>
+    <linearGradient id="glowA" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8fe3ff"/>
+      <stop offset="100%" stop-color="#4bb8e6"/>
+    </linearGradient>
+    <filter id="softA" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+  </defs>
+
+  <!-- rounded app background -->
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="url(#bgA)"/>
+  <!-- cyan aura behind mascot -->
+  <ellipse cx="256" cy="252" rx="150" ry="150" fill="#63d6ff" opacity="0.22" filter="url(#softA)"/>
+
+  <!-- soft ground shadow -->
+  <ellipse cx="256" cy="418" rx="128" ry="26" fill="#000000" opacity="0.35"/>
+
+  <!-- little legs -->
+  <rect x="214" y="372" width="26" height="46" rx="13" fill="#2b2f36"/>
+  <rect x="272" y="372" width="26" height="46" rx="13" fill="#2b2f36"/>
+  <ellipse cx="214" cy="420" rx="22" ry="12" fill="#20242a"/>
+  <ellipse cx="298" cy="420" rx="22" ry="12" fill="#20242a"/>
+
+  <!-- terminal body -->
+  <g>
+    <rect x="126" y="150" width="260" height="238" rx="34" fill="url(#glowA)"/>
+    <rect x="136" y="160" width="240" height="218" rx="26" fill="#1b1f25"/>
+    <!-- title bar -->
+    <rect x="136" y="160" width="240" height="46" rx="26" fill="#232830"/>
+    <rect x="136" y="188" width="240" height="18" fill="#232830"/>
+    <circle cx="166" cy="183" r="8" fill="#ff6f6f"/>
+    <circle cx="192" cy="183" r="8" fill="#ffd166"/>
+    <circle cx="218" cy="183" r="8" fill="#7ee787"/>
+    <!-- screen -->
+    <rect x="150" y="214" width="212" height="150" rx="16" fill="url(#screenA)"/>
+
+    <!-- cute face on screen -->
+    <!-- eyes -->
+    <ellipse cx="212" cy="272" rx="20" ry="24" fill="#ffffff"/>
+    <ellipse cx="300" cy="272" rx="20" ry="24" fill="#ffffff"/>
+    <circle cx="215" cy="276" r="12" fill="#2a2320"/>
+    <circle cx="303" cy="276" r="12" fill="#2a2320"/>
+    <circle cx="210" cy="270" r="4.5" fill="#ffffff"/>
+    <circle cx="298" cy="270" r="4.5" fill="#ffffff"/>
+    <!-- blush -->
+    <ellipse cx="182" cy="304" rx="14" ry="8" fill="#ff9ab0" opacity="0.55"/>
+    <ellipse cx="330" cy="304" rx="14" ry="8" fill="#ff9ab0" opacity="0.55"/>
+    <!-- smile -->
+    <path d="M232 306 q24 22 48 0" stroke="#e8b872" stroke-width="7" fill="none" stroke-linecap="round"/>
+    <!-- amber prompt caret -->
+    <path d="M168 330 l14 10 -14 10" stroke="#ffd68a" stroke-width="7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="192" y="344" width="26" height="8" rx="4" fill="#ffd68a"/>
+  </g>
+
+  <!-- two tiny crew mitts carrying it -->
+  <ellipse cx="120" cy="330" rx="26" ry="20" fill="#e7b48c" stroke="#2a2320" stroke-width="6"/>
+  <ellipse cx="392" cy="330" rx="26" ry="20" fill="#e7b48c" stroke="#2a2320" stroke-width="6"/>
+</svg>

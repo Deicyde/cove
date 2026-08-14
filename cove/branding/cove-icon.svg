@@ -1,0 +1,39 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1c2a33"/><stop offset="55%" stop-color="#16212a"/><stop offset="100%" stop-color="#101820"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#9fe9ff"/><stop offset="100%" stop-color="#4bb8e6"/>
+    </linearGradient>
+    <radialGradient id="parch" cx="42%" cy="38%" r="75%">
+      <stop offset="0%" stop-color="#f6e8bd"/><stop offset="70%" stop-color="#ecd79f"/><stop offset="100%" stop-color="#d8b673"/>
+    </radialGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffe89a"/><stop offset="52%" stop-color="#f2bd48"/><stop offset="100%" stop-color="#c17f24"/>
+    </linearGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="9"/></filter>
+    <filter id="drop" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <ellipse cx="256" cy="252" rx="150" ry="150" fill="#63d6ff" opacity="0.15" filter="url(#soft)"/>
+  <rect x="96" y="126" width="320" height="260" rx="40" fill="url(#ring)"/>
+  <rect x="108" y="138" width="296" height="236" rx="30" fill="#0f1419"/>
+  <rect x="108" y="138" width="296" height="52" rx="30" fill="#182029"/>
+  <rect x="108" y="168" width="296" height="22" fill="#182029"/>
+  <circle cx="140" cy="164" r="9" fill="#ff6f6f"/><circle cx="170" cy="164" r="9" fill="#ffd166"/><circle cx="200" cy="164" r="9" fill="#7ee787"/>
+  <path d="M150 236 l46 34 -46 34" stroke="#8fe3ff" stroke-width="20" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M262 250 c-14 -22 -50 -14 -50 14 c0 26 40 46 54 58 c14 -12 54 -32 54 -58 c0 -28 -36 -36 -50 -14 c-2 3 -6 3 -8 0 z" fill="#ff7aa2"/>
+  <path d="M292 236 a30 30 0 0 1 8 6" stroke="#ffd0df" stroke-width="7" fill="none" stroke-linecap="round" opacity="0.85"/>
+<g transform="translate(286 280) rotate(-7)" filter="url(#drop)"><path d="M6 12 L40 5 L76 10 L112 4 L146 12 L148 38 L144 74 L147 110 L109 116 L73 112 L36 117 L8 109 L4 79 L9 48 L4 22 Z" fill="#a8863f" opacity="0.55" transform="translate(2 3)"/><path d="M6 12 L40 5 L76 10 L112 4 L146 12 L148 38 L144 74 L147 110 L109 116 L73 112 L36 117 L8 109 L4 79 L9 48 L4 22 Z" fill="url(#parch)" stroke="#b9964e" stroke-width="2.5"/><path d="M6 12 L40 5 L76 10 L112 4 L146 12 L148 38 L144 74 L147 110 L109 116 L73 112 L36 117 L8 109 L4 79 L9 48 L4 22 Z" fill="none" stroke="#c8a86a" stroke-width="1" opacity="0.7" transform="translate(4 4) scale(0.965)"/><path d="M30 84 q-4 -18 20 -22 q18 -30 44 -6 q26 -2 26 20 q10 14 -8 22 q-14 12 -44 8 q-34 4 -46 -10 q-4 -8 8 -12 z" fill="#e6cf92" stroke="#b98a4a" stroke-width="2.5"/><path d="M74 52 q-2 -16 4 -22" stroke="#5a7a3a" stroke-width="4" fill="none" stroke-linecap="round"/><path d="M78 30 q-18 -6 -26 4 q16 -2 26 4 q0 -14 14 -18 q-10 8 -14 10 q14 -2 22 6 q-14 -8 -22 -6 z" fill="#4e8a3a"/><path d="M98 74 l20 20 M118 74 l-20 20" stroke="#c0392b" stroke-width="6.5" stroke-linecap="round"/><path d="M36 96 q24 -6 40 -2 q22 4 32 -8" stroke="#8a5a2a" stroke-width="3.4" fill="none" stroke-dasharray="0.5 8" stroke-linecap="round"/>
+      <circle cx="122" cy="30" r="15" fill="none" stroke="#8a6a2e" stroke-width="1.5" opacity="0.6"/>
+      <path d="M122 14 L127 27 L122 30 L117 27 Z" fill="#b23b2e"/>
+      <path d="M122 46 L127 33 L122 30 L117 33 Z" fill="#7a5a2a"/>
+      <path d="M106 30 L119 25 L122 30 L119 35 Z" fill="#7a5a2a"/>
+      <path d="M138 30 L125 25 L122 30 L125 35 Z" fill="#7a5a2a"/>
+      <circle cx="122" cy="30" r="2.6" fill="#7a5a2a"/><path d="M20 104 q7 -6 14 0 M120 100 q7 -6 14 0 M66 108 q7 -6 14 0" stroke="#7fa7c8" stroke-width="2.5" fill="none" stroke-linecap="round" opacity="0.6"/></g>
+  <text x="256" y="446" text-anchor="middle" font-family="Menlo, monospace" font-size="66" font-weight="700" fill="#ffe6a3" letter-spacing="4">cove</text>
+</svg>

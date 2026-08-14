@@ -22,10 +22,18 @@ var _groups := {}            # term_id:int -> CarryGroup
 var _focused_id := -1
 var _rescan_accum := 0.0
 
+# Ctrl+` focus cycling. The order is frozen (by proximity to the focused
+# terminal) on the *first* press of a run of chords, so repeated taps walk a
+# stable ring of nearby termlings; any other input ends the run.
+var _cycle_order: Array = []
+var _cycle_idx := 0
+var _cycle_active := false
+
 # camera / interaction
 var _cam: Camera2D
 var _panning := false
 var _gesture_accum := 0.0     # trackpad pan-gesture steps accumulated for resize
+var _scroll_accum := 0.0      # trackpad pan-gesture steps accumulated for terminal scroll
 var _tracking_id := -1       # term id the camera is following (double-click), or -1
 var _press_group: Node2D = null
 var _press_pos := Vector2.ZERO
@@ -65,6 +73,7 @@ var _frames := 0
 
 
 func _ready() -> void:
+	_set_window_icon()   # cove pirate-map icon on the window + macOS dock
 	kitten_exe = OS.get_environment("COVE_KITTEN")
 	kitty_socket = OS.get_environment("COVE_KITTY_SOCKET")
 	_shot_path = OS.get_environment("COVE_SHOT")
@@ -80,6 +89,14 @@ func _ready() -> void:
 	_reconcile()
 	_restore_after_reconcile()
 	_start_ls_poll()
+
+
+func _set_window_icon() -> void:
+	# The project.godot icon covers the launcher/export; this also swaps the
+	# live window + dock icon at runtime (Godot's default otherwise wins there).
+	var tex := load("res://branding/cove-icon-256.png") as Texture2D
+	if tex:
+		DisplayServer.set_icon(tex.get_image())
 
 
 func _exit_tree() -> void:
@@ -220,6 +237,45 @@ func _group_at(world_pos: Vector2) -> Node2D:
 	return best
 
 
+func _is_modifier_key(kc: int) -> bool:
+	return kc in [KEY_META, KEY_SHIFT, KEY_CTRL, KEY_ALT, KEY_CAPSLOCK]
+
+
+# Cycle focus to the next nearby terminal. On the first press of a run the ring
+# is frozen: terminals sorted by distance to the currently focused one (itself
+# first), so taps march outward through the neighbours. Subsequent taps just
+# advance the index; the run ends when any other input arrives.
+func _cycle_focus() -> void:
+	if _groups.size() <= 1:
+		return
+	if not _cycle_active or _cycle_order.size() != _groups.size():
+		_cycle_order = _order_by_proximity(_focused_id)
+		_cycle_idx = maxi(_cycle_order.find(_focused_id), 0)
+		_cycle_active = true
+	# Advance to the next still-present terminal in the frozen ring.
+	for _i in _cycle_order.size():
+		_cycle_idx = (_cycle_idx + 1) % _cycle_order.size()
+		var target: int = _cycle_order[_cycle_idx]
+		if _groups.has(target):
+			_set_focus(target)
+			if _tracking_id != -1:
+				_tracking_id = target   # keep the camera glued if we were following
+			else:
+				_pan_once = target      # otherwise glide the view over to it
+			return
+
+
+func _order_by_proximity(from_id: int) -> Array:
+	var origin := _cam.position if _cam else Vector2.ZERO
+	if _groups.has(from_id):
+		origin = _groups[from_id].get_ground_pos()
+	var ids: Array = _groups.keys()
+	ids.sort_custom(func(a, b):
+		return _groups[a].get_ground_pos().distance_squared_to(origin) \
+			< _groups[b].get_ground_pos().distance_squared_to(origin))
+	return ids
+
+
 # --- input ------------------------------------------------------------------
 
 # Catch the spawn chord early (macOS can swallow Cmd-chords before they reach
@@ -233,6 +289,18 @@ func _input(event: InputEvent) -> void:
 			_close_rename()
 			get_viewport().set_input_as_handled()
 		return
+	# Ctrl+` (optionally with Shift) -> focus the next nearby terminal. We use
+	# Ctrl, not Cmd: macOS reserves Cmd+` for its own "cycle windows of the app"
+	# shortcut and swallows/mangles the event before Godot gets a usable one.
+	var is_backtick: bool = (event.keycode == KEY_QUOTELEFT or event.physical_keycode == KEY_QUOTELEFT)
+	if is_backtick and event.ctrl_pressed:
+		_cycle_focus()
+		get_viewport().set_input_as_handled()
+		return
+	# Any other real keypress (not a bare modifier) ends the cycle run, so the
+	# next chord re-freezes a fresh proximity order.
+	if not _is_modifier_key(event.keycode):
+		_cycle_active = false
 	if event.keycode == KEY_N and (event.meta_pressed or event.ctrl_pressed):
 		_spawn_terminal()
 		get_viewport().set_input_as_handled()
@@ -244,15 +312,20 @@ func _world_mouse() -> Vector2:
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
+		if event.pressed:
+			_cycle_active = false   # any click ends a focus-cycle run
 		var wpos := _world_mouse()
-		# Wheel: over a terminal -> resize it; over empty ground -> zoom camera.
+		# Wheel over a terminal: plain scroll goes *into* the terminal; Cmd/Ctrl+
+		# scroll resizes it. Over empty ground: zoom the camera.
 		if event.pressed and event.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN]:
-			var dir := 1 if event.button_index == MOUSE_BUTTON_WHEEL_UP else -1
+			var up: bool = event.button_index == MOUSE_BUTTON_WHEEL_UP
 			var g := _group_at(wpos)
-			if g != null:
-				_resize_group(g, dir)
+			if g == null:
+				_zoom_at(event.position, 1 if up else -1)
+			elif event.meta_pressed or event.ctrl_pressed:
+				_resize_group(g, 1 if up else -1)
 			else:
-				_zoom_at(event.position, dir)
+				_scroll_terminal(g, up, 3)
 			return
 		# Right button: rename the terminal under the cursor.
 		if event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
@@ -296,22 +369,32 @@ func _unhandled_input(event: InputEvent) -> void:
 		elif _panning:
 			_cam.position -= event.relative / _cam.zoom
 	elif event is InputEventPanGesture:
-		# macOS trackpad two-finger scroll. Over a terminal: resize it (in cell
-		# steps); over empty ground: zoom the camera toward the cursor. Wheel
-		# events don't fire for trackpads, so this is the only path on macOS.
+		# macOS trackpad two-finger scroll. Over a terminal: plain scroll goes
+		# into the terminal, Cmd/Ctrl+scroll resizes it (in cell steps). Over
+		# empty ground: zoom the camera. Wheel events don't fire for trackpads,
+		# so this is the only scroll path on macOS.
 		var g := _group_at(_world_mouse())
-		if g != null:
+		if g == null:
+			_zoom_by(pow(1.08, -event.delta.y))
+		elif event.meta_pressed or event.ctrl_pressed:
 			_gesture_accum += event.delta.y
 			while _gesture_accum >= 1.5:
 				_resize_group(g, -1); _gesture_accum -= 1.5
 			while _gesture_accum <= -1.5:
 				_resize_group(g, 1); _gesture_accum += 1.5
 		else:
-			_zoom_by(pow(1.08, -event.delta.y))
+			# delta.y > 0 = swipe content up = scroll down (wheel-down / newer).
+			_scroll_accum += event.delta.y
+			var n := int(_scroll_accum)
+			if n != 0:
+				_scroll_terminal(g, n < 0, absi(n))
+				_scroll_accum -= n
 	elif event is InputEventMagnifyGesture:
 		# trackpad pinch (event.factor > 1 = fingers spreading = zoom in)
 		_zoom_by(event.factor)
-	elif event is InputEventKey and event.pressed and not event.echo:
+	elif event is InputEventKey and event.pressed:
+		# Accept echo (OS auto-repeat) here so holding a key repeats into the
+		# shell -- only the chord handling in _input() filters echoes out.
 		_on_key(event)
 
 
@@ -420,6 +503,43 @@ func _resize_group(g: Node2D, dir: int) -> void:
 		OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "resize-os-window",
 			"--match", "id:%d" % t.pane_id, "--unit", "cells",
 			"--width", str(nc), "--height", str(nr)], false)
+
+
+# Send `lines` of scroll to a terminal. If the app is grabbing the mouse (vim,
+# less, htop, most agent TUIs) forward wheel events over the fast pty socket so
+# it scrolls its own view. Otherwise scroll kitty's scrollback buffer via remote
+# control (slower, but this is the only path that moves shell history).
+func _scroll_terminal(g: Node2D, up: bool, lines: int) -> void:
+	var t = g.terminal
+	var pane: int = t.pane_id
+	if pane == 0 or lines <= 0:
+		return
+	if t.mouse_mode != 0:
+		var wheel := _wheel_bytes(t, up)
+		var out := PackedByteArray()
+		for _i in mini(lines, 10):   # cap the burst a fast flick can emit
+			out.append_array(wheel)
+		_pty(pane, out)
+	elif kitten_exe != "":
+		# `<n>l` scrolls down, `<n>l-` scrolls up (toward older lines).
+		var amount := "%dl%s" % [mini(lines, 10), "-" if up else ""]
+		OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "scroll-window",
+			"--match", "id:%d" % pane, amount], false)
+
+
+# One SGR (or X10-fallback) mouse-wheel event for the cell under the cursor.
+# Wheel-up = button 64, wheel-down = 65.
+func _wheel_bytes(t, up: bool) -> PackedByteArray:
+	var cell: Vector2i = t.cell_at(_world_mouse())
+	var col := cell.x + 1   # SGR/X10 are 1-based
+	var row := cell.y + 1
+	var btn := 64 if up else 65
+	var esc := char(27)
+	if t.mouse_proto == 2 or t.mouse_proto == 4:   # SGR / SGR-pixel
+		return ("%s[<%d;%d;%dM" % [esc, btn, col, row]).to_utf8_buffer()
+	# X10: ESC [ M  <btn+32> <col+32> <row+32>  (clamped to the legacy range)
+	return PackedByteArray([27, 91, 77,
+		mini(btn + 32, 255), mini(col + 32, 255), mini(row + 32, 255)])
 
 
 # ============================================================================

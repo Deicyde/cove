@@ -1,0 +1,66 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1c2a33"/>
+      <stop offset="55%" stop-color="#16212a"/>
+      <stop offset="100%" stop-color="#101820"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#9fe9ff"/>
+      <stop offset="100%" stop-color="#4bb8e6"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffe89a"/>
+      <stop offset="52%" stop-color="#f2bd48"/>
+      <stop offset="100%" stop-color="#c17f24"/>
+    </linearGradient>
+    <linearGradient id="parch" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f3e3b0"/>
+      <stop offset="100%" stop-color="#d6bb7e"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#8a5230"/>
+      <stop offset="45%" stop-color="#5f3a22"/>
+      <stop offset="100%" stop-color="#3f2716"/>
+    </linearGradient>
+    <linearGradient id="feather" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#b98ad6"/>
+      <stop offset="100%" stop-color="#7d51a8"/>
+    </linearGradient>
+    <linearGradient id="hatg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3a3550"/>
+      <stop offset="100%" stop-color="#221f2e"/>
+    </linearGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="9"/>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <ellipse cx="256" cy="252" rx="150" ry="150" fill="#63d6ff" opacity="0.15" filter="url(#soft)"/>
+
+  <rect x="96" y="126" width="320" height="260" rx="40" fill="url(#ring)"/>
+  <rect x="108" y="138" width="296" height="236" rx="30" fill="#0f1419"/>
+  <rect x="108" y="138" width="296" height="52" rx="30" fill="#182029"/>
+  <rect x="108" y="168" width="296" height="22" fill="#182029"/>
+  <circle cx="140" cy="164" r="9" fill="#ff6f6f"/>
+  <circle cx="170" cy="164" r="9" fill="#ffd166"/>
+  <circle cx="200" cy="164" r="9" fill="#7ee787"/>
+
+  <path d="M150 236 l46 34 -46 34" stroke="#8fe3ff" stroke-width="20" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M262 250 c-14 -22 -50 -14 -50 14 c0 26 40 46 54 58 c14 -12 54 -32 54 -58 c0 -28 -36 -36 -50 -14 c-2 3 -6 3 -8 0 z" fill="#ff7aa2"/>
+  <path d="M292 236 a30 30 0 0 1 8 6" stroke="#ffd0df" stroke-width="7" fill="none" stroke-linecap="round" opacity="0.85"/>
+
+  <g>
+    <path d="M150 138 q-30 -6 -40 -34 q-4 -22 14 -34 q26 -14 44 8 q14 18 6 44 q-6 18 -24 22 z" fill="#e14b4b"/>
+    <path d="M126 96 q-16 6 -18 26 q14 6 26 -6 q6 -12 -8 -20 z" fill="#3fb7e6"/>
+    <path d="M124 84 q-8 -14 6 -22 q12 -6 18 6" fill="#ffd166"/>
+    <circle cx="132" cy="82" r="14" fill="#e14b4b"/>
+    <circle cx="128" cy="80" r="5" fill="#fff"/>
+    <circle cx="127" cy="81" r="2.6" fill="#20202a"/>
+    <path d="M114 84 q-16 -2 -18 10 q10 8 20 -2 z" fill="#ffcf4d"/>
+    <path d="M150 150 q22 6 30 -6" stroke="#ffd166" stroke-width="6" fill="none" stroke-linecap="round"/>
+  </g>
+
+  <text x="256" y="446" text-anchor="middle" font-family="Menlo, monospace" font-size="66" font-weight="700" fill="#ffe6a3" letter-spacing="4">cove</text>
+</svg>

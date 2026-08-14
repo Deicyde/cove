@@ -9,7 +9,13 @@ DIR="/tmp/cove"
 # shellcheck disable=SC1090
 source "$DIR/dev-env"
 
-if ! pgrep -f 'launcher/kitty --title cove' >/dev/null; then
+# Is the cove-kitty still alive? Prefer the pid file dev.sh wrote; fall back to
+# scanning ps (macOS `pgrep -f` can't read kitty's args, so it never matches).
+kpid="$(cat "$DIR/kitty.pid" 2>/dev/null || true)"
+if [ -z "$kpid" ] || ! kill -0 "$kpid" 2>/dev/null; then
+    kpid="$(ps -Ao pid=,command= | awk '/[l]auncher\/kitty --title cove/ {print $1; exit}')"
+fi
+if [ -z "$kpid" ]; then
     echo "kitty (cove) isn't running — start fresh with cove/dev.sh." >&2
     exit 1
 fi

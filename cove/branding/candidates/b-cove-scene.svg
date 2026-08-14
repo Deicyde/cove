@@ -1,0 +1,72 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="skyB" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3a3550"/>
+      <stop offset="45%" stop-color="#2a2740"/>
+      <stop offset="100%" stop-color="#20202f"/>
+    </linearGradient>
+    <linearGradient id="waterB" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#63cfe8"/>
+      <stop offset="100%" stop-color="#2f7fa8"/>
+    </linearGradient>
+    <radialGradient id="moonB" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#fff4d6"/>
+      <stop offset="100%" stop-color="#ffe6a3"/>
+    </radialGradient>
+    <clipPath id="roundB"><rect x="0" y="0" width="512" height="512" rx="112"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#roundB)">
+    <rect x="0" y="0" width="512" height="512" fill="url(#skyB)"/>
+
+    <!-- moon -->
+    <circle cx="378" cy="132" r="52" fill="url(#moonB)"/>
+    <circle cx="360" cy="120" r="52" fill="#2a2740" opacity="0.9"/>
+    <!-- stars -->
+    <g fill="#fff6dc">
+      <circle cx="120" cy="96" r="4"/>
+      <circle cx="180" cy="150" r="3"/>
+      <circle cx="90" cy="180" r="2.5"/>
+      <circle cx="250" cy="86" r="3"/>
+      <circle cx="440" cy="220" r="3"/>
+      <circle cx="150" cy="70" r="2"/>
+    </g>
+
+    <!-- rolling cove hills -->
+    <path d="M0 330 Q120 288 256 322 T512 316 V512 H0 Z" fill="#2c3a34"/>
+    <path d="M0 360 Q140 322 300 356 T512 350 V512 H0 Z" fill="#25322d"/>
+
+    <!-- water cove -->
+    <path d="M0 402 Q256 372 512 402 V512 H0 Z" fill="url(#waterB)"/>
+    <g stroke="#bfeeff" stroke-width="5" fill="none" stroke-linecap="round" opacity="0.7">
+      <path d="M70 438 q18 -12 36 0"/>
+      <path d="M150 462 q18 -12 36 0"/>
+      <path d="M330 452 q18 -12 36 0"/>
+      <path d="M410 434 q18 -12 36 0"/>
+    </g>
+
+    <!-- little Termling boat sitting in the cove -->
+    <g>
+      <ellipse cx="256" cy="402" rx="86" ry="16" fill="#000" opacity="0.18"/>
+      <!-- terminal body -->
+      <rect x="176" y="230" width="160" height="150" rx="24" fill="#73d9ff"/>
+      <rect x="184" y="238" width="144" height="134" rx="18" fill="#1b1f25"/>
+      <rect x="184" y="238" width="144" height="30" rx="18" fill="#232830"/>
+      <rect x="184" y="256" width="144" height="12" fill="#232830"/>
+      <circle cx="204" cy="253" r="5" fill="#ff6f6f"/>
+      <circle cx="220" cy="253" r="5" fill="#ffd166"/>
+      <circle cx="236" cy="253" r="5" fill="#7ee787"/>
+      <rect x="194" y="278" width="124" height="86" rx="12" fill="#101317"/>
+      <!-- face -->
+      <ellipse cx="234" cy="312" rx="13" ry="16" fill="#fff"/>
+      <ellipse cx="286" cy="312" rx="13" ry="16" fill="#fff"/>
+      <circle cx="236" cy="315" r="8" fill="#2a2320"/>
+      <circle cx="288" cy="315" r="8" fill="#2a2320"/>
+      <circle cx="233" cy="311" r="3" fill="#fff"/>
+      <circle cx="285" cy="311" r="3" fill="#fff"/>
+      <ellipse cx="214" cy="332" rx="10" ry="6" fill="#ff9ab0" opacity="0.6"/>
+      <ellipse cx="306" cy="332" rx="10" ry="6" fill="#ff9ab0" opacity="0.6"/>
+      <path d="M246 334 q14 14 28 0" stroke="#e8b872" stroke-width="5" fill="none" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>

@@ -22,7 +22,12 @@ if [ ! -f "$APP/.godot/extension_list.cfg" ]; then
 fi
 
 pkill -f 'godot --path' 2>/dev/null || true
-pkill -f 'launcher/kitty --title cove' 2>/dev/null || true
+# Kill any previous cove-kitty. macOS `pkill -f` can't read kitty's args, so
+# match via the pid file dev.sh wrote + a `ps` scan on the launcher + title.
+[ -f "$DIR/kitty.pid" ] && kill "$(cat "$DIR/kitty.pid" 2>/dev/null)" 2>/dev/null || true
+for _p in $(ps -Ao pid=,command= | awk '/[l]auncher\/kitty --title cove/ {print $1}'); do
+    kill "$_p" 2>/dev/null || true
+done
 sleep 0.5
 rm -rf "$DIR"; rm -f /tmp/cove-kitty
 
@@ -33,13 +38,18 @@ KITTY_COVE=1 KITTY_COVE_DIR="$DIR" nohup "$KITTY" --title cove \
     -o font_size=16 -o remember_window_size=no \
     -o initial_window_width=60c -o initial_window_height=18c \
     "${SHELL:-/bin/zsh}" >/tmp/cove-kitty.log 2>&1 &
+COVE_KITTY_PID=$!
 
 for _ in $(seq 1 60); do ls "$DIR"/term-*.rgba >/dev/null 2>&1 && break; sleep 0.1; done
+# Record the kitty pid so reload.sh/stop.sh find it without pgrep (which can't
+# read kitty's args on macOS).
+echo "$COVE_KITTY_PID" > "$DIR/kitty.pid"
 cat > "$DIR/dev-env" <<EOF
 COVE_KITTEN=$KITTEN
 COVE_KITTY_SOCKET=$SOCK
 APP=$APP
 GODOT=$GODOT
+COVE_KITTY_PID=$COVE_KITTY_PID
 EOF
 
 COVE_KITTEN="$KITTEN" COVE_KITTY_SOCKET="$SOCK" \
