@@ -62,8 +62,15 @@ while true; do
             body="${title#"$MARK" }"          # "<key> @ <peer>"
             key="${body%% @ *}"
             peer="${body##* @ }"
-            "$KITTEN" @ --to "$SOCK" launch --type=os-window --title "$title" --keep-focus \
-                "$WWID" termling watch --peer "$peer" "$key" >/dev/null 2>&1 || true
+            # Open at a readable size (origin screens are ~50 rows; the default
+            # ~18 would clip to the bottom slice). Cmd/Ctrl+scroll resizes further.
+            newid="$("$KITTEN" @ --to "$SOCK" launch --type=os-window --title "$title" --keep-focus \
+                "$WWID" termling watch --peer "$peer" "$key" 2>/dev/null)"
+            if [ -n "$newid" ]; then
+                "$KITTEN" @ --to "$SOCK" resize-os-window --match "id:$newid" --unit cells \
+                    --width "${COVE_REMOTE_COLS:-120}" --height "${COVE_REMOTE_ROWS:-40}" \
+                    >/dev/null 2>&1 || true
+            fi
         fi
     done
 

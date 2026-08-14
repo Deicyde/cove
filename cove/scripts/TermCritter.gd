@@ -112,8 +112,9 @@ func _apply_iosurface(w: int, h: int, id_a: int, id_b: int, ready: int) -> void:
 		screen.texture = t
 
 
-# Padding of the red backdrop mat beyond the terminal edge, on-screen px.
-const REMOTE_PAD := 16.0
+# Padding of the red backdrop mat beyond the terminal edge, on-screen px. Kept
+# to ~the blue focus border's width so the red frame reads at the same weight.
+const REMOTE_PAD := 4.0
 
 func _layout_decorations() -> void:
 	var half := onscreen_size() * 0.5

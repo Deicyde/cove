@@ -55,7 +55,13 @@ existing="$(open_shadows || true)"
         continue
     fi
     echo "cove-remote: opening shadow $title ($MODE)" >&2
-    # os-window (not a pane) so the Cove carries it as its own termling.
-    "$KITTEN" @ --to "$SOCK" launch --type=os-window --title "$title" --keep-focus \
-        "$WWID" termling "$MODE" --peer "$PEER" "$key" >/dev/null 2>&1 || true
+    # os-window (not a pane) so the Cove carries it as its own termling; sized
+    # readable (Cmd/Ctrl+scroll resizes further).
+    newid="$("$KITTEN" @ --to "$SOCK" launch --type=os-window --title "$title" --keep-focus \
+        "$WWID" termling "$MODE" --peer "$PEER" "$key" 2>/dev/null)"
+    if [ -n "$newid" ]; then
+        "$KITTEN" @ --to "$SOCK" resize-os-window --match "id:$newid" --unit cells \
+            --width "${COVE_REMOTE_COLS:-120}" --height "${COVE_REMOTE_ROWS:-40}" \
+            >/dev/null 2>&1 || true
+    fi
 done
