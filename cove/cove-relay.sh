@@ -27,12 +27,17 @@ command -v python3 >/dev/null 2>&1 || { echo "cove-relay: python3 required" >&2;
 
 echo "cove-relay: streaming cove-kitty ($SOCK) termlings to wwid every ${INTERVAL}s" >&2
 
-# key -> 1 for every session we've registered this run, so we can end vanished ones.
-declare -A KNOWN
+# Space-delimited " w1 w4 … " of keys registered this run, so we can end vanished
+# ones. Plain string, not an associative array — macOS ships bash 3.2.
+KNOWN=" "
+has_key() { case "$2" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
-# Emit one `id\tagent\tcwd\ttitle` line per live window (tabs skipped).
-windows() {
-    "$KITTEN" @ --to "$SOCK" ls 2>/dev/null | python3 - <<'PY'
+# The JSON parser lives in a temp file, NOT `python3 - <<HEREDOC`: with a
+# heredoc, python reads its *script* from stdin and the piped `kitten @ ls` JSON
+# is discarded, so `json.load(sys.stdin)` sees EOF. A file keeps stdin the pipe.
+PARSER="$(mktemp -t cove-relay-parse.XXXXXX)"
+trap 'rm -f "$PARSER"' EXIT
+cat > "$PARSER" <<'PY'
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -58,18 +63,22 @@ for osw in data:
                     break
             print("\t".join([str(wid), agent, cwd, title]))
 PY
+
+# Emit one `id\tagent\tcwd\ttitle` line per live window (tabs skipped).
+windows() {
+    "$KITTEN" @ --to "$SOCK" ls 2>/dev/null | python3 "$PARSER"
 }
 
 while true; do
-    declare -A SEEN=()
+    seen=" "
     while IFS=$'\t' read -r wid agent cwd title; do
         [ -n "$wid" ] || continue
         key="w${wid}"
-        SEEN[$key]=1
-        if [ -z "${KNOWN[$key]:-}" ]; then
+        seen="$seen$key "
+        if ! has_key "$key" "$KNOWN"; then
             "$WWID" session register "$key" --agent "$agent" \
                 ${cwd:+--cwd "$cwd"} ${title:+--title "$title"} >/dev/null 2>&1 || true
-            KNOWN[$key]=1
+            KNOWN="$KNOWN$key "
         fi
         # Snapshot the screen text and publish it (wwid diffs vs the last).
         "$KITTEN" @ --to "$SOCK" get-text --match "id:${wid}" 2>/dev/null \
@@ -84,14 +93,18 @@ while true; do
         fi
     done < <(windows)
 
-    # End any termling that has gone away since last tick.
-    for key in "${!KNOWN[@]}"; do
-        if [ -z "${SEEN[$key]:-}" ]; then
+    # End any termling that has gone away since last tick; rebuild KNOWN from the
+    # survivors.
+    survivors=" "
+    for key in $KNOWN; do
+        if has_key "$key" "$seen"; then
+            survivors="$survivors$key "
+        else
             "$WWID" session end "$key" >/dev/null 2>&1 || true
             "$WWID" termling end "$key" >/dev/null 2>&1 || true
-            unset 'KNOWN[$key]'
         fi
     done
+    KNOWN="$survivors"
 
     sleep "$INTERVAL"
 done
