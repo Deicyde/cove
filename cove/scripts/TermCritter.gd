@@ -27,6 +27,7 @@ var remote_peer := ""    # which device it lives on (shown on the nameplate)
 var _focused := false     # last focus state, so set_remote can re-tint
 var _default_border_sb: StyleBox = null  # the local (blue) border style
 var _remote_border_sb: StyleBox = null   # a red variant for remote shadows
+var _backdrop: ColorRect = null          # red background mat, remote only
 var cols := 0
 var rows := 0
 var mouse_mode := 0      # 0 none, 1 button, 2 motion, 3 any
@@ -111,11 +112,20 @@ func _apply_iosurface(w: int, h: int, id_a: int, id_b: int, ready: int) -> void:
 		screen.texture = t
 
 
+# Padding of the red backdrop mat beyond the terminal edge, on-screen px.
+const REMOTE_PAD := 16.0
+
 func _layout_decorations() -> void:
 	var half := onscreen_size() * 0.5
 	if _border:
 		_border.position = -half
 		_border.size = onscreen_size()
+	if _backdrop:
+		# A red mat that extends past the terminal so the red reads as the
+		# termling's background, framing the (opaque) terminal content.
+		var pad := Vector2(REMOTE_PAD, REMOTE_PAD)
+		_backdrop.position = -half - pad
+		_backdrop.size = onscreen_size() + pad * 2.0
 	if _nameplate:
 		_nameplate.position = Vector2(-half.x, -half.y - 22.0)
 		_update_nameplate()
@@ -148,11 +158,15 @@ func set_remote(on: bool, peer: String = "") -> void:
 	remote = on
 	remote_peer = peer
 	_ensure_border_styles()
+	_ensure_backdrop()
 	if _border:
 		if on and _remote_border_sb:
 			_border.add_theme_stylebox_override("panel", _remote_border_sb)
 		elif _default_border_sb:
 			_border.add_theme_stylebox_override("panel", _default_border_sb)
+	if _backdrop:
+		_backdrop.visible = on
+	_layout_decorations()  # size the backdrop mat
 	_update_nameplate()
 	set_focused(_focused)  # re-apply tint + border visibility for current focus
 
@@ -167,6 +181,19 @@ func _ensure_border_styles() -> void:
 		var red: StyleBoxFlat = (_default_border_sb as StyleBoxFlat).duplicate()
 		red.border_color = Color(0.95, 0.25, 0.25, 0.95)
 		_remote_border_sb = red
+
+
+# The red background mat, created lazily and placed BEHIND the terminal (child 0
+# draws first) so the terminal content stays on top and legible.
+func _ensure_backdrop() -> void:
+	if _backdrop != null:
+		return
+	_backdrop = ColorRect.new()
+	_backdrop.color = Color(0.72, 0.09, 0.09, 0.92)  # remote red
+	_backdrop.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_backdrop.visible = false
+	add_child(_backdrop)
+	move_child(_backdrop, 0)  # behind $Screen
 
 
 # On-screen size of the terminal quad (native px * zoom).
@@ -200,8 +227,9 @@ func set_focused(focused: bool) -> void:
 	_focused = focused
 	var a := screen.modulate.a
 	if remote:
-		# Remote shadows always read cool/blue, brighter when focused.
-		screen.modulate = Color(0.80, 0.86, 1.0) if focused else Color(0.50, 0.55, 0.72)
+		# Keep remote content legible (near-neutral); the red mat + red border,
+		# not a screen tint, carry the "remote" signal. Dim slightly unfocused.
+		screen.modulate = Color.WHITE if focused else Color(0.82, 0.78, 0.78)
 	else:
 		screen.modulate = Color.WHITE if focused else Color(0.62, 0.62, 0.68)
 	screen.modulate.a = a
