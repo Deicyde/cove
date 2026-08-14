@@ -43,6 +43,7 @@ var _agent := "shell"
 var _busy := false
 var _attention := false
 var _goal = null          # Vector2 commanded target, or null = wander
+var _dragging := false    # the user is sliding this termling around by the mouse
 
 
 func setup(id: int, path: String, world_bounds: Rect2) -> void:
@@ -107,6 +108,25 @@ func command_stop() -> void:
 	_pick_target()
 
 
+# --- drag-to-move: the mouse slides the termling along the ground ------------
+
+func begin_drag_move() -> void:
+	_dragging = true
+	_goal = null
+
+
+func set_drag_pos(world_pos: Vector2) -> void:
+	# No clamp: drag a termling anywhere. It holds where dropped (end_drag_move
+	# sets _goal), the ground grid follows the camera, and Cmd+K finds strays.
+	# Only idle wander stays within `bounds`.
+	position = world_pos
+
+
+func end_drag_move() -> void:
+	_dragging = false
+	_goal = position   # hold where it was dropped rather than wandering straight off
+
+
 func _pick_target() -> void:
 	_target = Vector2(
 		randf_range(bounds.position.x + 160, bounds.end.x - 160),
@@ -141,14 +161,18 @@ func _process(delta: float) -> void:
 					_recover = 0.9
 					_left.set_airborne(false); _right.set_airborne(false)
 			_restore_shadow(delta)
-		_:  # wander / commanded
+		_:  # wander / commanded / dragged
 			_rig.position.y = lerp(_rig.position.y, 0.0, 12.0 * delta)
-			if _recover > 0.0:
-				_recover -= delta
-				_left.set_state("surprised"); _right.set_state("surprised")
+			if _dragging:
+				# The mouse owns the position; carriers just hustle to keep up.
+				_left.set_state("walk"); _right.set_state("walk")
 			else:
-				_navigate(delta)
-			position += _separation() * delta
+				if _recover > 0.0:
+					_recover -= delta
+					_left.set_state("surprised"); _right.set_state("surprised")
+				else:
+					_navigate(delta)
+				position += _separation() * delta
 			_restore_shadow(delta)
 
 
@@ -173,21 +197,23 @@ func _navigate(delta: float) -> void:
 				_wait = randf_range(1.2, 3.5)
 
 
-# Push away from nearby groups so terminals don't clip, but let them be close.
+# Push away from nearby groups so the roster doesn't clump, but keep the personal
+# space modest so termlings still drift close enough to occlude now and then (a
+# little depth overlap reads as a living crowd). Firm push, not a big radius.
 func _separation() -> Vector2:
 	var push := Vector2.ZERO
 	var parent := get_parent()
 	if parent == null:
 		return push
-	var min_d: float = terminal.onscreen_size().x * 0.6 + 150.0
+	var min_d: float = terminal.onscreen_size().x * 0.55 + 180.0
 	for sib in parent.get_children():
 		if sib == self or not sib.has_method("get_ground_pos"):
 			continue
 		var d: Vector2 = position - sib.get_ground_pos()
 		var dist := d.length()
 		if dist > 0.5 and dist < min_d:
-			push += (d / dist) * (min_d - dist) * 2.2
-	return push
+			push += (d / dist) * (min_d - dist) * 2.8
+	return push.limit_length(SPEED * 2.5)
 
 
 func _layout(_delta: float) -> void:
