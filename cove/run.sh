@@ -40,6 +40,9 @@ fi
 
 # The kitty window is created hidden (cove mode); only Godot is visible.
 # sync_to_monitor=no lets the hidden window keep rendering without a display link.
+# cove-shell.sh wraps each shell in an abduco session (survives a kitty restart;
+# see reload-kitty.sh). -o shell= makes Cmd+N windows use it too.
+WRAPPER="$REPO/cove/cove-shell.sh"
 "$KITTY" --title cove \
     --listen-on "$SOCK" \
     -o allow_remote_control=yes \
@@ -47,7 +50,8 @@ fi
     -o sync_to_monitor=no \
     -o font_size=16 \
     -o remember_window_size=no -o initial_window_width=60c -o initial_window_height=18c \
-    "${SHELL:-/bin/zsh}" &
+    -o shell="$WRAPPER" \
+    "$WRAPPER" &
 KITTY_PID=$!
 cleanup() { kill "$KITTY_PID" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -57,5 +61,8 @@ for _ in $(seq 1 50); do ls "$DIR"/term-*.rgba >/dev/null 2>&1 && break; sleep 0
 
 export COVE_KITTEN="$KITTEN"
 export COVE_KITTY_SOCKET="$SOCK"
+
+# Auto-start remote termlings (relay + peer auto-viewer) before the Godot host.
+"$REPO/cove/cove-remote-start.sh" || true
 
 "$GODOT" --path "$REPO/cove"

@@ -80,8 +80,9 @@ while true; do
                 ${cwd:+--cwd "$cwd"} ${title:+--title "$title"} >/dev/null 2>&1 || true
             KNOWN="$KNOWN$key "
         fi
-        # Snapshot the screen text and publish it (wwid diffs vs the last).
-        "$KITTEN" @ --to "$SOCK" get-text --match "id:${wid}" 2>/dev/null \
+        # Snapshot the screen WITH colour (--ansi keeps SGR codes) and publish it;
+        # wwid diffs vs the last snapshot, so only changed lines travel.
+        "$KITTEN" @ --to "$SOCK" get-text --ansi --extent screen --match "id:${wid}" 2>/dev/null \
             | "$WWID" termling publish "$key" 2>/dev/null || true
         # Replay any input a viewer forwarded to drive this termling. Gated at
         # wwid by sync.allow_remote_input, so this is empty unless you opted in.

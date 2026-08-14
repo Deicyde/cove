@@ -33,11 +33,16 @@ rm -rf "$DIR"; rm -f /tmp/cove-kitty
 
 export COVE=1
 [ "${COVE_IOSURFACE:-}" = "1" ] && export KITTY_COVE_IOSURFACE=1
+# Each terminal runs cove-shell.sh, which wraps the shell in an abduco session so
+# it survives a kitty restart (see reload-kitty.sh). -o shell= makes Cmd+N windows
+# use it too. abduco is a transparent passthrough, so rendering is unchanged.
+WRAPPER="$APP/cove-shell.sh"
 KITTY_COVE=1 KITTY_COVE_DIR="$DIR" nohup "$KITTY" --title cove \
     --listen-on "$SOCK" -o allow_remote_control=yes -o sync_to_monitor=no \
     -o font_size=16 -o remember_window_size=no \
     -o initial_window_width=60c -o initial_window_height=18c \
-    "${SHELL:-/bin/zsh}" >/tmp/cove-kitty.log 2>&1 &
+    -o shell="$WRAPPER" \
+    "$WRAPPER" >/tmp/cove-kitty.log 2>&1 &
 COVE_KITTY_PID=$!
 
 for _ in $(seq 1 60); do ls "$DIR"/term-*.rgba >/dev/null 2>&1 && break; sleep 0.1; done
@@ -51,6 +56,9 @@ APP=$APP
 GODOT=$GODOT
 COVE_KITTY_PID=$COVE_KITTY_PID
 EOF
+
+# Auto-start remote termlings (relay + peer auto-viewer) — survives Godot reloads.
+"$APP/cove-remote-start.sh" || true
 
 COVE_KITTEN="$KITTEN" COVE_KITTY_SOCKET="$SOCK" \
     nohup "$GODOT" --path "$APP" >/tmp/cove-godot.log 2>&1 &
