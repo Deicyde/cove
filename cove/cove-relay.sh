@@ -49,8 +49,12 @@ for osw in data:
             wid = w.get("id")
             if wid is None:
                 continue
-            cwd = w.get("cwd") or ""
             title = (w.get("title") or "").replace("\t", " ")
+            # Skip remote shadows (◈-titled): they're views of OTHER machines'
+            # termlings, so re-publishing them would mirror recursively.
+            if title.startswith("◈"):
+                continue
+            cwd = w.get("cwd") or ""
             # Crude agent sniff from the window's foreground process tree.
             blob = " ".join(
                 " ".join(p.get("cmdline", []))
