@@ -74,6 +74,14 @@ while true; do
         # Snapshot the screen text and publish it (wwid diffs vs the last).
         "$KITTEN" @ --to "$SOCK" get-text --match "id:${wid}" 2>/dev/null \
             | "$WWID" termling publish "$key" 2>/dev/null || true
+        # Replay any input a viewer forwarded to drive this termling. Gated at
+        # wwid by sync.allow_remote_input, so this is empty unless you opted in.
+        input="$("$WWID" termling input-drain "$key" 2>/dev/null || true)"
+        if [ -n "$input" ]; then
+            printf '%s' "$input" \
+                | "$KITTEN" @ --to "$SOCK" send-text --match "id:${wid}" --stdin \
+                  >/dev/null 2>&1 || true
+        fi
     done < <(windows)
 
     # End any termling that has gone away since last tick.

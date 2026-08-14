@@ -194,8 +194,12 @@ and the text stays selectable. It rides on wwid's multi-device sync (see
   termling a cool-blue tint and a `◈` nameplate (`TermCritter.set_remote`) so a
   remote shadow is never mistaken for a local termling.
 
-Driving a remote termling (forwarding your keystrokes back to its origin) is the
-next slice; the read path above is one-way.
+- **Driving** (take control): watching is read-only by default. The origin opts
+  in with `sync.allow_remote_input` in its wwid config; the viewer then runs
+  `cove/cove-remote.sh <peer> --drive` (or `wwid termling drive`). Lines you type
+  are forwarded to `POST /termlings/:key/input`, drained by `cove-relay.sh` on
+  the origin and replayed into the real terminal via `kitten @ send-text`. Double
+  gate: the sync+api_key surface AND the explicit opt-in.
 
 ## Known limitations
 

@@ -8,13 +8,18 @@
 # treatment (tinted screen + "◈" nameplate). Re-run to pick up new termlings;
 # already-open shadows are left alone.
 #
-#   cove/cove-remote.sh <peer>
+#   cove/cove-remote.sh <peer> [--drive]
 #
 # <peer> is a sync-peer name from your wwid config (sync.peers[].name).
+# With --drive the shadow forwards lines you type back to the peer (take
+# control) — needs the peer to have set sync.allow_remote_input. Read-only
+# otherwise.
 set -euo pipefail
 
 PEER="${1:-}"
-[ -n "$PEER" ] || { echo "usage: cove-remote.sh <peer>" >&2; exit 1; }
+[ -n "$PEER" ] || { echo "usage: cove-remote.sh <peer> [--drive]" >&2; exit 1; }
+MODE="watch"
+[ "${2:-}" = "--drive" ] && MODE="drive"
 
 DIR="${KITTY_COVE_DIR:-/tmp/cove}"
 [ -f "$DIR/dev-env" ] && . "$DIR/dev-env"
@@ -49,7 +54,7 @@ existing="$(open_shadows || true)"
         echo "cove-remote: $title already open" >&2
         continue
     fi
-    echo "cove-remote: opening shadow $title" >&2
+    echo "cove-remote: opening shadow $title ($MODE)" >&2
     "$KITTEN" @ --to "$SOCK" launch --type=window --title "$title" --keep-focus \
-        "$WWID" termling watch --peer "$PEER" "$key" >/dev/null 2>&1 || true
+        "$WWID" termling "$MODE" --peer "$PEER" "$key" >/dev/null 2>&1 || true
 done
