@@ -55,6 +55,7 @@ existing="$(open_shadows || true)"
         continue
     fi
     echo "cove-remote: opening shadow $title ($MODE)" >&2
-    "$KITTEN" @ --to "$SOCK" launch --type=window --title "$title" --keep-focus \
+    # os-window (not a pane) so the Cove carries it as its own termling.
+    "$KITTEN" @ --to "$SOCK" launch --type=os-window --title "$title" --keep-focus \
         "$WWID" termling "$MODE" --peer "$PEER" "$key" >/dev/null 2>&1 || true
 done
