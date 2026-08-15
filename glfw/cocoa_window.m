@@ -2833,6 +2833,11 @@ _glfwPlatformMaximizeWindow(_GLFWwindow *window) {
 
 void
 _glfwPlatformShowWindow(_GLFWwindow *window, bool move_to_active_screen) {
+    // cove: every kitty window lives only inside Godot as a hidden, off-screen
+    // window rendered into an FBO. Never order one on-screen -- otherwise a
+    // freshly-launched os-window (e.g. a remote-shadow mirror) would flash a
+    // native "cove" window onto the desktop and steal focus.
+    if (getenv("KITTY_COVE")) return;
     const bool is_background = window->ns.layer_shell.is_active && window->ns.layer_shell.config.type == GLFW_LAYER_SHELL_BACKGROUND;
     NSWindow *nw = window->ns.object;
     if (move_to_active_screen) {
@@ -2912,6 +2917,11 @@ _glfwPlatformWindowBell(_GLFWwindow *window UNUSED) {
 
 void
 _glfwPlatformFocusWindow(_GLFWwindow *window) {
+    // cove: windows are hidden and carried inside Godot. When one termling is
+    // killed (Ctrl-D), kitty moves focus to the next window; raising it here
+    // would flash that OTHER termling's native window onto the desktop. Never
+    // raise/activate on-screen in cove mode.
+    if (getenv("KITTY_COVE")) return;
     if (_glfwPlatformWindowIconified(window)) {
         // miniaturized windows return false in canBecomeKeyWindow therefore
         // unminiaturize first
