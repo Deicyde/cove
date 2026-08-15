@@ -21,24 +21,40 @@ cwd) or an error if you're not in one.
 
 **`list_terminals`** returns every terminal: `id`, `pane_id`, `agent`
 (`claude`/`codex`/`opencode`/`shell`), `busy`, `attention`, `pos [x,y]`,
-`cols`/`rows`, `cwd`, and `following`. Plus the `camera`. World coordinates:
-the ground spans roughly x∈[-1600,1600], y∈[-1100,1100]; +x is right, +y is down.
-`id` is the Cove terminal id; `pane_id` is kitty's `$KITTY_WINDOW_ID`. Every
-tool that takes an `id` accepts either.
+`cols`/`rows`, `cwd`, `zone`, and `following`. Plus the `camera` and the `zones`
+list (named regions with their rects). World coordinates: the ground spans
+roughly x∈[-1600,1600], y∈[-1100,1100]; +x is right, +y is down. `id` is the Cove
+terminal id; `pane_id` is kitty's `$KITTY_WINDOW_ID`. Every tool that takes an
+`id` accepts either.
+
+## Zones
+
+The Cove auto-clusters termlings into labelled regions by project (git-repo /
+cwd), so location tells you who's working on what without anyone issuing a
+command. Drag a termling into a region to override its membership, or drop it on
+open ground to pin it loose. So prefer *staying in your zone* over `follow` —
+the zone already keeps a team together while leaving each termling readable.
 
 ## Commanding
 
 - **`move(id, x, y)`** — send a terminal's carriers to a world point. Cancels any
   follow. The engine steers around other terminals.
 - **`follow(id, target)`** — `id` shadows `target`, standing beside it and keeping
-  up as it moves, without overlapping.
-- **`stop(id)`** — end follow/move; it wanders again.
+  up as it moves, without overlapping. Several followers of one target fan into a
+  ring around it. Use only for genuine pairing — following clusters termlings, so
+  otherwise leave each in its own spot so position stays a meaningful cue.
+- **`stop(id)`** — end follow/move; it wanders again, staying near where it is now
+  (each termling keeps to a small neighbourhood around its home, not the whole map).
 - **`focus(id)`** — focus it (typing goes there) and make the camera track it.
 - **`rename(name, id?)`** — name a terminal (shown on its nameplate). From inside
   a terminal you can omit `id` to name your own (uses `$KITTY_WINDOW_ID`). Empty
   name resets to `terminal N`.
+- **`assign(id, zone)`** — put a termling in a named zone (created if new), so it
+  walks over and keeps its wander inside that region. Empty `zone` pins it on open
+  ground. Overrides auto-zoning for that termling.
+- **`autozone(on)`** — toggle project auto-clustering (on by default).
 - **`gather()`** — cluster everyone around the current camera view.
-- **`scatter()`** — release everyone to wander.
+- **`scatter()`** — release everyone to wander; also clears all zones.
 
 To name the terminal you're running in: `rename(name="build")`. Users can also
 rename manually by right-clicking a terminal on the stage.

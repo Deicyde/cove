@@ -1557,7 +1557,12 @@ filter_option(int key UNUSED, int mods, unsigned int native_key UNUSED, unsigned
 
 static bool
 on_application_reopen(int has_visible_windows) {
-    if (has_visible_windows) return true;
+    // cove: terminals live only inside Godot as hidden windows, so there are
+    // never any "visible" windows. Left alone, every app reactivation (e.g. when
+    // a termling exits with C-d and focus bounces back to the app) would fire a
+    // reopen with has_visible_windows == 0 and spawn a spurious blank native
+    // window. Never auto-create one in cove mode.
+    if (cove_enabled() || has_visible_windows) return true;
     set_cocoa_pending_action(NEW_OS_WINDOW, NULL);
     return false;
 }

@@ -12,6 +12,10 @@ const SPEED := 90.0
 const GRAVITY := 2800.0
 const BOUNCE := 0.30
 const LIFT_H := 250.0
+# Idle wander stays within this radius of the termling's "home" anchor, so a
+# termling keeps to its neighbourhood instead of roaming the whole ground. Home
+# is set where it spawns/lands and re-set wherever you drop it (drag = zoning).
+const WANDER_RADIUS := 260.0
 
 const AGENT_COLORS := {
 	"claude": Color(0.90, 0.58, 0.30),
@@ -44,6 +48,9 @@ var _busy := false
 var _attention := false
 var _goal = null          # Vector2 commanded target, or null = wander
 var _dragging := false    # the user is sliding this termling around by the mouse
+var _home := Vector2.ZERO  # centre of the idle-wander neighbourhood
+var _home_set := false     # anchored once position is final (first _process tick)
+var _zone = null           # Rect2 the termling is confined to, or null = free wander
 
 
 func setup(id: int, path: String, world_bounds: Rect2) -> void:
@@ -104,7 +111,10 @@ func command_move(world_pos: Vector2) -> void:
 
 
 func command_stop() -> void:
+	# Wander around wherever it is now, not back across the whole map.
 	_goal = null
+	_home = position
+	_home_set = true
 	_pick_target()
 
 
@@ -123,14 +133,52 @@ func set_drag_pos(world_pos: Vector2) -> void:
 
 
 func end_drag_move() -> void:
+	# Dropping a termling relocates its neighbourhood: it holds here, then wanders
+	# only around this spot. This is the "zoning" gesture — drag a team together.
 	_dragging = false
+	_home = position
+	_home_set = true
 	_goal = position   # hold where it was dropped rather than wandering straight off
 
 
 func _pick_target() -> void:
-	_target = Vector2(
-		randf_range(bounds.position.x + 160, bounds.end.x - 160),
-		randf_range(bounds.position.y + 160, bounds.end.y - 120))
+	if _zone != null:
+		# Confined to a zone: pick anywhere inside it (inset so termlings don't sit
+		# on the border or under the label).
+		var z: Rect2 = _zone
+		var inset := 90.0
+		var w := maxf(0.0, z.size.x - inset * 2.0)
+		var h := maxf(0.0, z.size.y - inset * 2.0)
+		_target = z.position + Vector2(inset, inset) + Vector2(randf() * w, randf() * h)
+		return
+	var c := _home if _home_set else position
+	var ang := randf() * TAU
+	var r := sqrt(randf()) * WANDER_RADIUS   # sqrt = uniform over the disc
+	_target = c + Vector2(cos(ang), sin(ang)) * r
+	# Keep the pick on the ground even when home sits near the world edge.
+	_target.x = clampf(_target.x, bounds.position.x + 160, bounds.end.x - 160)
+	_target.y = clampf(_target.y, bounds.position.y + 160, bounds.end.y - 120)
+
+
+# --- zones: confine idle wander to a named region on the ground --------------
+
+# Confine to a zone. Recentres home there and, if it's idling, sends it inside
+# now rather than waiting for the next re-pick. A following/lifted termling keeps
+# its motion; the zone just takes effect once it's wandering again.
+func assign_zone(rect: Rect2) -> void:
+	_zone = rect
+	_home = rect.get_center()
+	_home_set = true
+	if _state != "lifted" and _state != "falling" and not _dragging and _goal == null:
+		_pick_target()
+
+
+func clear_zone() -> void:
+	_zone = null
+
+
+func zone_rect():
+	return _zone
 
 
 func _carry_h() -> float:
@@ -162,6 +210,12 @@ func _process(delta: float) -> void:
 					_left.set_airborne(false); _right.set_airborne(false)
 			_restore_shadow(delta)
 		_:  # wander / commanded / dragged
+			# Anchor the wander neighbourhood once Cove has placed us (position is
+			# still default during setup(), so we can't do this there).
+			if not _home_set:
+				_home = position
+				_home_set = true
+				_pick_target()
 			_rig.position.y = lerp(_rig.position.y, 0.0, 12.0 * delta)
 			if _dragging:
 				# The mouse owns the position; carriers just hustle to keep up.

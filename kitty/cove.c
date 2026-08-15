@@ -102,11 +102,22 @@ resolve_dir(void) {
 #define MSG_PTY 0
 #define MSG_RESIZE 1
 #define MSG_SPAWN 2
+#define MSG_MOUSE 3
 
 typedef struct { id_type id; uint32_t cols, rows; } PendingResize;
 static PendingResize resize_queue[COVE_MAX];
 static int resize_count = 0;
 static int pending_spawns = 0;
+
+// Mouse-driven text selection: Godot sends cell coords as you drag over the
+// focused terminal; we replay them into kitty's own selection so highlighting +
+// copy-to-clipboard work exactly as if the mouse were real. phase: 0 start,
+// 1 update (drag), 2 end. These touch the Screen, so they run on the main thread.
+#define COVE_MOUSE_MAX 256
+typedef struct { id_type id; uint8_t phase; uint8_t in_left_half; uint32_t x, y; } PendingMouse;
+static PendingMouse mouse_queue[COVE_MOUSE_MAX];
+static int mouse_count = 0;
+
 static pthread_mutex_t resize_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_t input_thread;
@@ -134,10 +145,30 @@ enqueue_resize(id_type id, uint32_t cols, uint32_t rows) {
     wakeup_main_loop();  // ensure the main thread wakes to drain + apply the resize
 }
 
+// Queue a selection step. Runs of drag-updates for the same window collapse to
+// the latest position (like resizes) so a fast drag can't overflow the queue;
+// start/end steps are always kept so the selection brackets stay intact.
+static void
+enqueue_mouse(id_type id, uint8_t phase, uint32_t x, uint32_t y, uint8_t in_left_half) {
+    pthread_mutex_lock(&resize_lock);
+    if (phase == 1 && mouse_count > 0) {
+        PendingMouse *last = &mouse_queue[mouse_count - 1];
+        if (last->id == id && last->phase == 1) {
+            last->x = x; last->y = y; last->in_left_half = in_left_half;
+            pthread_mutex_unlock(&resize_lock);
+            wakeup_main_loop();
+            return;
+        }
+    }
+    if (mouse_count < COVE_MOUSE_MAX) mouse_queue[mouse_count++] = (PendingMouse){ id, phase, in_left_half, x, y };
+    pthread_mutex_unlock(&resize_lock);
+    wakeup_main_loop();
+}
+
 bool
 cove_has_pending_control(void) {
     pthread_mutex_lock(&resize_lock);
-    bool any = resize_count > 0 || pending_spawns > 0;
+    bool any = resize_count > 0 || pending_spawns > 0 || mouse_count > 0;
     pthread_mutex_unlock(&resize_lock);
     return any;
 }
@@ -167,7 +198,38 @@ handle_input_client(int cfd) {
             pending_spawns++;
             pthread_mutex_unlock(&resize_lock);
             wakeup_main_loop();
+        } else if (kind == MSG_MOUSE) {
+            unsigned char phase, in_left_half;
+            uint32_t xy[2];
+            if (!read_all(cfd, &phase, 1)) return;
+            if (!read_all(cfd, xy, 8)) return;
+            if (!read_all(cfd, &in_left_half, 1)) return;
+            enqueue_mouse((id_type)id, phase, xy[0], xy[1], in_left_half);
         } else return;  // unknown kind: drop the connection
+    }
+}
+
+// Replay one selection step into kitty's own selection machinery. Setting the
+// window's mouse_pos first mirrors what a real mouse move would have done, so
+// start/update behave identically to a hand-drawn selection.
+static void
+apply_mouse(const PendingMouse *m) {
+    Window *w = window_for_window_id(m->id);
+    if (!w || !w->render_data.screen) return;
+    Screen *screen = w->render_data.screen;
+    bool left = m->in_left_half != 0;
+    w->mouse_pos.cell_x = m->x;
+    w->mouse_pos.cell_y = m->y;
+    w->mouse_pos.in_left_half_of_cell = left;
+    switch (m->phase) {
+        case 0: screen_start_selection(screen, m->x, m->y, left, false, EXTEND_CELL); break;
+        case 1: screen_update_selection(screen, m->x, m->y, left, (SelectionUpdate){0}); break;
+        case 2:
+            screen_update_selection(screen, m->x, m->y, left, (SelectionUpdate){.ended = true});
+            // kitty's own end-of-selection copies from its *active* window, which
+            // isn't our hidden cove terminal -- copy from this window explicitly.
+            call_boss(cove_copy_selection, "K", m->id);
+            break;
     }
 }
 
@@ -175,13 +237,17 @@ void
 cove_drain_control(void) {
     if (state != 1) return;
     PendingResize local[COVE_MAX];
-    int n, spawns;
+    PendingMouse mlocal[COVE_MOUSE_MAX];
+    int n, spawns, mn;
     pthread_mutex_lock(&resize_lock);
     n = resize_count;
     memcpy(local, resize_queue, (size_t)n * sizeof(PendingResize));
     resize_count = 0;
     spawns = pending_spawns;
     pending_spawns = 0;
+    mn = mouse_count;
+    memcpy(mlocal, mouse_queue, (size_t)mn * sizeof(PendingMouse));
+    mouse_count = 0;
     pthread_mutex_unlock(&resize_lock);
     for (int i = 0; i < n; i++) {
         call_boss(resize_os_window, "Kiis", local[i].id, (int)local[i].cols, (int)local[i].rows, "cells");
@@ -189,6 +255,7 @@ cove_drain_control(void) {
     for (int i = 0; i < spawns; i++) {
         call_boss(new_os_window, NULL);
     }
+    for (int i = 0; i < mn; i++) apply_mouse(&mlocal[i]);
 }
 
 static void*

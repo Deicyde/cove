@@ -6,6 +6,7 @@
 
 #include "cove_iosurface.h"
 #include "cove_input.h"
+#include "cove_drag.h"
 
 using namespace godot;
 
@@ -15,6 +16,7 @@ void initialize_cove_module(ModuleInitializationLevel p_level) {
 	}
 	GDREGISTER_CLASS(CoveIOSurface);
 	GDREGISTER_CLASS(CoveInput);
+	GDREGISTER_CLASS(CoveDrag);
 }
 
 void uninitialize_cove_module(ModuleInitializationLevel p_level) {

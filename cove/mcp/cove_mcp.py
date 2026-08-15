@@ -12,6 +12,7 @@ Register in ~/.claude.json under mcpServers, e.g.:
                 "args": ["/Users/.../kitty/cove/mcp/cove_mcp.py"]}
 """
 import sys, json, os
+import cove_find  # sibling module: semantic terminal resolver
 
 DIR = os.environ.get("KITTY_COVE_DIR", "/tmp/cove")
 STATE = os.path.join(DIR, "state.json")
@@ -54,7 +55,7 @@ def my_terminal():
 
 TOOLS = [
     {"name": "list_terminals",
-     "description": "List all terminals in the cove with their id, pane_id, agent (claude/codex/opencode/shell), busy/attention flags, position [x,y], cols/rows, cwd, and who they're following. Also returns the camera.",
+     "description": "List all terminals in the cove with their id, pane_id, agent (claude/codex/opencode/shell), busy/attention flags, position [x,y], cols/rows, cwd, the zone each is in, and who they're following. Also returns the camera and the list of zones (named regions with their rects).",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "whoami",
      "description": "Which cove terminal is THIS agent running in (uses $KITTY_WINDOW_ID). Returns the terminal record or an error if not inside the cove.",
@@ -80,12 +81,26 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "integer"}, "name": {"type": "string"}},
          "required": ["name"]}},
+    {"name": "find",
+     "description": "Find the terminal(s) matching a natural-language description of what they're doing -- e.g. 'the agent working on the auth refactor', 'the one running the tests', 'logs'. Ranks termlings semantically over their name, agent, window title, project, last event and cwd. By default focuses the best match and makes the camera track it; pass focus=false to only return the ranking. Returns {id, why, ranked:[{id,why}], source}.",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string"}, "focus": {"type": "boolean"}},
+         "required": ["query"]}},
     {"name": "gather",
      "description": "Call all terminals to cluster around the camera's current view.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "scatter",
-     "description": "Release all terminals from follow/move so they wander freely.",
+     "description": "Release all terminals from follow/move so they wander freely. Also clears all zones and zone overrides.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "assign",
+     "description": "Put a terminal into a named zone (a region on the ground), creating the zone if needed. The termling walks over and confines its wander to that region, so agents on the same project cluster together and location tells you who's working on what. Pass an empty zone to pin it on open ground instead. This overrides auto-zoning (which otherwise groups termlings by their git-repo/cwd) for that terminal. id may be a terminal or pane id.",
+     "inputSchema": {"type": "object", "properties": {
+         "id": {"type": "integer"}, "zone": {"type": "string"}},
+         "required": ["id", "zone"]}},
+    {"name": "autozone",
+     "description": "Toggle automatic zoning, which clusters termlings into per-project regions by their git-repo/cwd with no commands. On by default. Turning it off keeps only zones set by hand (drag or assign).",
+     "inputSchema": {"type": "object", "properties": {"on": {"type": "boolean"}},
+         "required": ["on"]}},
 ]
 
 
@@ -117,11 +132,23 @@ def call_tool(name, args):
             tid = me["id"]
         send_cmd({"cmd": "rename", "id": resolve(tid), "name": str(args["name"])})
         return {"ok": True}
+    if name == "find":
+        res = cove_find.find(args["query"])
+        if args.get("focus", True) and res.get("id") is not None:
+            send_cmd({"cmd": "focus", "id": int(res["id"])})
+            res["focused"] = int(res["id"])
+        return res
     if name == "gather":
         send_cmd({"cmd": "gather"})
         return {"ok": True}
     if name == "scatter":
         send_cmd({"cmd": "scatter"})
+        return {"ok": True}
+    if name == "assign":
+        send_cmd({"cmd": "assign", "id": resolve(args["id"]), "zone": str(args["zone"])})
+        return {"ok": True}
+    if name == "autozone":
+        send_cmd({"cmd": "autozone", "on": bool(args["on"])})
         return {"ok": True}
     raise ValueError("unknown tool: " + name)
 

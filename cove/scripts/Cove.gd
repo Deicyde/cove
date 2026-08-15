@@ -4,9 +4,11 @@
 # around by two little carriers (Sarah) on a ground panel, with soft shadows.
 #   - the groups wander freely
 #   - click a terminal to focus it, then type (keyboard -> focused shell)
-#   - press-drag a terminal to LIFT it off the ground: it rises to the cursor,
-#     its shadow shrinks, and the carriers panic; release to drop it (they recover)
-#     (the *focused* terminal drag-selects its text instead; Alt-drag lifts it)
+#   - press-drag a terminal to slide it around the ground (double-click to
+#     track+read one, and a drag then selects its text instead)
+#   - drag a termling off the window edge to hand it to another Mac (Universal
+#     Control carries it); hold Alt to relocate it freely, even off-screen,
+#     without sending
 #   - Cmd/Ctrl+N spawns another terminal
 extends Node2D
 
@@ -36,10 +38,14 @@ var _panning := false
 var _gesture_accum := 0.0     # trackpad pan-gesture steps accumulated for resize
 var _scroll_accum := 0.0      # trackpad pan-gesture steps accumulated for terminal scroll
 var _tracking_id := -1       # term id the camera is following (double-click), or -1
+var _occ_fading := false     # occluder fade is active (fading termlings in front of the tracked one)
 var _press_group: Node2D = null
 var _press_pos := Vector2.ZERO
 var _press_world := Vector2.ZERO
 var _lifting := false
+var _moving := false           # this drag repositions the termling on the ground
+var _move_can_send := false    # a plain (non-Alt) drag may fling to the edge; Alt-drag just relocates
+var _move_grab := Vector2.ZERO # cursor->ground offset so the grabbed point stays under the mouse
 # Drag-select on the focused terminal: text selection instead of lifting it.
 var _selecting := false        # this press should select, not lift
 var _sel_started := false      # the selection has actually begun (dragged past the deadzone)
@@ -47,10 +53,17 @@ const LIFT_THRESHOLD := 10.0
 const SELECT_DEADZONE := 3.0
 const MIN_ZOOM := 0.35
 const MAX_ZOOM := 3.0
+const TRACK_DIM := 0.18       # alpha for termlings occluding the tracked one
 
 # input transport
 var _sock: RefCounted = null
 var _input_tries := 0
+
+# cross-Mac termling handoff (native OS drag over Universal Control)
+var _drag: RefCounted = null   # CoveDrag extension
+var _inflight_id := -1         # term_id currently being dragged out (dimmed), or -1
+var _ghost: Label = null       # landing ghost shown while an inbound drag hovers
+const HANDOFF_EDGE_PX := 26.0  # drag a lifted termling this close to a window edge to fling it
 
 # agent state / control channel / notifications
 var _ls_thread: Thread
@@ -60,6 +73,16 @@ var _ls_run := true
 var _state_accum := 0.0
 var _cmd_accum := 0.0
 var _follows := {}           # follower term_id -> target term_id
+# Zones: named regions on the ground. Termlings auto-cluster by project (git-repo
+# / cwd) so "who's working on what" reads as location. Drag one into a region to
+# override; scatter clears everything.
+var _zones := {}             # name -> {slot:int, color:[r,g,b]}
+var _zone_of := {}           # term_id -> current zone name (derived)
+var _zone_override := {}     # term_id -> zone name forced by a drag ("" = loose)
+var _project_cache := {}     # cwd -> project key (git-root basename)
+var _auto_zone := true       # cluster by project unless overridden
+var _zone_layer: Node2D
+const ZoneLayer := preload("res://scripts/ZoneLayer.gd")
 var _notes := []             # [{project, event, term_id, ts}]
 var _panel_vbox: VBoxContainer
 var _agents := {}            # main-thread copy of _ls_data
@@ -71,6 +94,7 @@ var _sessions := {}          # term_id -> abduco session name (once learned from
 var _pos_by_session := {}    # session -> [x,y], to restore across a kitty restart
 var _name_by_session := {}   # session -> custom name, ditto
 var _pos_restored := {}      # term_id -> true once its position has been restored
+var _win_rect := {}          # last-known *windowed* os-window rect {pos,size} (not while maximized)
 
 # rename dialog
 var _rename_panel: PanelContainer
@@ -109,7 +133,9 @@ func _ready() -> void:
 		print("cove: fast input via CoveInput extension")
 	else:
 		push_warning("cove: CoveInput extension not loaded — input falls back to `kitten @ send` (slow). Check cove.gdextension / rebuild gdext.")
+	_setup_handoff()
 	_load_layout()   # restore positions/names/camera from the previous run
+	_restore_window()  # put the os-window back where (and how big / maximized) it was
 	_build_world()
 	_build_ui()
 	_reconcile()
@@ -152,6 +178,11 @@ func _build_world() -> void:
 	ground.z_index = -50
 	add_child(ground)
 
+	# Zone regions, painted above the ground but below the termlings.
+	_zone_layer = ZoneLayer.new()
+	_zone_layer.z_index = -40
+	add_child(_zone_layer)
+
 	_world = Node2D.new()
 	_world.y_sort_enabled = true
 	add_child(_world)
@@ -162,10 +193,12 @@ func _process(delta: float) -> void:
 	if _rescan_accum > 0.4:
 		_rescan_accum = 0.0
 		_reconcile()
+		_apply_zones()
 	if _sock != null and not _sock.call("is_connected") and _input_tries < 100:
 		_try_connect_sock()
 	_apply_agent_state()
 	_apply_follows()
+	_poll_handoff()
 	_pump_commands(delta)
 	_pump_notify()
 	_poll_search(delta)
@@ -184,6 +217,7 @@ func _process(delta: float) -> void:
 		_cam.position = _cam.position.lerp(_search_return_cam, 8.0 * delta)
 		if _cam.position.distance_to(_search_return_cam) < 2.0:
 			_cam_return = false
+	_update_occluder_fade(delta)
 	_frames += 1
 	if _shot_path != "" and _frames == 320:
 		var img := get_viewport().get_texture().get_image()
@@ -238,11 +272,185 @@ func _remove_group(id: int) -> void:
 	if _groups.has(id):
 		_groups[id].queue_free()
 		_groups.erase(id)
+	_zone_of.erase(id)
+	_zone_override.erase(id)
 	if _focused_id == id:
 		_focused_id = -1
 		for other in _groups:
 			_set_focus(other)
 			break
+
+
+# --- cross-Mac termling handoff --------------------------------------------
+# Fling a lifted termling at the window edge and Universal Control drags the real
+# OS session to the other Mac's Cove, which resumes it there (see cove-handoff-*).
+
+func _setup_handoff() -> void:
+	if not ClassDB.class_exists("CoveDrag"):
+		push_warning("cove: CoveDrag extension not loaded — termling handoff disabled.")
+		return
+	_drag = ClassDB.instantiate("CoveDrag")
+	var view := DisplayServer.window_get_native_handle(DisplayServer.WINDOW_VIEW, DisplayServer.MAIN_WINDOW_ID)
+	if not _drag.call("attach", view):
+		push_warning("cove: CoveDrag.attach failed — termling handoff disabled.")
+		_drag = null
+		return
+	# The landing ghost: a chip that rides under the cursor while an inbound drag
+	# hovers this Cove, so you can see where the termling will touch down.
+	var layer := CanvasLayer.new()
+	layer.layer = 100
+	add_child(layer)
+	_ghost = Label.new()
+	_ghost.add_theme_font_size_override("font_size", 16)
+	_ghost.add_theme_color_override("font_color", Color(1, 1, 1))
+	_ghost.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
+	_ghost.add_theme_constant_override("outline_size", 6)
+	_ghost.visible = false
+	layer.add_child(_ghost)
+	print("cove: termling handoff armed (fling a lifted termling at the window edge)")
+
+
+func _near_window_edge(p: Vector2) -> bool:
+	var s := get_viewport().get_visible_rect().size
+	return p.x < HANDOFF_EDGE_PX or p.y < HANDOFF_EDGE_PX \
+		or p.x > s.x - HANDOFF_EDGE_PX or p.y > s.y - HANDOFF_EDGE_PX
+
+
+func _handoff_name(id: int) -> String:
+	if _groups.has(id) and _groups[id].terminal.custom_name != "":
+		return _groups[id].terminal.custom_name
+	return _names.get(id, "")
+
+
+# The self-describing string that rides the OS pasteboard to the other Mac. The
+# agent/cwd and the wwid key are pane-id keyed (like the rest of Cove); term_id
+# (the os-window id) only needs to travel so the origin knows what to close.
+func _build_handoff_payload(g: Node2D) -> String:
+	var id: int = g.term_id
+	var pane: int = g.terminal.pane_id
+	var info: Dictionary = _agents.get(pane, {})
+	var agent := str(info.get("agent", "shell"))
+	var cwd := str(info.get("cwd", ""))
+	var sid := ""
+	if agent == "claude" and cwd != "":
+		# Ask Mac A's ~/.claude which conversation this termling is running, so the
+		# other Mac can resume that exact session.
+		var out := []
+		var script := ProjectSettings.globalize_path("res://cove-handoff-capture.sh")
+		OS.execute("/bin/sh", [script, cwd], out, false)
+		if out.size() > 0:
+			sid = str(out[0]).strip_edges()
+	return JSON.stringify({
+		"v": 1,
+		"key": "w%d" % pane,
+		"term_id": id,
+		"agent": agent,
+		"sid": sid,
+		"cwd": cwd,
+		"name": _handoff_name(id),
+	})
+
+
+func _try_begin_handoff() -> void:
+	if _drag == null or _inflight_id != -1 or _drag.call("is_dragging"):
+		return
+	if _press_group == null:
+		return
+	var g := _press_group
+	var id: int = g.term_id
+	var label := _handoff_name(id)
+	if label == "":
+		label = str(_agents.get(g.terminal.pane_id, {}).get("agent", "termling"))
+	# Snapshot the termling's live IOSurface as the drag image (falls back to a
+	# chip inside the extension if the surface can't be read).
+	var native: Vector2i = g.terminal.native_size()
+	if not _drag.call("begin_drag", _build_handoff_payload(g), label,
+			g.terminal.iosurface_id, native.x, native.y):
+		return  # no usable mouse event yet; a later motion retries
+	# The OS owns the mouse now. End the ground-drag and dim the termling so it
+	# reads as "in flight"; it closes for real only if a destination accepts the
+	# drop (else _cancel_inflight un-dims and it holds where it was).
+	g.end_drag_move()
+	_inflight_id = id
+	if _groups.has(id):
+		_groups[id].modulate = Color(1, 1, 1, 0.35)
+	_moving = false
+	_lifting = false
+	_press_group = null
+	_selecting = false
+	_panning = false
+
+
+func _poll_handoff() -> void:
+	if _drag == null:
+		return
+	var drop: Dictionary = _drag.call("poll_drop")
+	if not drop.is_empty():
+		_land_handoff(drop)
+	var ended: Dictionary = _drag.call("poll_drag_ended")
+	if not ended.is_empty():
+		if bool(ended.get("accepted", false)):
+			_close_origin(_inflight_id)
+		else:
+			_cancel_inflight()
+		_inflight_id = -1
+	if _ghost != null:
+		var hover: Dictionary = _drag.call("poll_hover")
+		if bool(hover.get("active", false)):
+			_ghost.text = "🐚 landing…"
+			_ghost.position = Vector2(hover.get("x", 0.0) + 14.0, hover.get("y", 0.0) - 10.0)
+			_ghost.visible = true
+		else:
+			_ghost.visible = false
+
+
+# A termling was dropped onto this Cove: launch it here, resuming the dragged
+# Claude conversation (or a shell) in the handed-over cwd.
+func _land_handoff(drop: Dictionary) -> void:
+	var data = JSON.parse_string(str(drop.get("payload", "")))
+	if typeof(data) != TYPE_DICTIONARY:
+		return
+	var agent := str(data.get("agent", "shell"))
+	var sid := str(data.get("sid", ""))
+	var cwd := str(data.get("cwd", ""))
+	var name := str(data.get("name", ""))
+	if kitten_exe == "":
+		push_warning("cove: landed a termling but no kitten to launch it")
+		return
+	var land := ProjectSettings.globalize_path("res://cove-handoff-land.sh")
+	var args := ["@", "--to", kitty_socket, "launch", "--type=os-window", "--keep-focus"]
+	if cwd != "":
+		args.append_array(["--cwd", cwd])
+	if name != "":
+		args.append_array(["--title", name])
+	args.append_array([land, agent, sid])
+	OS.create_process(kitten_exe, args, false)
+	print("cove: landed %s termling (sid=%s) in %s" % [agent, sid if sid != "" else "-", cwd])
+
+
+func _cancel_inflight() -> void:
+	# The drag was released over nothing; the termling stays put. Un-dim it.
+	if _inflight_id != -1 and _groups.has(_inflight_id):
+		_groups[_inflight_id].modulate = Color(1, 1, 1, 1)
+		_groups[_inflight_id].drop()
+
+
+# A destination accepted the drag, so the termling has moved: close the origin
+# window AND kill its abduco session so the old process doesn't linger (which,
+# for Claude, would double-open the now-synced transcript).
+func _close_origin(id: int) -> void:
+	if id == -1:
+		return
+	# close-window matches on the kitty window (pane) id, not the os-window id.
+	if kitten_exe != "" and _groups.has(id):
+		var pane: int = _groups[id].terminal.pane_id
+		if pane != 0:
+			OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "close-window",
+				"--match", "id:%d" % pane], false)
+	var sess := str(_sessions.get(id, ""))
+	if sess != "":
+		OS.create_process("/usr/bin/pkill", ["-f", "abduco -A %s " % sess], false)
+	_remove_group(id)
 
 
 func _set_focus(id: int) -> void:
@@ -417,10 +625,12 @@ func _unhandled_input(event: InputEvent) -> void:
 				_press_pos = event.position
 				_press_world = wpos
 				_sel_started = false
-				# Drag on the *focused* terminal selects its text; Alt-drag lifts
-				# it instead (the escape hatch for moving the focused one around).
-				_selecting = _press_group != null and _press_group.term_id == _focused_id and not event.alt_pressed and not event.double_click
+				# Drag semantics on a termling: while the camera is *tracking* this
+				# one you're reading it, so a drag selects its text; otherwise a drag
+				# repositions it on the ground. Alt-drag always lifts (handoff gesture).
+				_selecting = _press_group != null and _press_group.term_id == _tracking_id and not event.alt_pressed and not event.double_click
 				_lifting = false
+				_moving = false
 				_panning = _press_group == null  # empty-space left-drag pans
 				if _panning:
 					_tracking_id = -1  # manual pan cancels camera follow
@@ -432,10 +642,14 @@ func _unhandled_input(event: InputEvent) -> void:
 					_send_select(_press_group, _world_mouse(), 2)  # end drag -> copy selection
 				elif _press_group != null and _lifting:
 					_press_group.drop()
+				elif _press_group != null and _moving:
+					_press_group.end_drag_move()
+					_reassign_zone_on_drop(_press_group)
 				elif _press_group != null:
 					_set_focus(_press_group.term_id)
 				_press_group = null
 				_lifting = false
+				_moving = false
 				_selecting = false
 				_sel_started = false
 				_panning = false
@@ -449,12 +663,19 @@ func _unhandled_input(event: InputEvent) -> void:
 			if _sel_started:
 				_send_select(_press_group, _world_mouse(), 1)  # drag update
 		elif _press_group != null:
-			if not _lifting and event.position.distance_to(_press_pos) > LIFT_THRESHOLD:
-				_lifting = true
-				_press_group.lift()
+			# A drag slides the termling along the ground. A plain drag can fling
+			# it off the window edge to the other Mac (Universal Control carries
+			# it); holding Alt relocates freely — even off-screen — without sending.
+			if not _moving and event.position.distance_to(_press_pos) > LIFT_THRESHOLD:
 				_set_focus(_press_group.term_id)
-			if _lifting:
-				_press_group.set_lift_target(_world_mouse())
+				_moving = true
+				_move_can_send = not event.alt_pressed
+				_move_grab = _press_group.get_ground_pos() - _press_world
+				_press_group.begin_drag_move()
+			if _moving:
+				_press_group.set_drag_pos(_world_mouse() + _move_grab)
+				if _move_can_send and _near_window_edge(event.position):
+					_try_begin_handoff()
 		elif _panning:
 			_cam.position -= event.relative / _cam.zoom
 	elif event is InputEventPanGesture:
@@ -660,6 +881,14 @@ func _load_layout() -> void:
 	f.close()
 	if typeof(d) != TYPE_DICTIONARY:
 		return
+	# Zones (slots + colours) so a hot-reload keeps the same regions in place.
+	for z in d.get("zones", []):
+		var zn := str(z.get("name", ""))
+		if zn != "":
+			var col = z.get("color", [0.6, 0.6, 0.6])
+			_zones[zn] = {"slot": int(z.get("slot", _zones.size())), "color": col}
+	if typeof(d.get("auto_zone", null)) == TYPE_BOOL:
+		_auto_zone = d["auto_zone"]
 	var pos := {}
 	var follows := {}
 	for t in d.get("terminals", []):
@@ -671,6 +900,8 @@ func _load_layout() -> void:
 			_names[id] = str(t["name"])
 		if t.get("following", null) != null:
 			follows[id] = int(t["following"])
+		if t.get("zone_override", null) != null:
+			_zone_override[id] = str(t["zone_override"])
 		# Session-keyed restore survives a kitty restart: abduco keeps the shells
 		# alive but kitty hands out fresh window ids, so id-keying alone misses.
 		var sess := str(t.get("session", ""))
@@ -681,6 +912,8 @@ func _load_layout() -> void:
 	_saved = {"pos": pos, "cam": d.get("camera", null), "follows": follows, "focused": int(d.get("focused", -1))}
 	if _saved["cam"] == null:
 		_saved.erase("cam")
+	if typeof(d.get("window", null)) == TYPE_DICTIONARY:
+		_saved["window"] = d["window"]
 
 
 func _restore_after_reconcile() -> void:
@@ -690,6 +923,42 @@ func _restore_after_reconcile() -> void:
 	var foc := int(_saved.get("focused", -1))
 	if foc != -1 and _groups.has(foc):
 		_set_focus(foc)
+
+
+func _restore_window() -> void:
+	# Put the os-window back on the same monitor, at the same size, and re-maximize
+	# (or re-fullscreen) if that's how we were left. Restore the windowed rect first
+	# so an un-maximize later lands somewhere sane rather than filling the screen.
+	var w = _saved.get("window", null)
+	if typeof(w) != TYPE_DICTIONARY:
+		return
+	_apply_window_rect(w)
+	var mode := int(w.get("mode", DisplayServer.WINDOW_MODE_WINDOWED))
+	if mode == DisplayServer.WINDOW_MODE_MAXIMIZED \
+			or mode == DisplayServer.WINDOW_MODE_FULLSCREEN \
+			or mode == DisplayServer.WINDOW_MODE_EXCLUSIVE_FULLSCREEN:
+		DisplayServer.window_set_mode(mode)
+
+
+func _apply_window_rect(w: Dictionary) -> void:
+	var size = w.get("size", null)
+	if size is Array and size.size() == 2:
+		DisplayServer.window_set_size(Vector2i(int(size[0]), int(size[1])))
+	var pos = w.get("pos", null)
+	if pos is Array and pos.size() == 2:
+		# Only reposition if the saved corner still lands on a connected monitor;
+		# otherwise (display unplugged) leave Godot's default centred placement.
+		var p := Vector2i(int(pos[0]), int(pos[1]))
+		if _position_on_some_screen(p):
+			DisplayServer.window_set_position(p)
+
+
+func _position_on_some_screen(p: Vector2i) -> bool:
+	for i in range(DisplayServer.get_screen_count()):
+		var r := Rect2i(DisplayServer.screen_get_position(i), DisplayServer.screen_get_size(i))
+		if r.has_point(p):
+			return true
+	return false
 
 
 # --- kitty ls polling (background thread) -----------------------------------
@@ -851,7 +1120,7 @@ func _apply_agent_state() -> void:
 		var info = _agents.get(g.terminal.pane_id, {})
 		_learn_session(id, g, str(info.get("session", "")))
 		g.set_agent(info.get("agent", "shell"), info.get("busy", false))
-		# A shadow pane opened by cove-remote.sh titles itself "◈ <name> @ <peer>";
+		# A shadow pane opened by cove-remote-auto.sh titles itself "◈ <name> @ <peer>";
 		# recognise it and give the termling the remote treatment.
 		_apply_remote_marker(g, str(info.get("title", "")))
 		if info.get("attention", false):
@@ -865,7 +1134,7 @@ func _apply_agent_state() -> void:
 			_pan_once = -1
 
 
-# A remote shadow pane (from cove-remote.sh) carries the title
+# A remote shadow pane (from cove-remote-auto.sh) carries the title
 # "◈ <name> @ <peer>". Parse that and toggle the termling's remote treatment;
 # any other title clears it. Also seeds the nameplate name once.
 func _apply_remote_marker(g: Node2D, title: String) -> void:
@@ -905,16 +1174,160 @@ func _learn_session(id: int, g: Node2D, session: String) -> void:
 
 
 func _apply_follows() -> void:
+	# Group followers by their target first, so several followers of one termling
+	# arc around it (a fanned ring) instead of all aiming at the same slot and
+	# piling up. A lone follower still stands directly beside its target.
+	var by_target := {}
 	for fid in _follows.keys():
 		var target_id: int = _follows[fid]
 		if not _groups.has(fid) or not _groups.has(target_id):
 			_follows.erase(fid)
 			if _groups.has(fid):
 				_groups[fid].command_stop()
+				_zone_of.erase(fid)   # re-confine to its zone on the next tick
 			continue
+		if not by_target.has(target_id):
+			by_target[target_id] = []
+		by_target[target_id].append(fid)
+	for target_id in by_target:
 		var t = _groups[target_id]
-		var offset := Vector2(t.terminal.onscreen_size().x * 0.6 + 170.0, 0)
-		_groups[fid].command_move(t.get_ground_pos() + offset)
+		var followers: Array = by_target[target_id]
+		var radius: float = t.terminal.onscreen_size().x * 0.6 + 170.0
+		var n := followers.size()
+		for i in range(n):
+			# Fan across the target's right side (-55°..+55°); single follower = 0°.
+			var ang := 0.0 if n == 1 else deg_to_rad(lerpf(-55.0, 55.0, float(i) / float(n - 1)))
+			var offset: Vector2 = Vector2(cos(ang), sin(ang)) * radius
+			_groups[followers[i]].command_move(t.get_ground_pos() + offset)
+
+
+# --- zones ------------------------------------------------------------------
+
+# Layout: zones tile a fixed grid across the ground, so a zone keeps its slot as
+# others come and go (no reshuffling). Bounds are 3200×2200, so 3 columns fit.
+const ZONE_W := 900.0
+const ZONE_H := 660.0
+const ZONE_GAP := 130.0
+const ZONE_COLS := 3
+
+func _zone_slot_rect(slot: int) -> Rect2:
+	var col := slot % ZONE_COLS
+	var row := slot / ZONE_COLS
+	var x := _bounds.position.x + 150.0 + col * (ZONE_W + ZONE_GAP)
+	var y := _bounds.position.y + 150.0 + row * (ZONE_H + ZONE_GAP)
+	return Rect2(x, y, ZONE_W, ZONE_H)
+
+
+# A stable, pleasant colour per zone name (golden-angle hue off a name hash).
+func _zone_color(name: String) -> Color:
+	var h := float(hash(name) % 360) / 360.0
+	return Color.from_hsv(h, 0.55, 0.95)
+
+
+# The world rect of a named zone (creating a record + slot if new).
+func _zone_rect(name: String) -> Rect2:
+	if not _zones.has(name):
+		var used := {}
+		for z in _zones.values():
+			used[int(z["slot"])] = true
+		var slot := 0
+		while used.has(slot):
+			slot += 1
+		var col := _zone_color(name)
+		_zones[name] = {"slot": slot, "color": [col.r, col.g, col.b]}
+	return _zone_slot_rect(int(_zones[name]["slot"]))
+
+
+# Project key for a terminal: the basename of its enclosing git repo (walking up
+# from cwd), else the cwd's own folder name. This is what colocates termlings.
+func _project_key(cwd: String) -> String:
+	if cwd == "":
+		return ""
+	if _project_cache.has(cwd):
+		return _project_cache[cwd]
+	var p := cwd
+	while p != "" and p != "/":
+		if DirAccess.dir_exists_absolute(p + "/.git"):
+			break
+		p = p.get_base_dir()
+	var key := (p if (p != "" and p != "/") else cwd).get_file()
+	_project_cache[cwd] = key
+	return key
+
+
+func _group_cwd(id: int) -> String:
+	if not _groups.has(id):
+		return ""
+	return str(_agents.get(_groups[id].terminal.pane_id, {}).get("cwd", ""))
+
+
+# Assign each termling to a zone and confine its wander there. A drag override
+# wins over the project default; a following termling keeps its motion.
+func _apply_zones() -> void:
+	if not _auto_zone and _zone_override.is_empty():
+		return
+	for id in _groups:
+		var want := ""
+		if _zone_override.has(id):
+			want = str(_zone_override[id])          # "" = pinned loose (no zone)
+		elif _auto_zone:
+			want = _project_key(_group_cwd(id))
+		if _zone_of.get(id, "") == want:
+			continue
+		_zone_of[id] = want
+		if want == "":
+			_groups[id].clear_zone()
+		elif not _follows.has(id):
+			_groups[id].assign_zone(_zone_rect(want))
+	_prune_zones()
+	_rebuild_zone_layer()
+
+
+# Drop empty auto-created zones so the stage doesn't accumulate ghost regions.
+func _prune_zones() -> void:
+	var live := {}
+	for id in _zone_of:
+		var z: String = _zone_of[id]
+		if z != "":
+			live[z] = true
+	for name in _zones.keys():
+		if not live.has(name):
+			_zones.erase(name)
+
+
+# Push the current zones (rect + colour + member count) to the draw layer.
+func _rebuild_zone_layer() -> void:
+	if _zone_layer == null:
+		return
+	var counts := {}
+	for id in _zone_of:
+		var z: String = _zone_of[id]
+		if z != "":
+			counts[z] = int(counts.get(z, 0)) + 1
+	var items := []
+	for name in _zones:
+		var c = _zones[name]["color"]
+		items.append({
+			"rect": _zone_slot_rect(int(_zones[name]["slot"])),
+			"color": Color(c[0], c[1], c[2]),
+			"label": "%s  (%d)" % [name, int(counts.get(name, 0))],
+		})
+	_zone_layer.items = items
+
+
+# On drop, membership follows the drop point: land inside a zone to join it,
+# land on open ground to pin loose. Either way it's a sticky manual override.
+func _reassign_zone_on_drop(g: Node2D) -> void:
+	var p: Vector2 = g.get_ground_pos()
+	var landed := ""
+	for name in _zones:
+		if _zone_slot_rect(int(_zones[name]["slot"])).has_point(p):
+			landed = name
+			break
+	_zone_override[g.term_id] = landed
+	# Re-run assignment now so the drop reads immediately.
+	_zone_of.erase(g.term_id)
+	_apply_zones()
 
 
 # --- control channel --------------------------------------------------------
@@ -961,6 +1374,7 @@ func _exec_command(c: Dictionary) -> void:
 			if g:
 				g.command_stop()
 				_follows.erase(g.term_id)
+				_zone_of.erase(g.term_id)   # re-confine to its zone on the next tick
 		"focus":
 			var g := _find(int(c.get("id", -1)))
 			if g:
@@ -980,7 +1394,34 @@ func _exec_command(c: Dictionary) -> void:
 		"scatter", "release":
 			for id in _groups:
 				_groups[id].command_stop()
+				_groups[id].clear_zone()
 			_follows.clear()
+			_zones.clear()
+			_zone_of.clear()
+			_zone_override.clear()
+			_rebuild_zone_layer()
+		"assign":
+			# Force a termling into a named zone (creating it), or "" to pin it loose.
+			var g := _find(int(c.get("id", -1)))
+			if g:
+				var zn := str(c.get("zone", ""))
+				_zone_override[g.term_id] = zn
+				if zn != "":
+					_zone_rect(zn)  # ensure the zone exists / has a slot
+				_zone_of.erase(g.term_id)
+				_apply_zones()
+		"autozone":
+			_auto_zone = bool(c.get("on", true))
+			if not _auto_zone:
+				# Keep only drag/assign overrides; drop project-derived memberships.
+				for id in _groups:
+					if not _zone_override.has(id):
+						_zone_of.erase(id)
+						_groups[id].clear_zone()
+				_prune_zones()
+				_rebuild_zone_layer()
+			else:
+				_apply_zones()
 		"dismiss":
 			var tid := int(c.get("id", -1))
 			var kept := []
@@ -1021,11 +1462,38 @@ func _write_state() -> void:
 			"title": str(info.get("title", "")),
 			"project": str(note.get("project", "")),
 			"last_event": str(note.get("event", "")),
+			"zone": str(_zone_of.get(id, "")),
+			"zone_override": (str(_zone_override[id]) if _zone_override.has(id) else null),
+		})
+	# Remember the os-window geometry. Only refresh the windowed rect while actually
+	# windowed, so a maximized/fullscreen session still records the rect to fall back
+	# to when un-maximized (and across restarts).
+	var win_mode := DisplayServer.window_get_mode()
+	if win_mode == DisplayServer.WINDOW_MODE_WINDOWED:
+		var wp := DisplayServer.window_get_position()
+		var ws := DisplayServer.window_get_size()
+		_win_rect = {"pos": [wp.x, wp.y], "size": [ws.x, ws.y]}
+	var window := {"mode": int(win_mode)}
+	if _win_rect.has("pos"):
+		window["pos"] = _win_rect["pos"]
+		window["size"] = _win_rect["size"]
+	var zones := []
+	for name in _zones:
+		var r := _zone_slot_rect(int(_zones[name]["slot"]))
+		zones.append({
+			"name": name,
+			"slot": int(_zones[name]["slot"]),
+			"color": _zones[name]["color"],
+			"rect": [snappedf(r.position.x, 0.1), snappedf(r.position.y, 0.1),
+				snappedf(r.size.x, 0.1), snappedf(r.size.y, 0.1)],
 		})
 	var st := {
 		"terminals": terms,
 		"camera": [snappedf(_cam.position.x, 0.1), snappedf(_cam.position.y, 0.1), _cam.zoom.x],
 		"focused": _focused_id,
+		"window": window,
+		"zones": zones,
+		"auto_zone": _auto_zone,
 	}
 	var f := FileAccess.open(DIR + "/state.json", FileAccess.WRITE)
 	if f:
@@ -1444,6 +1912,30 @@ func _occludes(a: Node2D, target: Node2D) -> bool:
 	if a.terminal.global_position.y <= target.terminal.global_position.y:
 		return false
 	return _term_rect(a).intersects(_term_rect(target))
+
+
+# While the camera is tracking a termling, fade *only* the termlings drawing in
+# front of it, so a wanderer crossing the foreground never hides what you're
+# watching. The search overlay owns the dimming while it's open, so we defer to it.
+func _update_occluder_fade(delta: float) -> void:
+	if _search_open:
+		return
+	if _tracking_id != -1 and _groups.has(_tracking_id):
+		var target: Node2D = _groups[_tracking_id]
+		for oid in _groups:
+			var g: Node2D = _groups[oid]
+			var hide: bool = oid != _tracking_id and _occludes(g, target)
+			g.terminal.ease_dim(TRACK_DIM if hide else 1.0, delta)
+		_occ_fading = true
+	elif _occ_fading:
+		# Not tracking any more: ease everyone back to fully opaque, then settle.
+		var still_fading := false
+		for oid in _groups:
+			var t = _groups[oid].terminal
+			t.ease_dim(1.0, delta)
+			if t.screen.modulate.a < 0.99:
+				still_fading = true
+		_occ_fading = still_fading
 
 
 # Ask cove-find (Anthropic API) to resolve the query. Fire-and-forget: it writes

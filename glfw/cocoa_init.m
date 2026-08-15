@@ -301,8 +301,12 @@ static GLFWapplicationwillfinishlaunchingfun finish_launching_callback = NULL;
 - (void)applicationWillFinishLaunching:(NSNotification *)notification {
     (void)notification;
     if (_glfw.hints.init.ns.menubar) {
-        // In case we are unbundled, make us a proper UI application
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        // In case we are unbundled, make us a proper UI application. In cove
+        // mode every kitty window is hidden (Godot is the visible app), so run
+        // as an accessory: no Dock icon and no Cmd-Tab / taskbar entry.
+        [NSApp setActivationPolicy:getenv("KITTY_COVE")
+            ? NSApplicationActivationPolicyAccessory
+            : NSApplicationActivationPolicyRegular];
 
         // Menu bar setup must go between sharedApplication and finishLaunching
         // in order to properly emulate the behavior of NSApplicationMain

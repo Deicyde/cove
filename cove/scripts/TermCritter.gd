@@ -245,6 +245,12 @@ func set_dimmed(alpha: float) -> void:
 	screen.modulate.a = alpha
 
 
+# Like set_dimmed but eased over time — used for the tracked-termling occluder
+# fade so a termling wandering in front of the camera target doesn't pop.
+func ease_dim(alpha: float, delta: float) -> void:
+	screen.modulate.a = lerp(screen.modulate.a, alpha, 12.0 * delta)
+
+
 # Map a world position to a terminal cell (col,row), clamped. Used for mouse.
 func cell_at(world_pos: Vector2) -> Vector2i:
 	var local := screen.to_local(world_pos) + Vector2(_size) * 0.5  # 0..native

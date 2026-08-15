@@ -186,20 +186,22 @@ and the text stays selectable. It rides on wwid's multi-device sync (see
   the local wwid server (`wwid termling publish`). wwid diffs the text and serves
   only the changed rows at `GET /termlings/:key` (api_key + Tailscale, same gate
   as `/sync`). Needs `wwid start` with sync enabled and an `api_key` set.
-- **Viewer**: run `cove/cove-remote.sh <peer>` (a sync-peer name from your wwid
-  config). It lists the peer's termlings and opens one local cove-kitty window
-  per termling running `wwid termling watch`, which reconstructs the screen from
-  the deltas (read-only). Each shadow window is titled `◈ <name> @ <peer>`.
+- **Viewer**: automatic. `cove-remote-start.sh` (run on every Cove launch) starts
+  `cove/cove-remote-auto.sh`, which every ~3s mirrors every sync peer's termlings —
+  opening one local cove-kitty window per termling running `wwid termling watch`
+  (read-only, screen reconstructed from the deltas) and reaping shadows whose
+  remote termling has gone (so a kill on the origin clears the shadow here). Each
+  shadow window is titled `◈ <name> @ <peer>`. This is the only viewer mode.
 - **Remote indicator**: `Cove.gd` recognises the `◈` title marker and gives the
   termling a cool-blue tint and a `◈` nameplate (`TermCritter.set_remote`) so a
   remote shadow is never mistaken for a local termling.
 
-- **Driving** (take control): watching is read-only by default. The origin opts
-  in with `sync.allow_remote_input` in its wwid config; the viewer then runs
-  `cove/cove-remote.sh <peer> --drive` (or `wwid termling drive`). Lines you type
-  are forwarded to `POST /termlings/:key/input`, drained by `cove-relay.sh` on
-  the origin and replayed into the real terminal via `kitten @ send-text`. Double
-  gate: the sync+api_key surface AND the explicit opt-in.
+- **Driving** (take control): the auto viewer is read-only. To take control, run
+  `wwid termling drive --peer <peer> <key>` directly; the origin must opt in with
+  `sync.allow_remote_input` in its wwid config. Lines you type are forwarded to
+  `POST /termlings/:key/input`, drained by `cove-relay.sh` on the origin and
+  replayed into the real terminal via `kitten @ send-text`. Double gate: the
+  sync+api_key surface AND the explicit opt-in.
 
 ## Known limitations
 

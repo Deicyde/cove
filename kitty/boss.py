@@ -2925,6 +2925,16 @@ class Boss:
                 if get_options().copy_on_select:
                     self.copy_to_buffer(get_options().copy_on_select)
 
+    def cove_copy_selection(self, window_id: int) -> None:
+        # Called from cove.c when a drag-select finishes on a hidden cove
+        # terminal. That window isn't the active window, so copy from it directly.
+        w = self.window_id_map.get(window_id)
+        if w is not None and not w.destroyed:
+            text = w.text_for_selection()
+            if text:
+                set_clipboard_string(text)
+                set_primary_selection(text)
+
     def get_active_selection(self) -> str | None:
         w = self.active_window
         if w is not None and not w.destroyed:
