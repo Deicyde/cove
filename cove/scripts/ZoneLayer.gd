@@ -5,6 +5,7 @@
 extends Node2D
 
 var items: Array = []   # [{rect: Rect2, color: Color, label: String}]
+var preview := {}       # {rect: Rect2, color: Color} while the user rubber-bands a new region
 
 var _font: Font
 
@@ -29,3 +30,9 @@ func _draw() -> void:
 			var pos := rect.position + Vector2(26.0, 50.0)
 			draw_string(_font, pos, label, HORIZONTAL_ALIGNMENT_LEFT, -1, 40,
 				Color(col.r, col.g, col.b, 0.85))
+	if not preview.is_empty():
+		# The rubber-band for a region being drawn: brighter than a settled zone.
+		var rect: Rect2 = preview["rect"]
+		var col: Color = preview["color"]
+		draw_rect(rect, Color(col.r, col.g, col.b, 0.10), true)
+		draw_rect(rect, Color(col.r, col.g, col.b, 0.65), false, 3.0)

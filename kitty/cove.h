@@ -26,3 +26,12 @@ void cove_drain_control(void);
 
 // True if there are queued control requests waiting to be applied.
 bool cove_has_pending_control(void);
+
+// True if this OS window has been dragged out of the Cove: it lives on the
+// desktop as a normal, visible kitty window and is not exported to Godot.
+bool cove_window_is_detached(id_type id);
+
+// Re-adopt a previously detached OS window (called from the macOS drop watcher
+// when the user drags the native window back onto the Cove; main thread). Hides
+// it again, resumes frame export, and announces the adoption to Godot.
+void cove_readopt(uint64_t os_window_id);

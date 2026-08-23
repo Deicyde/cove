@@ -28,6 +28,9 @@ public:
 	// Drive kitty's text selection on a pane: [3][pane_id u64][phase u8][x u32][y u32][left u8].
 	// phase: 0 start, 1 update (drag), 2 end (copies the selection to the clipboard).
 	bool send_mouse(int64_t pane_id, int phase, int x, int y, bool in_left_half);
+	// Drag-out: detach an OS window from the cove onto the desktop, centred on
+	// (x, y) in Cocoa screen coords: [4][id u64][x i32][y i32].
+	bool send_detach(int64_t os_window_id, int x, int y);
 	void close_conn();
 
 	CoveInput() {}

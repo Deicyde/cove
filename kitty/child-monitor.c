@@ -1030,7 +1030,9 @@ render_prepared_os_window(
     cove_publish_frame(os_window);
     // In cove mode the window is hidden; presenting it is pointless (and
     // swaps aren't allowed for a hidden window), we export via the FBO instead.
-    if (!cove_enabled()) swap_window_buffers(os_window);
+    // A *detached* window was dragged out onto the desktop, so it's the one
+    // cove window that must present like a normal kitty window.
+    if (!cove_enabled() || cove_window_is_detached(os_window->id)) swap_window_buffers(os_window);
     os_window->last_active_tab = os_window->active_tab;
     os_window->last_num_tabs = os_window->num_tabs;
     os_window->last_active_window_id = active_window_id;

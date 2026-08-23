@@ -29,3 +29,19 @@ void cove_macos_free(CoveSurface *s);
 // Hold a latency-critical activity so App Nap doesn't throttle the hidden
 // window's render loop (keeps keystroke->pixels latency low). Idempotent.
 void cove_macos_keep_awake(void);
+
+// Drag-out: turn a hidden cove NSWindow into a normal, visible desktop window
+// centred on (x, y) (Cocoa screen coords, bottom-left origin, points), flip the
+// app into the Dock, and start watching the window so a later titlebar-drag
+// back onto the Cove re-adopts it. base_dir is the cove dir (for state.json).
+// Main thread only.
+void cove_macos_detach_window(void *nswindow, int x, int y, uint64_t os_window_id, const char *base_dir);
+
+// Stop watching a detached window (it was re-adopted or destroyed). Restores
+// the Dock-hidden activation policy when no detached windows remain. Main
+// thread only; safe to call for ids that aren't being watched.
+void cove_macos_forget_window(uint64_t os_window_id);
+
+// Programmatic drag-in: hide a detached window again and stop watching it (the
+// caller then runs cove_readopt to resume export). Main thread only.
+void cove_macos_adopt_window(void *nswindow, uint64_t os_window_id);

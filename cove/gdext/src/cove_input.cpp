@@ -27,6 +27,7 @@ void CoveInput::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("send_resize", "os_window_id", "cols", "rows"), &CoveInput::send_resize);
 	ClassDB::bind_method(D_METHOD("spawn"), &CoveInput::spawn);
 	ClassDB::bind_method(D_METHOD("send_mouse", "pane_id", "phase", "x", "y", "in_left_half"), &CoveInput::send_mouse);
+	ClassDB::bind_method(D_METHOD("send_detach", "os_window_id", "x", "y"), &CoveInput::send_detach);
 	ClassDB::bind_method(D_METHOD("close_conn"), &CoveInput::close_conn);
 }
 
@@ -176,6 +177,24 @@ bool CoveInput::send_mouse(int64_t pane_id, int phase, int x, int y, bool in_lef
 	memcpy(msg + 10, &xx, 4);
 	memcpy(msg + 14, &yy, 4);
 	msg[18] = in_left_half ? 1 : 0;
+	if (!write_all(_fd, msg, sizeof msg)) {
+		close_conn();
+		return false;
+	}
+	return true;
+}
+
+bool CoveInput::send_detach(int64_t os_window_id, int x, int y) {
+	if (_fd < 0) {
+		return false;
+	}
+	unsigned char msg[17];
+	msg[0] = 4;  // MSG_DETACH
+	uint64_t id = (uint64_t)os_window_id;
+	int32_t xx = (int32_t)x, yy = (int32_t)y;
+	memcpy(msg + 1, &id, 8);
+	memcpy(msg + 9, &xx, 4);
+	memcpy(msg + 13, &yy, 4);
 	if (!write_all(_fd, msg, sizeof msg)) {
 		close_conn();
 		return false;

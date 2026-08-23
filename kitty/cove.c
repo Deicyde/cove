@@ -31,12 +31,15 @@
 #include "state.h"
 #include "screen.h"
 #include "gl.h"
+#include "cove.h"
+#include "glfw-wrapper.h"
 #ifdef __APPLE__
 #include "cove_macos.h"
 #endif
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <inttypes.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -103,11 +106,24 @@ resolve_dir(void) {
 #define MSG_RESIZE 1
 #define MSG_SPAWN 2
 #define MSG_MOUSE 3
+#define MSG_DETACH 4
+#define MSG_ADOPT 5
 
 typedef struct { id_type id; uint32_t cols, rows; } PendingResize;
 static PendingResize resize_queue[COVE_MAX];
 static int resize_count = 0;
 static int pending_spawns = 0;
+
+// Drag-out: os-window ids queued for detach (become normal desktop windows),
+// and the set of currently detached ids (not exported to Godot). The queue is
+// filled from the input thread; both are drained/read on the main thread.
+typedef struct { id_type id; int32_t x, y; } PendingDetach;
+static PendingDetach detach_queue[COVE_MAX];
+static int detach_count = 0;
+static id_type adopt_queue[COVE_MAX];   // programmatic drag-in (MSG_ADOPT)
+static int adopt_count = 0;
+static id_type detached_ids[COVE_MAX];
+static int detached_n = 0;
 
 // Mouse-driven text selection: Godot sends cell coords as you drag over the
 // focused terminal; we replay them into kitty's own selection so highlighting +
@@ -168,9 +184,37 @@ enqueue_mouse(id_type id, uint8_t phase, uint32_t x, uint32_t y, uint8_t in_left
 bool
 cove_has_pending_control(void) {
     pthread_mutex_lock(&resize_lock);
-    bool any = resize_count > 0 || pending_spawns > 0 || mouse_count > 0;
+    bool any = resize_count > 0 || pending_spawns > 0 || mouse_count > 0 || detach_count > 0 || adopt_count > 0;
     pthread_mutex_unlock(&resize_lock);
     return any;
+}
+
+bool
+cove_window_is_detached(id_type id) {
+    for (int i = 0; i < detached_n; i++) if (detached_ids[i] == id) return true;
+    return false;
+}
+
+static void
+detached_remove(id_type id) {
+    for (int i = 0; i < detached_n; i++) {
+        if (detached_ids[i] == id) { detached_ids[i] = detached_ids[--detached_n]; return; }
+    }
+}
+
+// Append one event line for Godot (it pumps <dir>/events.jsonl like notify.jsonl).
+static void
+cove_emit_event(const char *fmt, ...) {
+    char path[4096];
+    snprintf(path, sizeof path, "%s/events.jsonl", base_dir);
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
 }
 
 static void
@@ -205,6 +249,18 @@ handle_input_client(int cfd) {
             if (!read_all(cfd, xy, 8)) return;
             if (!read_all(cfd, &in_left_half, 1)) return;
             enqueue_mouse((id_type)id, phase, xy[0], xy[1], in_left_half);
+        } else if (kind == MSG_DETACH) {
+            int32_t xy[2];
+            if (!read_all(cfd, xy, 8)) return;
+            pthread_mutex_lock(&resize_lock);
+            if (detach_count < COVE_MAX) detach_queue[detach_count++] = (PendingDetach){ (id_type)id, xy[0], xy[1] };
+            pthread_mutex_unlock(&resize_lock);
+            wakeup_main_loop();
+        } else if (kind == MSG_ADOPT) {
+            pthread_mutex_lock(&resize_lock);
+            if (adopt_count < COVE_MAX) adopt_queue[adopt_count++] = (id_type)id;
+            pthread_mutex_unlock(&resize_lock);
+            wakeup_main_loop();
         } else return;  // unknown kind: drop the connection
     }
 }
@@ -233,12 +289,62 @@ apply_mouse(const PendingMouse *m) {
     }
 }
 
+// Drag-out: hide-the-termling becomes show-the-window. Stop exporting the
+// frame (Godot sees the term file vanish and removes the termling), then hand
+// the NSWindow to the macOS side to be placed on the desktop and watched for a
+// drag back in. Main thread.
+static void
+apply_detach(const PendingDetach *d) {
+#ifdef __APPLE__
+    OSWindow *osw = os_window_for_id(d->id);
+    if (!osw || !osw->handle || cove_window_is_detached(d->id)) return;
+    void *nsw = glfwGetCocoaWindow((GLFWwindow*)osw->handle);
+    if (!nsw) return;
+    cove_remove_window(d->id);          // unlink the term file; Godot drops the termling
+    if (detached_n < COVE_MAX) detached_ids[detached_n++] = d->id;
+    cove_macos_detach_window(nsw, d->x, d->y, d->id, base_dir);
+    osw->redraw_count++;                // the now-visible window needs a real present
+    log_error("cove: detached os-window %llu to the desktop", (unsigned long long)d->id);
+#else
+    (void)d;
+#endif
+}
+
+// Programmatic drag-in (MSG_ADOPT, e.g. a "bring it home" command): hide the
+// detached window and re-adopt it. Main thread.
+static void
+apply_adopt(id_type id) {
+#ifdef __APPLE__
+    if (!cove_window_is_detached(id)) return;
+    OSWindow *osw = os_window_for_id(id);
+    if (!osw || !osw->handle) return;
+    cove_macos_adopt_window(glfwGetCocoaWindow((GLFWwindow*)osw->handle), id);
+    cove_readopt(id);
+#else
+    (void)id;
+#endif
+}
+
+// Drag-in landed (macOS watcher, main thread): resume exporting and tell Godot,
+// which places the reborn termling under the cursor.
+void
+cove_readopt(uint64_t os_window_id) {
+    detached_remove((id_type)os_window_id);
+    OSWindow *osw = os_window_for_id((id_type)os_window_id);
+    if (osw) osw->redraw_count++;       // force a frame so the term file reappears now
+    cove_emit_event("{\"event\":\"adopted\",\"term_id\":%llu}", (unsigned long long)os_window_id);
+    wakeup_main_loop();
+    log_error("cove: re-adopted os-window %llu into the cove", (unsigned long long)os_window_id);
+}
+
 void
 cove_drain_control(void) {
     if (state != 1) return;
     PendingResize local[COVE_MAX];
     PendingMouse mlocal[COVE_MOUSE_MAX];
-    int n, spawns, mn;
+    PendingDetach dlocal[COVE_MAX];
+    id_type alocal[COVE_MAX];
+    int n, spawns, mn, dn, an;
     pthread_mutex_lock(&resize_lock);
     n = resize_count;
     memcpy(local, resize_queue, (size_t)n * sizeof(PendingResize));
@@ -248,6 +354,12 @@ cove_drain_control(void) {
     mn = mouse_count;
     memcpy(mlocal, mouse_queue, (size_t)mn * sizeof(PendingMouse));
     mouse_count = 0;
+    dn = detach_count;
+    memcpy(dlocal, detach_queue, (size_t)dn * sizeof(PendingDetach));
+    detach_count = 0;
+    an = adopt_count;
+    memcpy(alocal, adopt_queue, (size_t)an * sizeof(id_type));
+    adopt_count = 0;
     pthread_mutex_unlock(&resize_lock);
     for (int i = 0; i < n; i++) {
         call_boss(resize_os_window, "Kiis", local[i].id, (int)local[i].cols, (int)local[i].rows, "cells");
@@ -256,6 +368,18 @@ cove_drain_control(void) {
         call_boss(new_os_window, NULL);
     }
     for (int i = 0; i < mn; i++) apply_mouse(&mlocal[i]);
+    for (int i = 0; i < dn; i++) apply_detach(&dlocal[i]);
+    for (int i = 0; i < an; i++) apply_adopt(alocal[i]);
+}
+
+// One thread per client: Godot holds a persistent connection, but short-lived
+// tools (tests, scripts) must be able to talk to the socket at the same time.
+static void*
+input_client_main(void *arg) {
+    int cfd = (int)(intptr_t)arg;
+    handle_input_client(cfd);
+    close(cfd);
+    return NULL;
 }
 
 static void*
@@ -271,13 +395,14 @@ input_thread_main(void *arg) {
     addr.sun_family = AF_UNIX;
     snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
     if (bind(sfd, (struct sockaddr*)&addr, sizeof addr) != 0) { perror("cove: input bind"); close(sfd); return NULL; }
-    if (listen(sfd, 4) != 0) { perror("cove: input listen"); close(sfd); return NULL; }
+    if (listen(sfd, 8) != 0) { perror("cove: input listen"); close(sfd); return NULL; }
     log_error("cove: input socket at %s", path);
     for (;;) {
         int cfd = accept(sfd, NULL, NULL);
         if (cfd < 0) { if (errno == EINTR) continue; break; }
-        handle_input_client(cfd);
-        close(cfd);
+        pthread_t ct;
+        if (pthread_create(&ct, NULL, input_client_main, (void*)(intptr_t)cfd) == 0) pthread_detach(ct);
+        else close(cfd);
     }
     close(sfd);
     return NULL;
@@ -363,6 +488,7 @@ readback(OSWindow *os_window, unsigned width, unsigned height, unsigned char *ds
 void
 cove_publish_frame(OSWindow *os_window) {
     if (!cove_enabled()) return;
+    if (cove_window_is_detached(os_window->id)) return;  // it lives on the desktop now
     unsigned w = (unsigned)os_window->viewport_width, h = (unsigned)os_window->viewport_height;
     if (!w || !h) return;
     Slot *s = slot_for(os_window->id);
@@ -436,6 +562,13 @@ cove_publish_frame(OSWindow *os_window) {
 void
 cove_remove_window(id_type id) {
     if (state != 1) return;
+    // If it was out on the desktop, stop watching it (window closed for real).
+    if (cove_window_is_detached(id)) {
+        detached_remove(id);
+#ifdef __APPLE__
+        cove_macos_forget_window(id);
+#endif
+    }
     for (int i = 0; i < COVE_MAX; i++) {
         if (slots[i].id == id) {
 #ifdef __APPLE__

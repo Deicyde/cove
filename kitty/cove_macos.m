@@ -12,7 +12,9 @@
 #include <OpenGL/CGLIOSurface.h>
 #include <IOSurface/IOSurface.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #include <stdio.h>
 
 // Cove's OS window is hidden, so macOS App Nap throttles the app's timers
@@ -106,5 +108,147 @@ cove_macos_free(CoveSurface *s) {
     if (s->gl_texture) { glDeleteTextures(1, &s->gl_texture); s->gl_texture = 0; }
     if (s->surface) { CFRelease((IOSurfaceRef)s->surface); s->surface = NULL; }
     s->w = s->h = 0; s->id = 0;
+}
+
+// --- drag-out / drag-in (detach a termling to the desktop, adopt it back) ----
+// A detached window is a normal kitty NSWindow on the desktop. There is no
+// public "window drag ended" notification, so a 120ms main-queue timer watches
+// each detached window: a frame move while the left button is down marks it as
+// being dragged; on release with the cursor inside the Cove's Godot window the
+// window is hidden again and cove_readopt() resumes its export to Godot.
+
+extern void cove_readopt(uint64_t os_window_id);  // cove.c (main thread)
+
+typedef struct {
+    NSWindow *win;        // retained
+    uint64_t osw_id;
+    NSRect last_frame;
+    bool dragging;
+} CoveDetached;
+
+#define COVE_DETACHED_MAX 64
+static CoveDetached detached_wins[COVE_DETACHED_MAX];
+static int detached_wins_n = 0;
+static dispatch_source_t detach_timer = nil;
+static char detach_dir[4096] = "/tmp/cove";
+
+// The Godot window's CGWindowID, published by Cove.gd into state.json as
+// window.wnum. 0 = unknown (drag-in disabled until Godot writes it).
+static CGWindowID
+cove_godot_window_number(void) {
+    char path[4200];
+    snprintf(path, sizeof path, "%s/state.json", detach_dir);
+    NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
+    if (!data) return 0;
+    NSDictionary *d = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    if (![d isKindOfClass:[NSDictionary class]]) return 0;
+    NSDictionary *w = d[@"window"];
+    if (![w isKindOfClass:[NSDictionary class]]) return 0;
+    NSNumber *n = w[@"wnum"];
+    return [n isKindOfClass:[NSNumber class]] ? (CGWindowID)n.unsignedIntValue : 0;
+}
+
+// Is the mouse cursor currently over the Cove's Godot window? Uses CG global
+// coordinates (top-left origin) from the window server, so it works regardless
+// of Godot's own coordinate conventions.
+static bool
+cursor_over_cove_window(void) {
+    CGWindowID wnum = cove_godot_window_number();
+    if (!wnum) return false;
+    CFArrayRef ids = CFArrayCreate(NULL, (const void*[]){ (void*)(uintptr_t)wnum }, 1, NULL);
+    CFArrayRef info = CGWindowListCreateDescriptionFromArray(ids);
+    CFRelease(ids);
+    if (!info) return false;
+    bool inside = false;
+    if (CFArrayGetCount(info) > 0) {
+        NSDictionary *d = (__bridge NSDictionary*)CFArrayGetValueAtIndex(info, 0);
+        CGRect bounds = CGRectZero;
+        if (CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)d[(id)kCGWindowBounds], &bounds)) {
+            NSPoint m = [NSEvent mouseLocation];  // Cocoa: bottom-left origin of primary screen
+            CGFloat primary_h = [[NSScreen screens] firstObject].frame.size.height;
+            inside = CGRectContainsPoint(bounds, CGPointMake(m.x, primary_h - m.y));
+        }
+    }
+    CFRelease(info);
+    return inside;
+}
+
+static void
+detach_watch_tick(void) {
+    bool down = ([NSEvent pressedMouseButtons] & 1) != 0;
+    for (int i = 0; i < detached_wins_n; i++) {
+        CoveDetached *d = &detached_wins[i];
+        NSRect f = d->win.frame;
+        if (down) {
+            // A frame *move* (same size) while the button is held = a titlebar drag.
+            if (!NSEqualPoints(f.origin, d->last_frame.origin) && NSEqualSizes(f.size, d->last_frame.size))
+                d->dragging = true;
+            d->last_frame = f;
+            continue;
+        }
+        d->last_frame = f;
+        if (!d->dragging) continue;
+        d->dragging = false;
+        if (cursor_over_cove_window()) {
+            uint64_t id = d->osw_id;
+            [d->win orderOut:nil];
+            cove_macos_forget_window(id);   // compacts the array; restart the scan
+            cove_readopt(id);
+            i = -1;
+        }
+    }
+}
+
+static void
+detach_timer_ensure(void) {
+    if (detach_timer) return;
+    detach_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(detach_timer, DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC, 30 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(detach_timer, ^{ detach_watch_tick(); });
+    dispatch_resume(detach_timer);
+}
+
+void
+cove_macos_detach_window(void *nswindow, int x, int y, uint64_t os_window_id, const char *base_dir) {
+    NSWindow *nw = (__bridge NSWindow*)nswindow;
+    if (!nw || detached_wins_n >= COVE_DETACHED_MAX) return;
+    if (base_dir && base_dir[0]) snprintf(detach_dir, sizeof detach_dir, "%s", base_dir);
+    NSRect f = nw.frame;
+    // Centre the window on the drop point, clamped so the titlebar stays reachable.
+    NSPoint origin = NSMakePoint(x - f.size.width / 2, y - f.size.height / 2);
+    NSScreen *scr = [NSScreen mainScreen];
+    if (scr) {
+        NSRect vis = scr.visibleFrame;
+        origin.x = fmax(vis.origin.x - f.size.width + 80, fmin(origin.x, NSMaxX(vis) - 80));
+        origin.y = fmax(vis.origin.y - f.size.height + 40, fmin(origin.y, NSMaxY(vis) - f.size.height));
+    }
+    [nw setFrameOrigin:origin];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [nw makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+    detached_wins[detached_wins_n++] = (CoveDetached){ [nw retain], os_window_id, nw.frame, false };
+    detach_timer_ensure();
+}
+
+void
+cove_macos_adopt_window(void *nswindow, uint64_t os_window_id) {
+    NSWindow *nw = (__bridge NSWindow*)nswindow;
+    if (nw) [nw orderOut:nil];
+    cove_macos_forget_window(os_window_id);
+}
+
+void
+cove_macos_forget_window(uint64_t os_window_id) {
+    for (int i = 0; i < detached_wins_n; i++) {
+        if (detached_wins[i].osw_id != os_window_id) continue;
+        [detached_wins[i].win release];
+        detached_wins[i] = detached_wins[--detached_wins_n];
+        break;
+    }
+    if (detached_wins_n == 0) {
+        if (detach_timer) { dispatch_source_cancel(detach_timer); dispatch_release(detach_timer); detach_timer = nil; }
+        // No termling out on the desktop any more: tuck the app back out of the Dock.
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    }
 }
 #endif

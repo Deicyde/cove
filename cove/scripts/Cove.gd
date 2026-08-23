@@ -5,10 +5,17 @@
 #   - the groups wander freely
 #   - click a terminal to focus it, then type (keyboard -> focused shell)
 #   - press-drag a terminal to slide it around the ground (double-click to
-#     track+read one, and a drag then selects its text instead)
-#   - drag a termling off the window edge to hand it to another Mac (Universal
-#     Control carries it); hold Alt to relocate it freely, even off-screen,
-#     without sending
+#     track+read one, and a drag then selects its text instead; Shift-drag
+#     selects on the focused one without tracking first)
+#   - Cmd+C copies the selection, Cmd+V pastes (an image-only clipboard is
+#     forwarded as ^V so agents read the image off the system pasteboard)
+#   - drag a termling off the window edge and release on the desktop: it leaves
+#     the cove and becomes a normal kitty window (drag that window back onto
+#     the Cove to re-adopt it). Release over another Mac's Cove instead and
+#     Universal Control hands it over. Hold Alt to relocate freely, even
+#     off-screen, without sending
+#   - Cmd+drag on empty ground draws a named region (a pinned zone that
+#     persists while empty); right-click an empty spot inside one deletes it
 #   - Cmd/Ctrl+N spawns another terminal
 extends Node2D
 
@@ -62,8 +69,14 @@ var _input_tries := 0
 # cross-Mac termling handoff (native OS drag over Universal Control)
 var _drag: RefCounted = null   # CoveDrag extension
 var _inflight_id := -1         # term_id currently being dragged out (dimmed), or -1
+var _self_drop := false        # the in-flight drag was dropped back onto this Cove
 var _ghost: Label = null       # landing ghost shown while an inbound drag hovers
 const HANDOFF_EDGE_PX := 26.0  # drag a lifted termling this close to a window edge to fling it
+
+# drag-out / drag-in (detach a termling to the desktop, adopt it back)
+var _evt_accum := 0.0          # pump cadence for kitty's events.jsonl
+var _pending_place := {}       # term_id -> world pos for a termling adopted at the cursor
+var _land_queue: Array = []    # world positions for the next landed handoff drops
 
 # agent state / control channel / notifications
 var _ls_thread: Thread
@@ -82,6 +95,16 @@ var _zone_override := {}     # term_id -> zone name forced by a drag ("" = loose
 var _project_cache := {}     # cwd -> project key (git-root basename)
 var _auto_zone := true       # cluster by project unless overridden
 var _zone_layer: Node2D
+# Hand-drawn regions: Cmd+drag on empty ground rubber-bands a rect, then a
+# dialog names it. Named regions are "pinned": they persist while empty, so the
+# cove can be a place to park things. Right-click an empty spot inside one
+# deletes it.
+var _region_drawing := false
+var _region_anchor := Vector2.ZERO
+var _region_pending := Rect2()
+var _region_panel: PanelContainer
+var _region_edit: LineEdit
+var _region_open := false
 const ZoneLayer := preload("res://scripts/ZoneLayer.gd")
 var _notes := []             # [{project, event, term_id, ts}]
 var _panel_vbox: VBoxContainer
@@ -189,6 +212,10 @@ func _build_world() -> void:
 
 
 func _process(delta: float) -> void:
+	# _restore_window()'s window_set_mode can pump a re-entrant _process from
+	# inside _ready, before the world/camera exist. Wait until setup is done.
+	if _world == null or _cam == null:
+		return
 	_rescan_accum += delta
 	if _rescan_accum > 0.4:
 		_rescan_accum = 0.0
@@ -201,6 +228,7 @@ func _process(delta: float) -> void:
 	_poll_handoff()
 	_pump_commands(delta)
 	_pump_notify()
+	_pump_events(delta)
 	_poll_search(delta)
 	_state_accum += delta
 	if _state_accum > 0.2:
@@ -249,7 +277,16 @@ func _reconcile() -> void:
 
 func _add_group(id: int) -> void:
 	var g := CarryGroup.new()
-	if _saved.get("pos", {}).has(id):
+	if _pending_place.has(id):
+		# Adopted from the desktop: appear right where it was dropped.
+		g.position = _pending_place[id]
+		_pending_place.erase(id)
+		_pos_restored[id] = true
+	elif not _land_queue.is_empty():
+		# A handed-off termling landed here: appear under the drop point.
+		g.position = _land_queue.pop_front()
+		_pos_restored[id] = true
+	elif _saved.get("pos", {}).has(id):
 		# Restore where it was on the previous run (hot-reload keeps positions).
 		var p = _saved["pos"][id]
 		g.position = Vector2(p[0], p[1])
@@ -389,11 +426,18 @@ func _poll_handoff() -> void:
 		_land_handoff(drop)
 	var ended: Dictionary = _drag.call("poll_drag_ended")
 	if not ended.is_empty():
-		if bool(ended.get("accepted", false)):
+		if _self_drop:
+			_cancel_inflight()   # dropped back onto this Cove: it just stays
+		elif bool(ended.get("accepted", false)):
 			_close_origin(_inflight_id)
+		elif not bool(ended.get("inside_self", false)) and ended.has("sx"):
+			# Released on the desktop (no Cove took it): the termling leaves the
+			# cove and becomes a normal kitty window right there.
+			_detach_inflight(ended)
 		else:
 			_cancel_inflight()
 		_inflight_id = -1
+		_self_drop = false
 	if _ghost != null:
 		var hover: Dictionary = _drag.call("poll_hover")
 		if bool(hover.get("active", false)):
@@ -410,6 +454,12 @@ func _land_handoff(drop: Dictionary) -> void:
 	var data = JSON.parse_string(str(drop.get("payload", "")))
 	if typeof(data) != TYPE_DICTIONARY:
 		return
+	# Our own in-flight termling dropped back onto this same Cove: don't clone
+	# it, just keep it here (_poll_handoff sees _self_drop and cancels).
+	var tid := int(data.get("term_id", -1))
+	if _inflight_id != -1 and tid == _inflight_id and _groups.has(tid):
+		_self_drop = true
+		return
 	var agent := str(data.get("agent", "shell"))
 	var sid := str(data.get("sid", ""))
 	var cwd := str(data.get("cwd", ""))
@@ -417,6 +467,9 @@ func _land_handoff(drop: Dictionary) -> void:
 	if kitten_exe == "":
 		push_warning("cove: landed a termling but no kitten to launch it")
 		return
+	# Remember where it landed so the new termling appears under the drop point.
+	var view := Vector2(float(drop.get("x", 0.0)), float(drop.get("y", 0.0)))
+	_land_queue.append(get_viewport().get_canvas_transform().affine_inverse() * view)
 	var land := ProjectSettings.globalize_path("res://cove-handoff-land.sh")
 	var args := ["@", "--to", kitty_socket, "launch", "--type=os-window", "--keep-focus"]
 	if cwd != "":
@@ -433,6 +486,58 @@ func _cancel_inflight() -> void:
 	if _inflight_id != -1 and _groups.has(_inflight_id):
 		_groups[_inflight_id].modulate = Color(1, 1, 1, 1)
 		_groups[_inflight_id].drop()
+
+
+# Drag-out: the OS drag ended on the desktop, so the termling leaves the cove.
+# Kitty un-hides its real window centred on the release point ((sx, sy), Cocoa
+# screen coords straight from the drag session) and stops exporting its frame;
+# _reconcile() removes the termling once the term file vanishes.
+func _detach_inflight(ended: Dictionary) -> void:
+	var id := _inflight_id
+	if id == -1:
+		return
+	if _sock == null or not _sock.call("is_connected") \
+			or not _sock.call("send_detach", id, int(ended.get("sx", 0.0)), int(ended.get("sy", 0.0))):
+		push_warning("cove: detach of termling %d failed (no input socket?)" % id)
+		_cancel_inflight()
+		return
+	print("cove: termling %d left the cove for the desktop" % id)
+
+
+# Drag-in: kitty appends events to events.jsonl when a native kitty window is
+# dropped back onto the Cove ("adopted"). The window keeps its os-window id, so
+# the reborn termling is placed under the cursor (where the drop happened).
+func _pump_events(delta: float) -> void:
+	_evt_accum += delta
+	if _evt_accum < 0.1:
+		return
+	_evt_accum = 0.0
+	var path := DIR + "/events.jsonl"
+	if not FileAccess.file_exists(path):
+		return
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return
+	var content := f.get_as_text()
+	f.close()
+	if content.strip_edges() == "":
+		return
+	var w := FileAccess.open(path, FileAccess.WRITE)  # consume
+	if w:
+		w.store_string("")
+		w.close()
+	for line in content.split("\n", false):
+		var e = JSON.parse_string(line)
+		if typeof(e) != TYPE_DICTIONARY:
+			continue
+		if str(e.get("event", "")) == "adopted":
+			var id := int(e.get("term_id", -1))
+			var pos := _world_mouse()   # the drop just happened under the cursor
+			if _groups.has(id):
+				_groups[id].position = pos
+			else:
+				_pending_place[id] = pos
+			print("cove: adopted os-window %d back into the cove" % id)
 
 
 # A destination accepted the drag, so the termling has moved: close the origin
@@ -548,6 +653,25 @@ func _input(event: InputEvent) -> void:
 			_close_rename()
 			get_viewport().set_input_as_handled()
 		return
+	# Ditto for the region-name dialog.
+	if _region_open:
+		if event.keycode == KEY_ESCAPE:
+			_close_region_name()
+			get_viewport().set_input_as_handled()
+		return
+	# Cmd+C / Cmd+V: clipboard in and out of the focused termling. Copy grabs
+	# kitty's current selection (drag-select while tracking, see _send_select);
+	# paste routes through kitty so bracketed paste works, and an image-only
+	# clipboard is forwarded as ^V so agents (Claude Code) read the image from
+	# the system pasteboard themselves.
+	if event.keycode == KEY_C and event.meta_pressed and not event.ctrl_pressed:
+		_copy_focused()
+		get_viewport().set_input_as_handled()
+		return
+	if event.keycode == KEY_V and event.meta_pressed and not event.ctrl_pressed:
+		_paste_focused()
+		get_viewport().set_input_as_handled()
+		return
 	# Ctrl+` (optionally with Shift) -> focus the next nearby terminal. We use
 	# Ctrl, not Cmd: macOS reserves Cmd+` for its own "cycle windows of the app"
 	# shortcut and swallows/mangles the event before Godot gets a usable one.
@@ -607,11 +731,16 @@ func _unhandled_input(event: InputEvent) -> void:
 			else:
 				_scroll_terminal(g, up, 3)
 			return
-		# Right button: rename the terminal under the cursor.
+		# Right button: rename the terminal under the cursor; on empty ground
+		# inside a hand-drawn region, delete that region.
 		if event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
 			var g := _group_at(wpos)
 			if g != null:
 				_open_rename(g)
+			else:
+				var rn := _pinned_region_at(wpos)
+				if rn != "":
+					_delete_region(rn)
 			return
 		# Middle button: pan.
 		if event.button_index == MOUSE_BUTTON_MIDDLE:
@@ -620,15 +749,33 @@ func _unhandled_input(event: InputEvent) -> void:
 				_tracking_id = -1  # manual pan cancels camera follow
 			return
 		if event.button_index == MOUSE_BUTTON_LEFT:
+			if event.pressed and event.meta_pressed and _group_at(wpos) == null:
+				# Cmd+drag on empty ground: rubber-band a new named region.
+				_region_drawing = true
+				_region_anchor = wpos
+				_panning = false
+				_tracking_id = -1
+				return
+			if not event.pressed and _region_drawing:
+				_region_drawing = false
+				var r := Rect2(_region_anchor, Vector2.ZERO).expand(wpos)
+				_zone_layer.preview = {}
+				if r.size.x > 120.0 and r.size.y > 90.0:
+					_region_pending = r
+					_open_region_name()
+				return
 			if event.pressed:
 				_press_group = _group_at(wpos)
 				_press_pos = event.position
 				_press_world = wpos
 				_sel_started = false
 				# Drag semantics on a termling: while the camera is *tracking* this
-				# one you're reading it, so a drag selects its text; otherwise a drag
+				# one you're reading it, so a drag selects its text; Shift-drag on the
+				# focused one also selects (no need to track first); otherwise a drag
 				# repositions it on the ground. Alt-drag always lifts (handoff gesture).
-				_selecting = _press_group != null and _press_group.term_id == _tracking_id and not event.alt_pressed and not event.double_click
+				_selecting = _press_group != null and not event.alt_pressed and not event.double_click \
+					and (_press_group.term_id == _tracking_id \
+						or (event.shift_pressed and _press_group.term_id == _focused_id))
 				_lifting = false
 				_moving = false
 				_panning = _press_group == null  # empty-space left-drag pans
@@ -654,7 +801,10 @@ func _unhandled_input(event: InputEvent) -> void:
 				_sel_started = false
 				_panning = false
 	elif event is InputEventMouseMotion:
-		if _selecting and _press_group != null:
+		if _region_drawing:
+			var r := Rect2(_region_anchor, Vector2.ZERO).expand(_world_mouse())
+			_zone_layer.preview = {"rect": r, "color": Color(0.55, 0.95, 0.75)}
+		elif _selecting and _press_group != null:
 			# Begin selecting once past the deadzone so a plain click still just
 			# focuses; anchor at the press cell, then track the cursor as we drag.
 			if not _sel_started and event.position.distance_to(_press_pos) > SELECT_DEADZONE:
@@ -785,6 +935,39 @@ func _pty(pane: int, data: PackedByteArray) -> void:
 			"--match", "id:%d" % pane, data.get_string_from_utf8()], false)
 
 
+func _focused_pane() -> int:
+	if _focused_id == -1 or not _groups.has(_focused_id):
+		return 0
+	return _groups[_focused_id].terminal.pane_id
+
+
+# Cmd+C: copy the focused terminal's current selection to the system clipboard.
+# Runs through `kitten @ action` so kitty's own copy machinery does the work.
+func _copy_focused() -> void:
+	var pane := _focused_pane()
+	if pane == 0 or kitten_exe == "":
+		return
+	OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "action",
+		"--match", "id:%d" % pane, "copy_to_clipboard"], false)
+
+
+# Cmd+V: paste the system clipboard into the focused terminal. Text goes
+# through kitty's paste_from_clipboard (bracketed-paste aware, so agents and
+# editors see one paste, not keystrokes). An image-only clipboard becomes a ^V
+# keypress: agents like Claude Code react to it by reading the image straight
+# off the shared system pasteboard.
+func _paste_focused() -> void:
+	var pane := _focused_pane()
+	if pane == 0:
+		return
+	if DisplayServer.clipboard_has():
+		if kitten_exe != "":
+			OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "action",
+				"--match", "id:%d" % pane, "paste_from_clipboard"], false)
+	elif DisplayServer.clipboard_has_image():
+		_pty(pane, PackedByteArray([22]))  # ^V
+
+
 func _spawn_terminal() -> void:
 	# Prefer the persistent socket (no kitten process -> much snappier).
 	if _sock != null and _sock.call("is_connected"):
@@ -882,11 +1065,17 @@ func _load_layout() -> void:
 	if typeof(d) != TYPE_DICTIONARY:
 		return
 	# Zones (slots + colours) so a hot-reload keeps the same regions in place.
+	# Hand-drawn regions carry their own rect and are pinned (never pruned).
 	for z in d.get("zones", []):
 		var zn := str(z.get("name", ""))
 		if zn != "":
 			var col = z.get("color", [0.6, 0.6, 0.6])
-			_zones[zn] = {"slot": int(z.get("slot", _zones.size())), "color": col}
+			var rec := {"slot": int(z.get("slot", _zones.size())), "color": col}
+			var zr = z.get("rect", null)
+			if bool(z.get("pinned", false)) and zr is Array and zr.size() == 4:
+				rec["rect"] = zr
+				rec["pinned"] = true
+			_zones[zn] = rec
 	if typeof(d.get("auto_zone", null)) == TYPE_BOOL:
 		_auto_zone = d["auto_zone"]
 	var pos := {}
@@ -1224,18 +1413,34 @@ func _zone_color(name: String) -> Color:
 	return Color.from_hsv(h, 0.55, 0.95)
 
 
+# The world rect of an existing zone: a hand-drawn (pinned) region keeps its
+# own rect; auto zones live in the fixed slot grid.
+func _zone_area(name: String) -> Rect2:
+	var z = _zones.get(name, null)
+	if z == null:
+		return Rect2()
+	if z.has("rect"):
+		var r = z["rect"]
+		return Rect2(float(r[0]), float(r[1]), float(r[2]), float(r[3]))
+	return _zone_slot_rect(int(z["slot"]))
+
+
+func _free_zone_slot() -> int:
+	var used := {}
+	for z in _zones.values():
+		used[int(z["slot"])] = true
+	var slot := 0
+	while used.has(slot):
+		slot += 1
+	return slot
+
+
 # The world rect of a named zone (creating a record + slot if new).
 func _zone_rect(name: String) -> Rect2:
 	if not _zones.has(name):
-		var used := {}
-		for z in _zones.values():
-			used[int(z["slot"])] = true
-		var slot := 0
-		while used.has(slot):
-			slot += 1
 		var col := _zone_color(name)
-		_zones[name] = {"slot": slot, "color": [col.r, col.g, col.b]}
-	return _zone_slot_rect(int(_zones[name]["slot"]))
+		_zones[name] = {"slot": _free_zone_slot(), "color": [col.r, col.g, col.b]}
+	return _zone_area(name)
 
 
 # Project key for a terminal: the basename of its enclosing git repo (walking up
@@ -1284,6 +1489,7 @@ func _apply_zones() -> void:
 
 
 # Drop empty auto-created zones so the stage doesn't accumulate ghost regions.
+# Hand-drawn (pinned) regions survive empty: they're parking spots by design.
 func _prune_zones() -> void:
 	var live := {}
 	for id in _zone_of:
@@ -1291,7 +1497,7 @@ func _prune_zones() -> void:
 		if z != "":
 			live[z] = true
 	for name in _zones.keys():
-		if not live.has(name):
+		if not live.has(name) and not bool(_zones[name].get("pinned", false)):
 			_zones.erase(name)
 
 
@@ -1308,11 +1514,116 @@ func _rebuild_zone_layer() -> void:
 	for name in _zones:
 		var c = _zones[name]["color"]
 		items.append({
-			"rect": _zone_slot_rect(int(_zones[name]["slot"])),
+			"rect": _zone_area(name),
 			"color": Color(c[0], c[1], c[2]),
 			"label": "%s  (%d)" % [name, int(counts.get(name, 0))],
 		})
 	_zone_layer.items = items
+
+
+# The hand-drawn region containing p, or "".
+func _pinned_region_at(p: Vector2) -> String:
+	for name in _zones:
+		if bool(_zones[name].get("pinned", false)) and _zone_area(name).has_point(p):
+			return name
+	return ""
+
+
+# Create the region the user just rubber-banded, and adopt anyone standing in it.
+func _apply_region() -> void:
+	var nm := _region_edit.text.strip_edges()
+	if nm != "" and _region_pending.size != Vector2.ZERO:
+		var col := _zone_color(nm)
+		_zones[nm] = {
+			"slot": _free_zone_slot(), "color": [col.r, col.g, col.b],
+			"rect": [_region_pending.position.x, _region_pending.position.y,
+				_region_pending.size.x, _region_pending.size.y],
+			"pinned": true,
+		}
+		for id in _groups:
+			if _region_pending.has_point(_groups[id].get_ground_pos()):
+				_zone_override[id] = nm
+				_zone_of.erase(id)
+		_apply_zones()
+		_rebuild_zone_layer()
+		print("cove: created region '%s'" % nm)
+	_close_region_name()
+
+
+func _delete_region(name: String) -> void:
+	if not _zones.has(name):
+		return
+	_zones.erase(name)
+	for id in _groups:
+		if str(_zone_override.get(id, "")) == name:
+			_zone_override.erase(id)
+		if str(_zone_of.get(id, "")) == name:
+			_zone_of.erase(id)
+			_groups[id].clear_zone()
+	_apply_zones()
+	_rebuild_zone_layer()
+	print("cove: deleted region '%s'" % name)
+
+
+func _build_region_dialog() -> void:
+	var layer := CanvasLayer.new()
+	layer.layer = 5
+	add_child(layer)
+	var center := CenterContainer.new()
+	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	layer.add_child(center)
+
+	_region_panel = PanelContainer.new()
+	_region_panel.add_theme_stylebox_override("panel", _themed_box(Color(0.55, 0.95, 0.75, 0.7)))
+	_region_panel.visible = false
+	center.add_child(_region_panel)
+
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", 12)
+	_region_panel.add_child(vb)
+
+	var title := Label.new()
+	title.text = "🗺 name this region"
+	title.add_theme_font_size_override("font_size", 16)
+	title.add_theme_color_override("font_color", Color(0.9, 0.8, 0.55))
+	vb.add_child(title)
+
+	_region_edit = LineEdit.new()
+	_region_edit.custom_minimum_size = Vector2(280, 0)
+	_region_edit.placeholder_text = "e.g. parking · kitty · experiments"
+	_region_edit.add_theme_color_override("font_color", Color(0.95, 0.95, 0.98))
+	_region_edit.text_submitted.connect(func(_t): _apply_region())
+	vb.add_child(_region_edit)
+
+	var hb := HBoxContainer.new()
+	hb.alignment = BoxContainer.ALIGNMENT_END
+	hb.add_theme_constant_override("separation", 8)
+	vb.add_child(hb)
+	var cancel := Button.new()
+	cancel.text = "Cancel"
+	cancel.pressed.connect(_close_region_name)
+	hb.add_child(cancel)
+	var ok := Button.new()
+	ok.text = "Create"
+	ok.pressed.connect(_apply_region)
+	hb.add_child(ok)
+
+
+func _open_region_name() -> void:
+	if _region_panel == null:
+		return
+	_region_open = true
+	_region_edit.text = ""
+	_region_panel.visible = true
+	_region_edit.grab_focus()
+
+
+func _close_region_name() -> void:
+	if _region_panel:
+		_region_panel.visible = false
+	_region_open = false
+	_region_pending = Rect2()
 
 
 # On drop, membership follows the drop point: land inside a zone to join it,
@@ -1321,7 +1632,7 @@ func _reassign_zone_on_drop(g: Node2D) -> void:
 	var p: Vector2 = g.get_ground_pos()
 	var landed := ""
 	for name in _zones:
-		if _zone_slot_rect(int(_zones[name]["slot"])).has_point(p):
+		if _zone_area(name).has_point(p):
 			landed = name
 			break
 	_zone_override[g.term_id] = landed
@@ -1477,13 +1788,18 @@ func _write_state() -> void:
 	if _win_rect.has("pos"):
 		window["pos"] = _win_rect["pos"]
 		window["size"] = _win_rect["size"]
+	if _drag != null:
+		# The Godot window's CGWindowID: kitty hit-tests native kitty-window drags
+		# against it so a drag back onto the Cove re-adopts the terminal.
+		window["wnum"] = int(_drag.call("window_number"))
 	var zones := []
 	for name in _zones:
-		var r := _zone_slot_rect(int(_zones[name]["slot"]))
+		var r := _zone_area(name)
 		zones.append({
 			"name": name,
 			"slot": int(_zones[name]["slot"]),
 			"color": _zones[name]["color"],
+			"pinned": bool(_zones[name].get("pinned", false)),
 			"rect": [snappedf(r.position.x, 0.1), snappedf(r.position.y, 0.1),
 				snappedf(r.size.x, 0.1), snappedf(r.size.y, 0.1)],
 		})
@@ -1589,6 +1905,7 @@ func _build_ui() -> void:
 	_panel_vbox.add_child(title)
 	_update_panel()
 	_build_rename_dialog()
+	_build_region_dialog()
 	_build_search_dialog()
 
 

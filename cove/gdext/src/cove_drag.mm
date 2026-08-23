@@ -29,8 +29,13 @@ struct DropEvt {
 	std::string payload;
 	double x = 0, y = 0;
 };
+struct EndEvt {
+	bool accepted = false;
+	double sx = 0, sy = 0;    // end point, Cocoa screen coords (bottom-left origin)
+	bool inside_self = false; // ended over our own window
+};
 static std::deque<DropEvt> g_drops;
-static std::deque<bool> g_ended;   // accepted flag per finished outbound drag
+static std::deque<EndEvt> g_ended;   // one entry per finished outbound drag
 static bool g_hover_active = false;
 static double g_hover_x = 0, g_hover_y = 0;
 static bool g_dragging = false;
@@ -183,9 +188,13 @@ static NSImage *make_drag_image_from_iosurface(uint32_t sid, int tex_w, int tex_
 		endedAtPoint:(NSPoint)screenPoint
 		operation:(NSDragOperation)operation {
 	(void)session;
-	(void)screenPoint;
+	EndEvt e;
+	e.accepted = operation != NSDragOperationNone;
+	e.sx = screenPoint.x;
+	e.sy = screenPoint.y;
+	e.inside_self = g_view && g_view.window && NSPointInRect(screenPoint, g_view.window.frame);
 	std::lock_guard<std::mutex> lk(g_mtx);
-	g_ended.push_back(operation != NSDragOperationNone);
+	g_ended.push_back(e);
 	g_dragging = false;
 	g_hover_active = false;
 }
@@ -316,6 +325,7 @@ void CoveDrag::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("poll_drop"), &CoveDrag::poll_drop);
 	ClassDB::bind_method(D_METHOD("poll_hover"), &CoveDrag::poll_hover);
 	ClassDB::bind_method(D_METHOD("poll_drag_ended"), &CoveDrag::poll_drag_ended);
+	ClassDB::bind_method(D_METHOD("window_number"), &CoveDrag::window_number);
 }
 
 bool CoveDrag::attach(int64_t view_handle) {
@@ -432,9 +442,20 @@ Dictionary CoveDrag::poll_drag_ended() {
 	if (g_ended.empty()) {
 		return d;
 	}
-	d["accepted"] = g_ended.front();
+	EndEvt e = g_ended.front();
 	g_ended.pop_front();
+	d["accepted"] = e.accepted;
+	d["sx"] = e.sx;
+	d["sy"] = e.sy;
+	d["inside_self"] = e.inside_self;
 	return d;
+}
+
+int64_t CoveDrag::window_number() const {
+	if (!g_view || !g_view.window) {
+		return 0;
+	}
+	return (int64_t)g_view.window.windowNumber;
 }
 
 CoveDrag::~CoveDrag() {

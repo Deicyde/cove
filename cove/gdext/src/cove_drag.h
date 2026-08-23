@@ -48,8 +48,15 @@ public:
 	// when active, x:float, y:float (view-local, top-left origin, points).
 	Dictionary poll_hover();
 	// Pop the outcome of a finished outbound drag, or {} if none. Keys:
-	// accepted:bool (true if some destination took the drop).
+	// accepted:bool (true if some destination took the drop), sx:float, sy:float
+	// (end point in Cocoa screen coords, bottom-left origin, points) and
+	// inside_self:bool (the drag ended over this Cove's own window).
 	Dictionary poll_drag_ended();
+
+	// The Godot window's global CGWindowID (NSWindow.windowNumber), or 0 when
+	// unattached. Published in state.json so kitty can hit-test native window
+	// drags against the Cove for drag-in adoption.
+	int64_t window_number() const;
 
 	CoveDrag() {}
 	~CoveDrag();
