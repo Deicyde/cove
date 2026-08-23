@@ -59,8 +59,12 @@ while true; do
     desired="$(
         for peer in $(peers); do
             [ -n "$peer" ] || continue
+            # Keys are always `w<id>` (see cove-relay.sh). Match that shape so an
+            # empty peer's human message ("No live termlings on <peer>.") isn't
+            # mis-parsed into a bogus `◈ No @ <peer>` shadow that flap-opens
+            # every cycle.
             "$WWID" termling list --peer "$peer" 2>/dev/null | awk -v p="$peer" -v m="$MARK" \
-                'NF{print m" "$1" @ "p}'
+                '$1 ~ /^w[0-9]+$/ {print m" "$1" @ "p}'
         done
     )"
 
