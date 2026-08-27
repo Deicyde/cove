@@ -1057,6 +1057,13 @@ PYWRAP0(last_focused_os_window_id) { return PyLong_FromUnsignedLongLong(last_foc
 
 PYWRAP0(current_focused_os_window_id) { return PyLong_FromUnsignedLongLong(current_focused_os_window_id()); }
 
+PYWRAP1(cove_detach) {
+    unsigned long long osw_id; int x = COVE_DETACH_CASCADE, y = COVE_DETACH_CASCADE;
+    if (!PyArg_ParseTuple(args, "K|ii", &osw_id, &x, &y)) return NULL;
+    cove_enqueue_detach((id_type)osw_id, (int32_t)x, (int32_t)y);
+    Py_RETURN_NONE;
+}
+
 
 PYWRAP1(handle_for_window_id) {
     id_type os_window_id;
@@ -2033,6 +2040,7 @@ static PyMethodDef module_methods[] = {
     M(get_window_being_dragged, METH_NOARGS),
     MW(update_pointer_shape, METH_VARARGS),
     MW(current_os_window, METH_NOARGS),
+    MW(cove_detach, METH_VARARGS),
     MW(next_window_id, METH_NOARGS),
     MW(last_focused_os_window_id, METH_NOARGS),
     MW(current_focused_os_window_id, METH_NOARGS),

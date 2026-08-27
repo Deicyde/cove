@@ -195,6 +195,19 @@ cove_window_is_detached(id_type id) {
     return false;
 }
 
+// Queue an os-window to be detached to the desktop (same path as MSG_DETACH, but
+// callable in-process). Used by the boss's cove_new_os_window action so a Cmd+N
+// pressed in a detached window spawns another desktop window rather than a hidden
+// termling. x == COVE_DETACH_CASCADE asks the macOS side to place it near the key
+// window. Safe to call outside cove mode: cove_drain_control() no-ops there.
+void
+cove_enqueue_detach(id_type id, int32_t x, int32_t y) {
+    pthread_mutex_lock(&resize_lock);
+    if (detach_count < COVE_MAX) detach_queue[detach_count++] = (PendingDetach){ id, x, y };
+    pthread_mutex_unlock(&resize_lock);
+    wakeup_main_loop();
+}
+
 static void
 detached_remove(id_type id) {
     for (int i = 0; i < detached_n; i++) {
@@ -252,10 +265,7 @@ handle_input_client(int cfd) {
         } else if (kind == MSG_DETACH) {
             int32_t xy[2];
             if (!read_all(cfd, xy, 8)) return;
-            pthread_mutex_lock(&resize_lock);
-            if (detach_count < COVE_MAX) detach_queue[detach_count++] = (PendingDetach){ (id_type)id, xy[0], xy[1] };
-            pthread_mutex_unlock(&resize_lock);
-            wakeup_main_loop();
+            cove_enqueue_detach((id_type)id, xy[0], xy[1]);
         } else if (kind == MSG_ADOPT) {
             pthread_mutex_lock(&resize_lock);
             if (adopt_count < COVE_MAX) adopt_queue[adopt_count++] = (id_type)id;

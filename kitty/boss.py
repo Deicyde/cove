@@ -749,6 +749,22 @@ class Boss:
     def new_os_window(self, *args: str) -> None:
         self._new_os_window(args)
 
+    @ac('win', '''
+        New OS window straight onto the desktop (Cove only).
+
+        Used for Cmd+N while a detached termling window is focused: instead of the
+        new window being captured as a hidden Cove termling, it is detached to the
+        desktop immediately (drag it onto the Cove later to adopt it). Outside Cove
+        mode this behaves like :ac:`new_os_window`.
+    ''')
+    def cove_new_os_window(self, *args: str) -> None:
+        os_window_id = self._new_os_window(args)
+        try:
+            from .fast_data_types import cove_detach
+        except ImportError:
+            return
+        cove_detach(os_window_id)  # C places it near the current key window
+
     @property
     def active_window_for_cwd(self) -> Window | None:
         t = self.active_tab

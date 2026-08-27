@@ -214,8 +214,23 @@ cove_macos_detach_window(void *nswindow, int x, int y, uint64_t os_window_id, co
     if (!nw || detached_wins_n >= COVE_DETACHED_MAX) return;
     if (base_dir && base_dir[0]) snprintf(detach_dir, sizeof detach_dir, "%s", base_dir);
     NSRect f = nw.frame;
-    // Centre the window on the drop point, clamped so the titlebar stays reachable.
-    NSPoint origin = NSMakePoint(x - f.size.width / 2, y - f.size.height / 2);
+    NSPoint origin;
+    if (x == INT32_MIN) {
+        // Spawned (Cmd+N in a detached window): cascade off the current key window
+        // so the new window lands just below/right of it, else centre on screen.
+        NSWindow *src = [NSApp keyWindow];
+        if (src && src != nw) {
+            NSRect sf = src.frame;
+            origin = NSMakePoint(sf.origin.x + 36, NSMaxY(sf) - f.size.height - 36);
+        } else {
+            NSRect vis = ([NSScreen mainScreen] ? [NSScreen mainScreen].visibleFrame : NSMakeRect(0, 0, 1440, 900));
+            origin = NSMakePoint(NSMidX(vis) - f.size.width / 2, NSMidY(vis) - f.size.height / 2);
+        }
+    } else {
+        // Centre the window on the drop point (a drag-out release).
+        origin = NSMakePoint(x - f.size.width / 2, y - f.size.height / 2);
+    }
+    // Clamp so the titlebar stays reachable.
     NSScreen *scr = [NSScreen mainScreen];
     if (scr) {
         NSRect vis = scr.visibleFrame;
