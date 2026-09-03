@@ -3,7 +3,8 @@
 # Cove as remote shadows. For each peer in the wwid config it opens a shadow
 # os-window per termling (titled "◈ <key> @ <peer>", which Cove.gd gives the red
 # remote treatment) and reaps shadows whose remote termling has gone. Runs
-# forever; start it once when the Cove comes up. Read-only (watch, not drive).
+# forever; start it once when the Cove comes up. Default read-only (watch);
+# COVE_REMOTE_MODE=drive makes shadows forward typed input to the origin.
 set -uo pipefail
 
 DIR="${KITTY_COVE_DIR:-/tmp/cove}"
@@ -14,6 +15,11 @@ WWID="${WWID:-wwid}"
 CFG="${WWID_HOME:-$HOME/.whatwasIdoing}/config.json"
 INTERVAL="${COVE_REMOTE_INTERVAL:-3}"
 MARK="◈"
+# Viewer mode: `watch` (read-only, default) or `drive` (renders AND forwards the
+# lines you type into the shadow back to the origin — needs the origin peer to
+# set `sync.allow_remote_input`). Set COVE_REMOTE_MODE=drive to make shadows
+# interactive.
+MODE="${COVE_REMOTE_MODE:-watch}"
 
 [ -n "$KITTEN" ] || { echo "cove-remote-auto: no kitten (set COVE_KITTEN)" >&2; exit 1; }
 command -v "$WWID" >/dev/null 2>&1 || { echo "cove-remote-auto: wwid not on PATH" >&2; exit 1; }
@@ -89,7 +95,7 @@ while true; do
             # Open at a readable size (origin screens are ~50 rows; the default
             # ~18 would clip to the bottom slice). Cmd/Ctrl+scroll resizes further.
             newid="$("$KITTEN" @ --to "$SOCK" launch --type=os-window --title "$title" --keep-focus \
-                "$WWID" termling watch --peer "$peer" "$key" 2>/dev/null)"
+                "$WWID" termling "$MODE" --peer "$peer" "$key" 2>/dev/null)"
             if [ -n "$newid" ]; then
                 "$KITTEN" @ --to "$SOCK" resize-os-window --match "id:$newid" --unit cells \
                     --width "${COVE_REMOTE_COLS:-120}" --height "${COVE_REMOTE_ROWS:-40}" \
