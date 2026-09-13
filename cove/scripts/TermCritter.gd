@@ -124,8 +124,12 @@ const REMOTE_PAD := 4.0
 func _layout_decorations() -> void:
 	var half := onscreen_size() * 0.5
 	if _border:
-		_border.position = -half
-		_border.size = onscreen_size()
+		# A StyleBox draws its border *inside* its rect, so grow the panel by
+		# the border width: the frame sits just outside the terminal and never
+		# covers the edge cells.
+		var bw := _border_width()
+		_border.position = -half - bw
+		_border.size = onscreen_size() + bw * 2.0
 	if _backdrop:
 		# A red mat that extends past the terminal so the red reads as the
 		# termling's background, framing the (opaque) terminal content.
@@ -135,6 +139,14 @@ func _layout_decorations() -> void:
 	if _nameplate:
 		_nameplate.position = Vector2(-half.x, -half.y - 22.0)
 		_update_nameplate()
+
+
+func _border_width() -> Vector2:
+	var sb = _border.get_theme_stylebox("panel") if _border else null
+	if sb is StyleBoxFlat:
+		var f := sb as StyleBoxFlat
+		return Vector2(f.border_width_left, f.border_width_top)
+	return Vector2.ZERO
 
 
 func _update_nameplate() -> void:
