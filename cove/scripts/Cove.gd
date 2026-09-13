@@ -73,6 +73,7 @@ var _present_id := -1          # term id currently presented full-window, or -1
 var _present_zoom := 0.0       # camera zoom that fits the presented termling
 var _present_prev_zoom := 0.0  # zoom to swoop back to when leaving present mode
 var _present_leaving := false  # animating the zoom back after leaving present mode
+var _present_lock := 0.0       # 0->1 ramp from swooping onto the presented termling to gluing to it
 const PRESENT_MAX_ZOOM := 8.0  # present mode may zoom past MAX_ZOOM to fill the window
 const VIEW_FILL := 0.92        # fraction of the window a fitted/presented termling spans
 const USER_LAYOUT := "user://cove-layout.json"  # durable name/pos-by-session (survives a cold start)
@@ -261,6 +262,9 @@ func _process(delta: float) -> void:
 	# centre, not the group's ground point (which sits well below it).
 	if _search_open and _search_preview_id != -1 and _groups.has(_search_preview_id):
 		_cam.position = _cam.position.lerp(_groups[_search_preview_id].terminal.global_position, 8.0 * delta)
+	elif _present_id != -1 and _groups.has(_present_id):
+		_present_lock = minf(_present_lock + 3.0 * delta, 1.0)
+		_snap_present_cam.call_deferred(delta)   # after this frame's bob is applied
 	elif _tracking_id != -1 and _groups.has(_tracking_id):
 		_cam.position = _cam.position.lerp(_groups[_tracking_id].terminal.global_position, 6.0 * delta)
 	elif _cam_return:
@@ -334,7 +338,7 @@ func _add_group(id: int) -> void:
 		var n := _groups.size()
 		g.position = center + Vector2(cos(n * 2.4) * (150.0 + 55.0 * n), sin(n * 2.4) * (120.0 + 45.0 * n))
 		if _spawn_follow:
-			# Cmd+N: this fresh termling should fill the view and be followed.
+			# Cmd+N: this fresh termling gets framed by the camera and followed.
 			_spawn_follow = false
 			g.position = center
 			_fit_pending[id] = true
@@ -751,7 +755,7 @@ func _input(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 		return
 	if event.keycode == KEY_N and (event.meta_pressed or event.ctrl_pressed):
-		_spawn_follow = true   # the next fresh termling fills the view + is followed
+		_spawn_follow = true   # the next fresh termling is framed by the camera + followed
 		_spawn_terminal()
 		get_viewport().set_input_as_handled()
 
@@ -1080,9 +1084,11 @@ func _spawn_terminal() -> void:
 	OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "launch", "--type=os-window", shell], false)
 
 
-# A Cmd+N termling waits here until its first frame reveals its cell size, then we
-# reflow it (cols/rows) so its on-screen quad fills ~VIEW_FILL of the window at the
-# current camera zoom. Runs each frame; ids drop out of _fit_pending once fitted.
+# A Cmd+N termling waits here until its first frame arrives, then we present it:
+# the camera zooms to frame it (Esc swoops back). It keeps its default cols/rows.
+# Reflowing it to fill the view made giant termlings (200x88 when zoomed in; 320x96
+# when sized to the window's pixels), and every frame of a big terminal is copied
+# through the rgba transport, so size is lag. Ids drop out once framed.
 func _apply_fits(_delta: float) -> void:
 	if _fit_pending.is_empty():
 		return
@@ -1090,22 +1096,12 @@ func _apply_fits(_delta: float) -> void:
 		if not _groups.has(id):
 			_fit_pending.erase(id)
 			continue
-		var t = _groups[id].terminal
-		var ns: Vector2i = t.native_size()
-		if t.cols <= 0 or t.rows <= 0 or ns.x <= 0 or ns.y <= 0:
+		var ns: Vector2i = _groups[id].terminal.native_size()
+		if ns.x <= 0 or ns.y <= 0:
 			continue   # no frame yet; try again next tick
-		var cell_w := float(ns.x) / float(t.cols)
-		var cell_h := float(ns.y) / float(t.rows)
-		var vp := get_viewport().get_visible_rect().size
-		var denom: float = t.zoom * _cam.zoom.x   # on-screen px = native * term.zoom * cam.zoom
-		if denom <= 0.0 or cell_w <= 0.0 or cell_h <= 0.0:
-			_fit_pending.erase(id)
-			continue
-		var nc := clampi(int(round(vp.x * VIEW_FILL / denom / cell_w)), 40, 320)
-		var nr := clampi(int(round(vp.y * VIEW_FILL / denom / cell_h)), 12, 120)
-		if _sock != null and _sock.call("is_connected"):
-			_sock.call("send_resize", id, nc, nr)
 		_fit_pending.erase(id)
+		if _present_id != id:
+			_toggle_present(_groups[id])
 
 
 # Present a termling full-window (triple-click). Toggles off if it's already the
@@ -1119,6 +1115,7 @@ func _toggle_present(g: Node2D) -> void:
 		_present_prev_zoom = _cam.zoom.x   # remember where to swoop back to
 	_present_id = id
 	_present_leaving = false
+	_present_lock = 0.0
 	_set_focus(id)
 	_tracking_id = id
 	_present_zoom = _fit_zoom_for(g)
@@ -1129,6 +1126,18 @@ func _leave_present() -> void:
 		return
 	_present_id = -1
 	_present_leaving = true   # _process eases the zoom back to _present_prev_zoom
+
+
+# Present mode's camera follow. Runs deferred: after every _process (so after
+# CarryGroup applies this frame's bob) and before Godot flushes the camera's
+# transform, so the presented termling holds still on screen instead of bobbing
+# against a camera that trails it by a frame. _present_lock ramps 0->1 so entering
+# present mode still swoops in rather than jumping.
+func _snap_present_cam(delta: float) -> void:
+	if _present_id == -1 or not _groups.has(_present_id):
+		return
+	var target: Vector2 = _groups[_present_id].terminal.global_position
+	_cam.position = _cam.position.lerp(target, maxf(_present_lock, 6.0 * delta))
 
 
 # Camera zoom at which g's terminal spans VIEW_FILL of the window. onscreen_size()
