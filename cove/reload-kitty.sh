@@ -30,7 +30,7 @@ echo "reattaching ${#SESSIONS[@]} termling session(s): ${SESSIONS[*]:-<none>}"
 
 # Stop Godot + kitty. The abduco masters (and the shells/agents they hold) keep
 # running, detached, so nothing inside the termlings is lost.
-pkill -f "godot --path $APP" 2>/dev/null || pkill -f 'godot --path' 2>/dev/null || true
+pkill -if "godot --path $APP" 2>/dev/null || pkill -if 'godot --path' 2>/dev/null || true
 kpid="$(cat "$DIR/kitty.pid" 2>/dev/null || true)"
 [ -n "$kpid" ] && kill "$kpid" 2>/dev/null || true
 for _p in $(ps -Ao pid=,command= | awk '/[l]auncher\/kitty --title cove/ {print $1}'); do

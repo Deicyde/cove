@@ -46,6 +46,11 @@ var _io_ids := Vector2i.ZERO        # (id_a, id_b) currently imported
 func setup(id: int, path: String) -> void:
 	term_id = id
 	frame_path = path
+	# kitty's frames are linear light; encode to sRGB so colours match the desktop.
+	# ($Screen, not `screen`: setup() runs before add_child, so @onready is unset.)
+	var mat := ShaderMaterial.new()
+	mat.shader = preload("res://shaders/term_srgb.gdshader")
+	$Screen.material = mat
 	if ClassDB.class_exists("CoveIOSurface"):
 		_importers = [ClassDB.instantiate("CoveIOSurface"), ClassDB.instantiate("CoveIOSurface")]
 

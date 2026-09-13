@@ -963,22 +963,42 @@ func _on_key(event: InputEventKey) -> void:
 		get_viewport().set_input_as_handled()
 
 
+# ESC [ X, or ESC [ 1 ; mod X when modified (xterm-style).
+func _csi_letter(final: String, mod: int) -> PackedByteArray:
+	var s := "[" + final if mod == 1 else "[1;%d%s" % [mod, final]
+	return (String.chr(27) + s).to_ascii_buffer()
+
+
+# ESC [ n ~, or ESC [ n ; mod ~ when modified.
+func _csi_tilde(n: int, mod: int) -> PackedByteArray:
+	var s := "[%d~" % n if mod == 1 else "[%d;%d~" % [n, mod]
+	return (String.chr(27) + s).to_ascii_buffer()
+
+
+# Cove sends finished bytes straight to the pty (MSG_PTY), bypassing kitty's key
+# encoder, so modifiers must be encoded here or they're silently lost.
 func _encode_key(event: InputEventKey) -> PackedByteArray:
 	var kc := event.keycode
+	# xterm modifier parameter: 1 + shift + 2*alt + 4*ctrl
+	var mod := 1 + int(event.shift_pressed) + 2 * int(event.alt_pressed) + 4 * int(event.ctrl_pressed)
 	match kc:
-		KEY_ENTER, KEY_KP_ENTER: return PackedByteArray([13])
-		KEY_BACKSPACE: return PackedByteArray([127])
-		KEY_TAB: return PackedByteArray([9])
+		KEY_ENTER, KEY_KP_ENTER:
+			return PackedByteArray([27, 13]) if event.alt_pressed else PackedByteArray([13])
+		KEY_BACKSPACE:
+			return PackedByteArray([27, 127]) if event.alt_pressed else PackedByteArray([127])
+		KEY_TAB:
+			# Shift+Tab = back-tab (CSI Z); Claude Code cycles modes on it.
+			return PackedByteArray([27, 91, 90]) if event.shift_pressed else PackedByteArray([9])
 		KEY_ESCAPE: return PackedByteArray([27])
-		KEY_UP: return PackedByteArray([27, 91, 65])
-		KEY_DOWN: return PackedByteArray([27, 91, 66])
-		KEY_RIGHT: return PackedByteArray([27, 91, 67])
-		KEY_LEFT: return PackedByteArray([27, 91, 68])
-		KEY_HOME: return PackedByteArray([27, 91, 72])
-		KEY_END: return PackedByteArray([27, 91, 70])
-		KEY_PAGEUP: return PackedByteArray([27, 91, 53, 126])
-		KEY_PAGEDOWN: return PackedByteArray([27, 91, 54, 126])
-		KEY_DELETE: return PackedByteArray([27, 91, 51, 126])
+		KEY_UP: return _csi_letter("A", mod)
+		KEY_DOWN: return _csi_letter("B", mod)
+		KEY_RIGHT: return _csi_letter("C", mod)
+		KEY_LEFT: return _csi_letter("D", mod)
+		KEY_HOME: return _csi_letter("H", mod)
+		KEY_END: return _csi_letter("F", mod)
+		KEY_PAGEUP: return _csi_tilde(5, mod)
+		KEY_PAGEDOWN: return _csi_tilde(6, mod)
+		KEY_DELETE: return _csi_tilde(3, mod)
 	if event.meta_pressed:
 		return PackedByteArray()
 	if event.ctrl_pressed:

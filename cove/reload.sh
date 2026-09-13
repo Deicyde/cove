@@ -20,7 +20,7 @@ if [ -z "$kpid" ]; then
     exit 1
 fi
 
-pkill -f "godot --path $APP" 2>/dev/null || pkill -f 'godot --path' 2>/dev/null || true
+pkill -if "godot --path $APP" 2>/dev/null || pkill -if 'godot --path' 2>/dev/null || true
 sleep 0.4
 COVE_KITTEN="$COVE_KITTEN" COVE_KITTY_SOCKET="$COVE_KITTY_SOCKET" \
     nohup "$GODOT" --path "$APP" >/tmp/cove-godot.log 2>&1 &
