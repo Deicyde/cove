@@ -17,10 +17,12 @@ REASON=$(printf '%s' "$INPUT" | jq -r '.stop_reason // .tool_name // ""')
 PROJECT=$(basename "$CWD" 2>/dev/null)
 TS=$(date +%s)
 
-# pane is kitty's window id -> maps directly to a cove terminal.
-printf '{"ts":%s,"pane":%s,"event":%s,"cwd":%s,"project":%s,"reason":%s}\n' \
+# session (abduco, stable across kitty restarts) is the preferred key; pane is
+# kitty's window id, kept as a fallback for Coves that don't match on session.
+printf '{"ts":%s,"pane":%s,"session":%s,"event":%s,"cwd":%s,"project":%s,"reason":%s}\n' \
   "$TS" \
   "${KITTY_WINDOW_ID}" \
+  "$(jq -cn --arg v "${COVE_SESSION:-}" '$v')" \
   "$(jq -cn --arg v "$EVENT" '$v')" \
   "$(jq -cn --arg v "$CWD" '$v')" \
   "$(jq -cn --arg v "$PROJECT" '$v')" \

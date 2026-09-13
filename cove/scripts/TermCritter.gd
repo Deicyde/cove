@@ -83,6 +83,11 @@ func poll() -> void:
 	var ready_index := int(head.decode_u32(56))
 	if w <= 0 or h <= 0 or seq == _last_seq:
 		return
+	# An off-screen termling's frames aren't worth reading (at 2x each is 10-27 MB
+	# through the rgba file). Leaving _last_seq alone means it catches up the
+	# moment it's back in view.
+	if iosurface_id == 0 and _tex != null and _size == Vector2i(w, h) and not _on_screen():
+		return
 	_last_seq = seq
 	# Normalise for kitty's render scale (1x vs 2x Retina) so world size is
 	# stable and a 2x render shows as sharper glyphs, not a bigger window.
@@ -101,17 +106,25 @@ func poll() -> void:
 		if px.size() < w * h * 4:
 			return
 		var img := Image.create_from_data(w, h, false, Image.FORMAT_RGBA8, px)
-		if flags & FLAG_BOTTOM_UP:
-			img.flip_y()
+		# Bottom-up frames are flipped by the sprite on the GPU: a CPU flip_y of a
+		# 2x frame was the single biggest cost on the main thread.
+		screen.flip_v = (flags & FLAG_BOTTOM_UP) != 0
 		if _tex == null or _size != Vector2i(w, h):
 			_tex = ImageTexture.create_from_image(img)
 			_size = Vector2i(w, h)
-			screen.flip_v = false
 			screen.texture = _tex
 			screen.scale = Vector2.ONE * zoom
 			_layout_decorations()
 		else:
 			_tex.update(img)
+
+
+# Is any of the terminal inside the window (with a margin)?
+func _on_screen() -> bool:
+	if screen == null or screen.texture == null:
+		return true
+	var r: Rect2 = screen.get_global_transform_with_canvas() * screen.get_rect()
+	return get_viewport_rect().grow(64.0).intersects(r)
 
 
 func _apply_iosurface(w: int, h: int, id_a: int, id_b: int, ready: int) -> void:

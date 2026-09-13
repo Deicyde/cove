@@ -1,80 +1,74 @@
 ---
 name: cove
-description: Drive the Walking-Terminals Cove — see the little terminal-carriers on the 2.5D stage, move them, make one follow another, gather/scatter, or focus one. Use when the user asks to move/arrange/follow/gather terminals, wants an agent to control where its terminal goes, or to reason about terminal positions on the Cove stage.
+description: Work inside the Cove, the user's board of live terminals ("termlings"). Use when you're running in a Cove termling (COVE=1) and want to tell the user your status, name your own termling, put yourself in a frame, keep your own notes or todo lists on the board, or look up other termlings. Agents never move termlings or change focus; the user arranges the board.
 ---
+# The Cove
 
-# Cove control
+The Cove is the user's board of live terminals. Each terminal is a **termling**
+that sits on a tldraw-style board next to the user's frames, boxes, text and
+arrows. **The user owns the layout and their attention.** You never move
+termlings, change focus, or drive the camera. You describe yourself, and the
+Cove decides how to show it.
 
-The stage is **the Cove**: each live terminal is a **Termling**, hauled around a
-cosy top-down world by two little crewmates. A Termling you follow to work
-alongside becomes your **shellmate**. You drive them through the `cove` MCP
-server (already registered). Motion planning — avoiding other Termlings, staying
-nearby without clipping — is done by the engine; you just issue intents.
+The `cove` MCP server is already registered. Everything acts on your own
+termling, identified by `$COVE_SESSION` (its abduco session, which survives
+kitty restarts).
 
-## Am I inside the Cove?
+## Am I in the Cove?
 
-A shell inside the Cove has `COVE=1` and a `KITTY_WINDOW_ID`. From an
-agent, call **`whoami`** — it returns your terminal record (id, position, agent,
-cwd) or an error if you're not in one.
+A shell inside the Cove has `COVE=1` and `COVE_SESSION=cove-<n>`. Call
+**`whoami`** to get your termling record (id, session, name, frame, cwd), or an
+error if you aren't in one.
 
-## Seeing the world
+## Looking around (read-only)
 
-**`list_terminals`** returns every terminal: `id`, `pane_id`, `agent`
-(`claude`/`codex`/`opencode`/`shell`), `busy`, `attention`, `pos [x,y]`,
-`cols`/`rows`, `cwd`, `zone`, and `following`. Plus the `camera` and the `zones`
-list (named regions with their rects). World coordinates: the ground spans
-roughly x∈[-1600,1600], y∈[-1100,1100]; +x is right, +y is down. `id` is the Cove
-terminal id; `pane_id` is kitty's `$KITTY_WINDOW_ID`. Every tool that takes an
-`id` accepts either.
+- **`list_terminals`**: every termling (id, session, name, agent, busy, the frame
+  it's in as `container`, cwd, project, title) plus the board's frames
+  (`zones`: id, name, rect).
+- **`board(mine?)`**: the shapes on the board. `mine=true` returns only yours.
+- **`find(query)`**: rank termlings by a natural-language description ("the one
+  running the tests"). It returns matches and never changes focus.
 
-## Zones
+## Telling the user how you're doing
 
-The Cove auto-clusters termlings into labelled regions by project (git-repo /
-cwd), so location tells you who's working on what without anyone issuing a
-command. Drag a termling into a region to override its membership, or drop it on
-open ground to pin it loose. So prefer *staying in your zone* over `follow` —
-the zone already keeps a team together while leaving each termling readable.
+- **`status(state, summary?)`**: `needs_you`, `blocked` or `done` puts a "!"
+  badge on your termling and queues you for the user's attention. If the user
+  isn't focused on anything, focus jumps to you; otherwise you wait in a queue,
+  and focus comes to you when they leave their current termling. Call it once;
+  don't repeat it. `working` clears it.
+- The Stop/Notification hooks already ping when you finish or wait for input.
+  Use `status` for something more specific ("blocked: need the API key").
 
-## Commanding
+## Describing yourself
 
-- **`move(id, x, y)`** — send a terminal's carriers to a world point. Cancels any
-  follow. The engine steers around other terminals.
-- **`follow(id, target)`** — `id` shadows `target`, standing beside it and keeping
-  up as it moves, without overlapping. Several followers of one target fan into a
-  ring around it. Use only for genuine pairing — following clusters termlings, so
-  otherwise leave each in its own spot so position stays a meaningful cue.
-- **`stop(id)`** — end follow/move; it wanders again, staying near where it is now
-  (each termling keeps to a small neighbourhood around its home, not the whole map).
-- **`focus(id)`** — focus it (typing goes there) and make the camera track it.
-- **`rename(name, id?)`** — name a terminal (shown on its nameplate). From inside
-  a terminal you can omit `id` to name your own (uses `$KITTY_WINDOW_ID`). Empty
-  name resets to `terminal N`.
-- **`assign(id, zone)`** — put a termling in a named zone (created if new), so it
-  walks over and keeps its wander inside that region. Empty `zone` pins it on open
-  ground. Overrides auto-zoning for that termling.
-- **`autozone(on)`** — toggle project auto-clustering (on by default).
-- **`gather()`** — cluster everyone around the current camera view.
-- **`scatter()`** — release everyone to wander; also clears all zones.
+- **`rename(name)`**: name your own termling, e.g. `auth-refactor`. Only do it
+  when a name helps the user; nothing requires it.
+- **`join_frame(frame)`** / **`leave_frame()`**: put your own termling into an
+  existing frame (by name or shape id from `list_terminals` `zones`), or take it
+  out. Frames often share names like "rectangle", so prefer the id. Only
+  yourself: you can't place other termlings.
 
-To name the terminal you're running in: `rename(name="build")`. Users can also
-rename manually by right-clicking a terminal on the stage.
+## Your notes on the board
 
-## Recipes
+You can keep your own shapes on the board, placed next to your termling. Only
+you (and the user) can change them.
 
-- *"bring my terminal next to the one running codex"*: `list_terminals` → find the
-  codex terminal's id and your own via `whoami` → `follow(my_id, codex_id)`.
-- *"line them up"*: `list_terminals`, then `move` each to a row of x positions at a
-  shared y.
-- *"send this one to the corner and leave it"*: `move(id, -1400, -900)` then it
-  stays put until it finishes (it won't wander from a commanded point until you
-  `stop` it).
+- **`add_note(type, text?, items?, color?)`**: `type` is `note`, `todo` or `text`.
+  A `todo` with `items` makes a checklist, which is good for showing your plan.
+  Returns the shape id.
+- **`update_note(id, ...)`**: replace `text` / `color` / `items`, append
+  `add_items`, or `check` / `uncheck` / `remove` an item (by index or text).
+- **`link(to, from?, text?)`**: an arrow from one of your shapes (or `me`, your
+  termling) to a termling id or shape id.
+- **`delete_notes(ids)`**: remove shapes you own.
+
+Keep it tidy: update one todo list as you go rather than adding new notes, and
+delete your notes when the work is done if they're no longer useful.
 
 ## Notes
 
-- Commands are fire-and-forget (appended to a queue Godot drains ~10×/s). Re-read
-  `list_terminals` to see the result a moment later.
-- Terminals that need your input flash a "!" and get added to the on-stage
-  notification panel automatically (via the Stop/Notification hooks); you don't
-  need to do anything for that.
-- No-op if the Cove isn't running (`state.json` absent) — tools still return,
-  just against an empty world.
+- Commands carry a request id. If the Cove confirms, you get `confirmed: true`,
+  and errors (unknown shape, not yours) come back as tool errors. An older Cove
+  answers `confirmed: false`; re-read `board` / `list_terminals` to check.
+- No-op if the Cove isn't running: reads return an empty world and self
+  actions error with "not inside a Cove termling".

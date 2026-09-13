@@ -17,5 +17,8 @@
 # nested child of that session. The login shell re-sets anything user-defined.
 for v in $(env | sed -n 's/^\(CLAUDE[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
 sess="cove-$$"
+# The stable identity of this termling: survives kitty restarts (unlike
+# $KITTY_WINDOW_ID), and is what the cove MCP tools and board ownership key on.
+export COVE_SESSION="$sess"
 ABDUCO="$(command -v abduco 2>/dev/null || echo /opt/homebrew/bin/abduco)"
 exec "$ABDUCO" -A "$sess" "${SHELL:-/bin/zsh}"

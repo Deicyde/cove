@@ -125,6 +125,12 @@ func begin_drag_move() -> void:
 	_goal = null
 
 
+# Press-and-hold picked us up: a little hop so the lift is visible before the
+# mouse moves (the wander branch eases the rig back down).
+func pickup_hop() -> void:
+	_rig.position.y = -16.0
+
+
 func set_drag_pos(world_pos: Vector2) -> void:
 	# No clamp: drag a termling anywhere. It holds where dropped (end_drag_move
 	# sets _goal), the ground grid follows the camera, and Cmd+K finds strays.
@@ -175,6 +181,18 @@ func assign_zone(rect: Rect2) -> void:
 
 func clear_zone() -> void:
 	_zone = null
+
+
+# Its zone (a frame/box on the board) moved: carry the termling along, keeping
+# its home, wander target and any commanded goal in step.
+func translate_by(delta: Vector2) -> void:
+	position += delta
+	_home += delta
+	_target += delta
+	if _goal != null:
+		_goal += delta
+	if _zone != null:
+		_zone = Rect2(_zone.position + delta, _zone.size)
 
 
 func zone_rect():

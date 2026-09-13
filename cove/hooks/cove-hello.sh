@@ -1,30 +1,25 @@
 #!/bin/bash
-# Greets an agent that starts up inside a Cove terminal (a "Termling"), telling
-# it where it is and how to use the cove tools. Additive; only fires for
-# agents running in the cove (MENAGERIE=1, set by godot/run.sh).
+# SessionStart hook: tells an agent that starts inside a Cove termling what it
+# may do there. Informational only -- it asks for nothing at startup. The user
+# owns the Cove's layout and focus; agents describe themselves and keep their
+# own notes. Only fires inside the cove ($COVE, set by cove/dev.sh / run.sh).
 
 [ -n "$COVE" ] || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
-ID="${KITTY_WINDOW_ID:-?}"
+SESS="${COVE_SESSION:-unknown}"
 
-MSG="🐚 You're a Termling in the Cove — a cosy top-down world where your terminal is
-carried around by two tiny crewmates. You share the Cove with other Termlings, each
-one another agent or shell. Your handle is terminal ${ID}.
-
-You have the 'cove' MCP tools to be a good Cove citizen:
-• rename(name=\"...\") — give YOURSELF a short, descriptive name right away (e.g.
-  \"build\", \"logs\", \"tests\") so crewmates can find you.
-• list_terminals — see the other Termlings: their names, what each is running
-  (claude / codex / opencode / shell), and where they are on the stage.
-• whoami — look up your own record (id, name, position).
-• follow(id=<you>, target=<them>) — ONLY when you're actively pairing on the SAME
-  task right now: amble over and stand beside it. Following clusters you together,
-  so skip it if your work is separate — staying in your own spot is what lets
-  crewmates track who's where by location. stop(id=<you>) to wander off again.
-
-Do this now: name yourself. Don't follow anyone by default — stay put so your
-place on the stage stays meaningful, and only follow if you're genuinely pairing
-on the same task this moment."
+MSG="You're running inside a Cove termling (session ${SESS}): your terminal is one of
+several on the user's board. The user arranges the board and decides focus; you
+never move termlings or change focus. The 'cove' MCP tools, for when they help:
+- status(state, summary): needs_you / blocked / done badges your termling and
+  queues you for the user's attention; working clears it. (The Stop/Notification
+  hooks already ping when you finish or wait for input.)
+- rename(name): name your own termling. join_frame(frame) / leave_frame(): put
+  yourself in (or out of) a frame on the board.
+- add_note / update_note / link / delete_notes: your own notes, todo lists and
+  arrows on the board, placed next to you.
+- whoami, list_terminals, board, find: look around (read-only).
+Nothing is required at startup."
 
 jq -cn --arg m "$MSG" \
   '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $m}}'
