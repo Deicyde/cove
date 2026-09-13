@@ -62,6 +62,22 @@ const MIN_ZOOM := 0.35
 const MAX_ZOOM := 3.0
 const TRACK_DIM := 0.18       # alpha for termlings occluding the tracked one
 
+# Cmd+N: size the new termling to the view + follow it. Triple-click a termling
+# to "present" it — zoom the camera so it fills the whole cove window.
+var _spawn_follow := false     # next brand-new termling: fit it to the view + follow
+var _fit_pending := {}         # term_id -> true: resize to fill the view once its cells are known
+var _click_streak := 0         # consecutive quick clicks on the same termling
+var _click_last_ms := 0
+var _click_last_id := -1
+var _present_id := -1          # term id currently presented full-window, or -1
+var _present_zoom := 0.0       # camera zoom that fits the presented termling
+var _present_prev_zoom := 0.0  # zoom to swoop back to when leaving present mode
+var _present_leaving := false  # animating the zoom back after leaving present mode
+const PRESENT_MAX_ZOOM := 8.0  # present mode may zoom past MAX_ZOOM to fill the window
+const VIEW_FILL := 0.92        # fraction of the window a fitted/presented termling spans
+const USER_LAYOUT := "user://cove-layout.json"  # durable name/pos-by-session (survives a cold start)
+var _durable_accum := 0.0
+
 # input transport
 var _sock: RefCounted = null
 var _input_tries := 0
@@ -178,6 +194,7 @@ func _exit_tree() -> void:
 	_ls_run = false
 	if _ls_thread and _ls_thread.is_started():
 		_ls_thread.wait_to_finish()
+	_write_durable()   # capture the latest names/positions before we go
 
 
 func _build_world() -> void:
@@ -234,6 +251,11 @@ func _process(delta: float) -> void:
 	if _state_accum > 0.2:
 		_state_accum = 0.0
 		_write_state()
+	_durable_accum += delta
+	if _durable_accum > 3.0:
+		_durable_accum = 0.0
+		_write_durable()   # session-keyed name/pos mirror that survives a cold restart
+	_apply_fits(delta)
 	# While previewing a search hit the camera swoops onto it; otherwise it follows
 	# the tracked terminal (double-click / committed jump). Track the terminal's
 	# centre, not the group's ground point (which sits well below it).
@@ -245,6 +267,21 @@ func _process(delta: float) -> void:
 		_cam.position = _cam.position.lerp(_search_return_cam, 8.0 * delta)
 		if _cam.position.distance_to(_search_return_cam) < 2.0:
 			_cam_return = false
+	# Present ("fill the window") mode: zoom the camera so the presented termling
+	# spans the whole window; leaving swoops the zoom back to where it was.
+	if _present_id != -1:
+		if _groups.has(_present_id):
+			_present_zoom = _fit_zoom_for(_groups[_present_id])
+			var z := lerpf(_cam.zoom.x, _present_zoom, 8.0 * delta)
+			_cam.zoom = Vector2(z, z)
+		else:
+			_leave_present()   # the presented termling went away
+	elif _present_leaving:
+		var z := lerpf(_cam.zoom.x, _present_prev_zoom, 8.0 * delta)
+		_cam.zoom = Vector2(z, z)
+		if absf(z - _present_prev_zoom) < 0.003:
+			_cam.zoom = Vector2(_present_prev_zoom, _present_prev_zoom)
+			_present_leaving = false
 	_update_occluder_fade(delta)
 	_frames += 1
 	if _shot_path != "" and _frames == 320:
@@ -296,12 +333,20 @@ func _add_group(id: int) -> void:
 		var center := _cam.position if _cam else Vector2.ZERO
 		var n := _groups.size()
 		g.position = center + Vector2(cos(n * 2.4) * (150.0 + 55.0 * n), sin(n * 2.4) * (120.0 + 45.0 * n))
+		if _spawn_follow:
+			# Cmd+N: this fresh termling should fill the view and be followed.
+			_spawn_follow = false
+			g.position = center
+			_fit_pending[id] = true
 	_world.add_child(g)
 	g.setup(id, "%s/term-%d.rgba" % [DIR, id], _bounds)
 	if _names.has(id):
 		g.terminal.set_custom_name(_names[id])
 	_groups[id] = g
-	if _focused_id == -1:
+	if _fit_pending.has(id):
+		_set_focus(id)
+		_tracking_id = id   # glue the camera to the new termling
+	elif _focused_id == -1:
 		_set_focus(id)
 
 
@@ -398,11 +443,12 @@ func _try_begin_handoff() -> void:
 	var label := _handoff_name(id)
 	if label == "":
 		label = str(_agents.get(g.terminal.pane_id, {}).get("agent", "termling"))
-	# Snapshot the termling's live IOSurface as the drag image (falls back to a
-	# chip inside the extension if the surface can't be read).
+	# Snapshot the termling as the drag image: the extension reads the live IOSurface
+	# when it can, else this PNG of the current frame, else a text chip as last resort.
 	var native: Vector2i = g.terminal.native_size()
+	var snap: String = g.terminal.snapshot_png("%s/drag-%d.png" % [DIR, id])
 	if not _drag.call("begin_drag", _build_handoff_payload(g), label,
-			g.terminal.iosurface_id, native.x, native.y):
+			g.terminal.iosurface_id, native.x, native.y, snap):
 		return  # no usable mouse event yet; a later motion retries
 	# The OS owns the mouse now. End the ground-drag and dim the termling so it
 	# reads as "in flight"; it closes for real only if a destination accepts the
@@ -501,6 +547,15 @@ func _detach_inflight(ended: Dictionary) -> void:
 		push_warning("cove: detach of termling %d failed (no input socket?)" % id)
 		_cancel_inflight()
 		return
+	# Carry the termling's name onto the desktop window's title bar (sticky, so the
+	# shell/agent can't overwrite it). Drag it back in and the name returns with it,
+	# since the term_id is preserved and _names[id] still holds it.
+	var nm := _handoff_name(id)
+	if nm != "" and kitten_exe != "" and _groups.has(id):
+		var pane: int = _groups[id].terminal.pane_id
+		if pane != 0:
+			OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "set-window-title",
+				"--match", "id:%d" % pane, nm], false)
 	print("cove: termling %d left the cove for the desktop" % id)
 
 
@@ -659,6 +714,11 @@ func _input(event: InputEvent) -> void:
 			_close_region_name()
 			get_viewport().set_input_as_handled()
 		return
+	# Esc leaves "present" (full-window) mode, swooping the camera back.
+	if event.keycode == KEY_ESCAPE and _present_id != -1:
+		_leave_present()
+		get_viewport().set_input_as_handled()
+		return
 	# Cmd+C / Cmd+V: clipboard in and out of the focused termling. Copy grabs
 	# kitty's current selection (drag-select while tracking, see _send_select);
 	# paste routes through kitty so bracketed paste works, and an image-only
@@ -691,6 +751,7 @@ func _input(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 		return
 	if event.keycode == KEY_N and (event.meta_pressed or event.ctrl_pressed):
+		_spawn_follow = true   # the next fresh termling fills the view + is followed
 		_spawn_terminal()
 		get_viewport().set_input_as_handled()
 
@@ -784,6 +845,21 @@ func _unhandled_input(event: InputEvent) -> void:
 				if event.double_click and _press_group != null:
 					_set_focus(_press_group.term_id)
 					_tracking_id = _press_group.term_id  # double-click: focus + follow
+				# Triple-click a termling -> present it full-window (click again or Esc
+				# to leave). A click on empty ground also leaves present mode.
+				var now_ms := Time.get_ticks_msec()
+				var gid: int = _press_group.term_id if _press_group != null else -1
+				if gid != -1 and gid == _click_last_id and now_ms - _click_last_ms < 450:
+					_click_streak += 1
+				else:
+					_click_streak = 1
+				_click_last_id = gid
+				_click_last_ms = now_ms
+				if gid != -1 and _click_streak >= 3:
+					_toggle_present(_press_group)
+					_click_streak = 0
+				elif gid == -1 and _present_id != -1:
+					_leave_present()
 			else:
 				if _sel_started and _press_group != null:
 					_send_select(_press_group, _world_mouse(), 2)  # end drag -> copy selection
@@ -860,6 +936,9 @@ func _unhandled_input(event: InputEvent) -> void:
 
 # Zoom the camera toward the cursor by a multiplicative factor (>1 zooms in).
 func _zoom_by(factor: float) -> void:
+	# A manual zoom abandons present mode, keeping the zoom the user is dialling in.
+	_present_id = -1
+	_present_leaving = false
 	var before := _cam.get_global_mouse_position()
 	var z := clampf(_cam.zoom.x * factor, MIN_ZOOM, MAX_ZOOM)
 	_cam.zoom = Vector2(z, z)
@@ -981,6 +1060,67 @@ func _spawn_terminal() -> void:
 	OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "launch", "--type=os-window", shell], false)
 
 
+# A Cmd+N termling waits here until its first frame reveals its cell size, then we
+# reflow it (cols/rows) so its on-screen quad fills ~VIEW_FILL of the window at the
+# current camera zoom. Runs each frame; ids drop out of _fit_pending once fitted.
+func _apply_fits(_delta: float) -> void:
+	if _fit_pending.is_empty():
+		return
+	for id in _fit_pending.keys():
+		if not _groups.has(id):
+			_fit_pending.erase(id)
+			continue
+		var t = _groups[id].terminal
+		var ns: Vector2i = t.native_size()
+		if t.cols <= 0 or t.rows <= 0 or ns.x <= 0 or ns.y <= 0:
+			continue   # no frame yet; try again next tick
+		var cell_w := float(ns.x) / float(t.cols)
+		var cell_h := float(ns.y) / float(t.rows)
+		var vp := get_viewport().get_visible_rect().size
+		var denom: float = t.zoom * _cam.zoom.x   # on-screen px = native * term.zoom * cam.zoom
+		if denom <= 0.0 or cell_w <= 0.0 or cell_h <= 0.0:
+			_fit_pending.erase(id)
+			continue
+		var nc := clampi(int(round(vp.x * VIEW_FILL / denom / cell_w)), 40, 320)
+		var nr := clampi(int(round(vp.y * VIEW_FILL / denom / cell_h)), 12, 120)
+		if _sock != null and _sock.call("is_connected"):
+			_sock.call("send_resize", id, nc, nr)
+		_fit_pending.erase(id)
+
+
+# Present a termling full-window (triple-click). Toggles off if it's already the
+# presented one. The camera glue + zoom happen in _process.
+func _toggle_present(g: Node2D) -> void:
+	var id: int = g.term_id
+	if _present_id == id:
+		_leave_present()
+		return
+	if _present_id == -1:
+		_present_prev_zoom = _cam.zoom.x   # remember where to swoop back to
+	_present_id = id
+	_present_leaving = false
+	_set_focus(id)
+	_tracking_id = id
+	_present_zoom = _fit_zoom_for(g)
+
+
+func _leave_present() -> void:
+	if _present_id == -1:
+		return
+	_present_id = -1
+	_present_leaving = true   # _process eases the zoom back to _present_prev_zoom
+
+
+# Camera zoom at which g's terminal spans VIEW_FILL of the window. onscreen_size()
+# is native*term.zoom (camera-independent world units); screen px = that * cam.zoom.
+func _fit_zoom_for(g: Node2D) -> float:
+	var on: Vector2 = g.terminal.onscreen_size()
+	if on.x <= 0.0 or on.y <= 0.0:
+		return _cam.zoom.x
+	var vp := get_viewport().get_visible_rect().size
+	return clampf(minf(vp.x / on.x, vp.y / on.y) * VIEW_FILL, MIN_ZOOM, PRESENT_MAX_ZOOM)
+
+
 # Reflow the terminal by changing its cols/rows (scroll to resize).
 func _resize_group(g: Node2D, dir: int) -> void:
 	var t = g.terminal
@@ -1052,6 +1192,9 @@ func _find(id: int) -> Node2D:
 # --- layout persistence (hot-reload keeps positions/names/camera) -----------
 
 func _load_layout() -> void:
+	# Durable session-keyed names/positions first (this survives a cold start, which
+	# wipes /tmp/cove); state.json below then overrides with the freshest values.
+	_load_durable()
 	# The previous run's state.json is our restore source (kitty keeps running,
 	# so the terminals + shells are still alive; we just re-place them).
 	var path := DIR + "/state.json"
@@ -1103,6 +1246,55 @@ func _load_layout() -> void:
 		_saved.erase("cam")
 	if typeof(d.get("window", null)) == TYPE_DICTIONARY:
 		_saved["window"] = d["window"]
+
+
+# Durable name/pos mirror, keyed by abduco session (the only id stable across a
+# kitty restart). Lives in user:// so a cold start — which `rm -rf`s /tmp/cove and
+# its state.json — still restores termling names once the ls poll relearns sessions.
+func _load_durable() -> void:
+	if not FileAccess.file_exists(USER_LAYOUT):
+		return
+	var f := FileAccess.open(USER_LAYOUT, FileAccess.READ)
+	if f == null:
+		return
+	var d = JSON.parse_string(f.get_as_text())
+	f.close()
+	if typeof(d) != TYPE_DICTIONARY:
+		return
+	for sess in d.get("by_session", {}):
+		var rec = d["by_session"][sess]
+		if typeof(rec) != TYPE_DICTIONARY:
+			continue
+		if str(rec.get("name", "")) != "":
+			_name_by_session[sess] = str(rec["name"])
+		if rec.get("pos", null) is Array:
+			_pos_by_session[sess] = rec["pos"]
+
+
+func _write_durable() -> void:
+	# Start from everything we already know (so sessions not present this run — e.g.
+	# a detached termling — are never dropped), then refresh from the live groups.
+	var by := {}
+	for sess in _name_by_session:
+		by[sess] = {"name": _name_by_session[sess]}
+	for sess in _pos_by_session:
+		var r: Dictionary = by.get(sess, {})
+		r["pos"] = _pos_by_session[sess]
+		by[sess] = r
+	for id in _groups:
+		var sess := str(_sessions.get(id, ""))
+		if sess == "":
+			continue
+		var g = _groups[id]
+		var r: Dictionary = by.get(sess, {})
+		if g.terminal.custom_name != "":
+			r["name"] = g.terminal.custom_name
+		r["pos"] = [snappedf(g.position.x, 0.1), snappedf(g.position.y, 0.1)]
+		by[sess] = r
+	var f := FileAccess.open(USER_LAYOUT, FileAccess.WRITE)
+	if f:
+		f.store_string(JSON.stringify({"by_session": by}))
+		f.close()
 
 
 func _restore_after_reconcile() -> void:
@@ -1161,7 +1353,16 @@ func _start_ls_poll() -> void:
 
 
 func _ls_loop() -> void:
+	var watchdog_tick := 0
 	while _ls_run:
+		# Every ~30s, run the session watchdog: it detects (and heals) abduco
+		# attach clients spinning at 100% cpu and deadlocked session ptys, both
+		# of which freeze a termling while every process in it stays alive.
+		watchdog_tick += 1
+		if watchdog_tick >= 30:
+			watchdog_tick = 0
+			var wd := ProjectSettings.globalize_path("res://cove-watchdog.py")
+			OS.create_process("/usr/bin/python3", [wd])
 		var out := []
 		OS.execute(kitten_exe, ["@", "--to", kitty_socket, "ls"], out, false)
 		var txt: String = out[0] if out.size() > 0 else ""
@@ -1981,6 +2182,9 @@ func _apply_rename() -> void:
 	if _rename_id != -1:
 		var nm := _rename_edit.text.strip_edges()
 		_names[_rename_id] = nm
+		var sess := str(_sessions.get(_rename_id, ""))
+		if sess != "":
+			_name_by_session[sess] = nm   # capture now so a restart restores it
 		if _groups.has(_rename_id):
 			_groups[_rename_id].terminal.set_custom_name(nm)
 	_close_rename()

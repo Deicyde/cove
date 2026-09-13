@@ -129,7 +129,7 @@ static NSImage *make_drag_image_from_iosurface(uint32_t sid, int tex_w, int tex_
 	// Scale to a tidy drag thumbnail, preserving aspect.
 	double nw = tex_w > 0 ? tex_w : (double)w;
 	double nh = tex_h > 0 ? tex_h : (double)h;
-	const double maxdim = 280.0;
+	const double maxdim = 420.0;
 	double scale = fmin(1.0, maxdim / fmax(nw, nh));
 	CGFloat sw = (CGFloat)fmax(1.0, nw * scale);
 	CGFloat sh = (CGFloat)fmax(1.0, nh * scale);
@@ -166,6 +166,50 @@ static NSImage *make_drag_image_from_iosurface(uint32_t sid, int tex_w, int tex_
 	}
 	[out unlockFocus];
 	CGImageRelease(cg);
+	return out;
+}
+
+// A drag image built from a PNG snapshot of the current frame (Godot writes it
+// when the live IOSurface isn't available — e.g. the rgba-file transport). Same
+// warm border + name caption as the IOSurface thumbnail. Returns nil if the file
+// can't be loaded, so the caller falls back to the text chip.
+static NSImage *make_drag_image_from_png(NSString *path, NSString *label) {
+	if (!path.length) {
+		return nil;
+	}
+	NSImage *src = [[NSImage alloc] initWithContentsOfFile:path];
+	if (!src || src.size.width < 1 || src.size.height < 1) {
+		return nil;
+	}
+	double nw = src.size.width, nh = src.size.height;
+	const double maxdim = 420.0;
+	double scale = fmin(1.0, maxdim / fmax(nw, nh));
+	CGFloat sw = (CGFloat)fmax(1.0, nw * scale);
+	CGFloat sh = (CGFloat)fmax(1.0, nh * scale);
+
+	NSImage *out = [[NSImage alloc] initWithSize:NSMakeSize(sw, sh)];
+	[out lockFocus];
+	[src drawInRect:NSMakeRect(0, 0, sw, sh) fromRect:NSZeroRect
+			operation:NSCompositingOperationCopy fraction:1.0];
+	NSBezierPath *border = [NSBezierPath bezierPathWithRect:NSMakeRect(1, 1, sw - 2, sh - 2)];
+	[[NSColor colorWithCalibratedRed:0.90 green:0.58 blue:0.30 alpha:0.95] setStroke];
+	[border setLineWidth:2];
+	[border stroke];
+	if (label.length) {
+		NSRect strip = NSMakeRect(0, 0, sw, 22);
+		[[NSColor colorWithCalibratedWhite:0.06 alpha:0.72] setFill];
+		NSRectFillUsingOperation(strip, NSCompositingOperationSourceOver);
+		NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
+		ps.alignment = NSTextAlignmentCenter;
+		ps.lineBreakMode = NSLineBreakByTruncatingTail;
+		NSDictionary *attrs = @{
+			NSFontAttributeName : [NSFont boldSystemFontOfSize:13],
+			NSForegroundColorAttributeName : [NSColor whiteColor],
+			NSParagraphStyleAttributeName : ps,
+		};
+		[[@"🐚 " stringByAppendingString:label] drawInRect:NSMakeRect(6, 3, sw - 12, 17) withAttributes:attrs];
+	}
+	[out unlockFocus];
 	return out;
 }
 
@@ -320,7 +364,7 @@ static void install_destination(NSView *view) {
 void CoveDrag::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("attach", "view_handle"), &CoveDrag::attach);
 	ClassDB::bind_method(D_METHOD("is_attached"), &CoveDrag::is_attached);
-	ClassDB::bind_method(D_METHOD("begin_drag", "payload", "label", "iosurface_id", "tex_w", "tex_h"), &CoveDrag::begin_drag);
+	ClassDB::bind_method(D_METHOD("begin_drag", "payload", "label", "iosurface_id", "tex_w", "tex_h", "fallback_png"), &CoveDrag::begin_drag);
 	ClassDB::bind_method(D_METHOD("is_dragging"), &CoveDrag::is_dragging);
 	ClassDB::bind_method(D_METHOD("poll_drop"), &CoveDrag::poll_drop);
 	ClassDB::bind_method(D_METHOD("poll_hover"), &CoveDrag::poll_hover);
@@ -354,12 +398,13 @@ bool CoveDrag::is_attached() const {
 }
 
 bool CoveDrag::begin_drag(const String &payload, const String &label,
-		int64_t iosurface_id, int tex_w, int tex_h) {
+		int64_t iosurface_id, int tex_w, int tex_h, const String &fallback_png) {
 	if (!g_view) {
 		return false;
 	}
 	NSString *pl = [NSString stringWithUTF8String:payload.utf8().get_data()];
 	NSString *lbl = [NSString stringWithUTF8String:label.utf8().get_data()];
+	NSString *png = [NSString stringWithUTF8String:fallback_png.utf8().get_data()];
 
 	NSEvent *ev = [NSApp currentEvent];
 	NSEventType et = ev ? ev.type : NSEventTypeApplicationDefined;
@@ -392,7 +437,10 @@ bool CoveDrag::begin_drag(const String &payload, const String &label,
 	NSDraggingItem *di = [[NSDraggingItem alloc] initWithPasteboardWriter:item];
 	NSImage *img = make_drag_image_from_iosurface((uint32_t)iosurface_id, tex_w, tex_h, lbl);
 	if (!img) {
-		img = make_drag_image(lbl);  // surface unavailable; fall back to the chip
+		img = make_drag_image_from_png(png, lbl);  // no live surface; use the frame PNG
+	}
+	if (!img) {
+		img = make_drag_image(lbl);  // neither available; fall back to the text chip
 	}
 	NSPoint locInView = [g_view convertPoint:ev.locationInWindow fromView:nil];
 	NSRect frame = NSMakeRect(locInView.x - img.size.width / 2,

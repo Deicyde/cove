@@ -31,13 +31,14 @@ public:
 	bool is_attached() const;
 
 	// Start an outbound OS drag carrying `payload`. The drag image is a live
-	// thumbnail of the termling, snapshotted from its IOSurface (`iosurface_id`
-	// with native size tex_w x tex_h); `label` is drawn as a caption and used for
-	// the fallback chip if the surface can't be read. Must be called while a mouse
-	// button is down (during Godot's drag input handling). Returns false if no
-	// usable mouse event is available or the view isn't attached.
+	// thumbnail of the termling: the IOSurface (`iosurface_id`, native size
+	// tex_w x tex_h) when available, else the PNG at `fallback_png` (a snapshot of
+	// the current frame Godot writes for the rgba-file transport), else a text chip.
+	// `label` is drawn as a caption. Must be called while a mouse button is down
+	// (during Godot's drag input handling). Returns false if no usable mouse event
+	// is available or the view isn't attached.
 	bool begin_drag(const String &payload, const String &label,
-			int64_t iosurface_id, int tex_w, int tex_h);
+			int64_t iosurface_id, int tex_w, int tex_h, const String &fallback_png);
 	// True while an outbound drag started here is still in flight.
 	bool is_dragging() const;
 

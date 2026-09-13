@@ -49,7 +49,8 @@ WRAPPER="$REPO/cove/cove-shell.sh"
     -o macos_quit_when_last_window_closed=yes \
     -o sync_to_monitor=no \
     -o font_size=16 \
-    -o remember_window_size=no -o initial_window_width=60c -o initial_window_height=18c \
+    -o remember_window_size=no -o initial_window_width=110c -o initial_window_height=32c \
+    -o "map cmd+n cove_new_os_window" \
     -o shell="$WRAPPER" \
     "$WRAPPER" &
 KITTY_PID=$!

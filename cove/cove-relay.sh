@@ -77,6 +77,13 @@ while true; do
     seen=" "
     while IFS=$'\t' read -r wid agent cwd title; do
         [ -n "$wid" ] || continue
+        # Only publish termlings the Cove is actually carrying. kitty exports a
+        # framebuffer term-<id>.rgba per in-Cove window; a window dragged OUT to
+        # the desktop (detach) keeps living on the cove-kitty socket but loses
+        # its term file. Without this guard the relay keeps streaming detached
+        # desktop windows to peers as remote shadows long after they left the
+        # Cove — so a peer sees more shadows than the origin's Cove carries.
+        [ -e "$DIR/term-${wid}.rgba" ] || continue
         key="w${wid}"
         seen="$seen$key "
         if ! has_key "$key" "$KNOWN"; then

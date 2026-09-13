@@ -150,6 +150,22 @@ func set_custom_name(n: String) -> void:
 	_update_nameplate()
 
 
+# Save the current terminal frame to a PNG. Used as the drag-out image when the
+# native drag code can't read the live IOSurface (e.g. the rgba-file transport,
+# where iosurface_id is 0). Returns the path, or "" if there's no frame to save.
+func snapshot_png(path: String) -> String:
+	if screen == null or screen.texture == null:
+		return ""
+	var img: Image = screen.texture.get_image()
+	if img == null:
+		return ""
+	if screen.flip_v:
+		img.flip_y()   # IOSurface path holds GL bottom-up pixels
+	if img.save_png(path) != OK:
+		return ""
+	return path
+
+
 # Mark this termling a remote shadow (or clear it). Remote termlings get a red
 # border (always on), a cool-blue screen tint, and a "◈" nameplate so they're
 # never mistaken for a local one.

@@ -40,7 +40,8 @@ WRAPPER="$APP/cove-shell.sh"
 KITTY_COVE=1 KITTY_COVE_DIR="$DIR" nohup "$KITTY" --title cove \
     --listen-on "$SOCK" -o allow_remote_control=yes -o sync_to_monitor=no \
     -o font_size=16 -o remember_window_size=no \
-    -o initial_window_width=60c -o initial_window_height=18c \
+    -o initial_window_width=110c -o initial_window_height=32c \
+    -o "map cmd+n cove_new_os_window" \
     -o shell="$WRAPPER" \
     "$WRAPPER" >/tmp/cove-kitty.log 2>&1 &
 COVE_KITTY_PID=$!
