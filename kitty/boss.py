@@ -501,6 +501,9 @@ class Boss:
             wtitle = override_title or getattr(startup_session, 'os_window_title', None) or self.args.title
             window_state = window_state or getattr(startup_session, 'os_window_state', None)
             wstate = parse_os_window_state(window_state) if window_state is not None else None
+            if x is None and y is None:
+                from .launch import cove_window_pos
+                x, y = cove_window_pos()  # cove: render hidden windows on the 2x screen
             with startup_notification_handler(do_notify=startup_id is not None, startup_id=startup_id) as pre_show_callback:
                 os_window_id = create_os_window(
                     initial_window_size_func(size_data, self.cached_values),

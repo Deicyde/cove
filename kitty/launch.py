@@ -472,6 +472,18 @@ def parse_os_window_position(position: str | None) -> tuple[int | None, int | No
     return int(x), int(y)
 
 
+def cove_window_pos() -> tuple[int | None, int | None]:
+    # Cove: kitty windows stay hidden and are drawn inside Godot, but each one
+    # still renders at the backing scale of the screen it sits on. Left to the
+    # default cascade they can land on a 1x external monitor and look blurry, so
+    # park them on the primary screen (normally the Retina one) to render at 2x.
+    # Override with KITTY_COVE_WINDOW_POS=XxY. Outside cove mode: no opinion.
+    import os
+    if not os.environ.get('KITTY_COVE'):
+        return None, None
+    return parse_os_window_position(os.environ.get('KITTY_COVE_WINDOW_POS') or '0x0')
+
+
 def tab_for_window(boss: Boss, opts: LaunchCLIOptions, target_tab: Tab | None, next_to: Window | None, add_to_session: str) -> Tab:
 
     def create_tab(tm: TabManager | None = None) -> Tab:

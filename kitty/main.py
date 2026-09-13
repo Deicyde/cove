@@ -307,6 +307,9 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (),
                 from .launch import parse_os_window_position
 
                 pos_x, pos_y = parse_os_window_position(args.position)
+            if pos_x is None and pos_y is None:
+                from .launch import cove_window_pos
+                pos_x, pos_y = cove_window_pos()  # cove: render hidden windows on the 2x screen
         startup_session_error: tuple[Exception, str] | None = None
         try:
             startup_sessions = tuple(create_sessions(opts, args, default_session=opts.startup_session))

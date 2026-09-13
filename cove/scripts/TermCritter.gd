@@ -10,9 +10,14 @@ const MAGIC := 0x4B4D454E
 const HEADER := 64
 const FLAG_BOTTOM_UP := 0x1
 
-# On-screen pixels per native terminal pixel. Fixed, so resizing (changing
-# cols/rows) grows/shrinks the whole window rather than rescaling the text.
-var zoom := 0.30
+# On-screen pixels per native terminal pixel. Resizing (changing cols/rows)
+# grows/shrinks the whole window rather than rescaling the text. kitty renders at
+# its window's backing scale (1x or 2x Retina, depending on which screen its
+# hidden window lands on), so poll() divides BASE_ZOOM by the detected render
+# scale: world size stays put, and a 2x render gives Retina-sharp glyphs.
+const BASE_ZOOM := 0.30
+const BASE_CELL_H := 19.0   # cell height in px at font_size=16 rendered at 1x
+var zoom := BASE_ZOOM
 
 @onready var screen: Sprite2D = $Screen
 @onready var _nameplate: Label = get_node_or_null("Nameplate")
@@ -79,6 +84,14 @@ func poll() -> void:
 	if w <= 0 or h <= 0 or seq == _last_seq:
 		return
 	_last_seq = seq
+	# Normalise for kitty's render scale (1x vs 2x Retina) so world size is
+	# stable and a 2x render shows as sharper glyphs, not a bigger window.
+	var render_scale := maxf(1.0, roundf(float(h) / float(maxi(rows, 1)) / BASE_CELL_H))
+	var z := BASE_ZOOM / render_scale
+	if not is_equal_approx(z, zoom):
+		zoom = z
+		screen.scale = Vector2.ONE * zoom
+		_layout_decorations()
 
 	if iosurface_id != 0 and not _importers.is_empty():
 		_apply_iosurface(w, h, iosurface_id, iosurface_id_b, ready_index)
