@@ -17,6 +17,7 @@
 #     no termling focused, V/R/O/A/T/N/F/D/E... draw boxes, arrows, text, sticky
 #     notes, frames and todo lists. Drop a termling in a frame/box to zone it
 #   - Cmd/Ctrl+N spawns another terminal
+#   - Cmd+' steps through the notifications (Enter focuses, any other key goes back)
 extends Node2D
 
 const CarryGroup := preload("res://scripts/CarryGroup.gd")
@@ -115,8 +116,9 @@ var _zone_saved := {}        # term_id -> container ref from the last run (sessi
 var _zone_by_session := {}   # abduco session -> container ref (shape id, or a legacy zone name)
 var _legacy_zones := []      # pinned regions from an older state.json, turned into frames once
 var _notes := []             # [{project, event, term_id, ts}]
-# "Needs you" queue (Attention.gd): a ping focuses the termling if nothing has
-# focus, else it waits in line and gets focus when you leave the one you're on.
+# "Needs you" queue (Attention.gd): a ping focuses the termling only if nothing
+# has focus and you're zoomed out (_ping); else it waits in the queue and the
+# notifications panel, and Cmd+' steps through them.
 const CoveAttentionScript := preload("res://scripts/Attention.gd")
 var _attention = CoveAttentionScript.new()
 var _kitty_attn := {}        # term_id -> true: kitty's needs_attention flag, to ping on its rising edge
@@ -192,6 +194,11 @@ var _avy_cam := Vector2.ZERO   # camera goal while the labels are up
 var _avy_zoom := 1.0           # zoom goal while the labels are up
 const AVY_KEYS := "asdfghjklqwertyuiopzxcvbnm"   # home row first, like avy
 const AVY_NEAR := 6            # zoom out (if needed) until this many nearby termlings fit
+
+# stepping notifications (Cmd+'): preview each one in turn, Enter focuses
+var _notif_open := false
+var _notif_ids: Array = []     # termlings with a notification, panel order, frozen at open
+var _notif_idx := 0            # the one being previewed
 
 # proof mode
 var _shot_path := ""
@@ -298,12 +305,12 @@ func _process(delta: float) -> void:
 	# While previewing (search hit or radial jump) the camera swoops onto it;
 	# otherwise it follows the tracked terminal (double-click / committed jump).
 	# Track the terminal's centre, not the group's ground point (well below it).
-	if _previewing():
+	if _fly_id != -1:
+		_fly_step(delta)   # owns pan *and* zoom until it lands; then tracking (or the preview) takes over
+	elif _previewing():
 		_cam.position = _cam.position.lerp(_groups[_preview_id].terminal.global_position, 8.0 * delta)
 	elif _avy_open:
 		_cam.position = _cam.position.lerp(_avy_cam, 8.0 * delta)
-	elif _fly_id != -1:
-		_fly_step(delta)   # owns pan *and* zoom until it lands; then tracking takes over
 	elif _present_id != -1 and _groups.has(_present_id):
 		_present_lock = minf(_present_lock + 3.0 * delta, 1.0)
 		_snap_present_cam.call_deferred(delta)   # after this frame's bob is applied
@@ -319,10 +326,16 @@ func _process(delta: float) -> void:
 	# spans the whole window; leaving swoops the zoom back to where it was.
 	# Previewing fits the previewed termling instead: exactly in present mode,
 	# otherwise zooming out only as far as needed so a big termling isn't clipped.
-	if _previewing():
+	if _fly_id != -1:
+		pass   # the flight owns the zoom
+	elif _previewing():
 		# The radial jump always fits smaller, so its ring has room around the termling.
-		var fit := _fit_zoom_for(_groups[_preview_id], RADIAL_FILL if _radial_open else VIEW_FILL)
-		_ease_zoom(fit if _present_id != -1 or _radial_open else minf(_preview_return_zoom, fit), delta)
+		# Stepping notifications zooms onto each one (in or out) so it's readable.
+		if _notif_open:
+			_ease_zoom(_fit_zoom_for(_groups[_preview_id], ATTEND_FILL), delta)
+		else:
+			var fit := _fit_zoom_for(_groups[_preview_id], RADIAL_FILL if _radial_open else VIEW_FILL)
+			_ease_zoom(fit if _present_id != -1 or _radial_open else minf(_preview_return_zoom, fit), delta)
 	elif _avy_open:
 		_ease_zoom(_avy_zoom, delta)
 	elif _present_id != -1:
@@ -412,7 +425,7 @@ func _add_group(id: int) -> void:
 		_set_focus(id)
 		_tracking_id = id   # glue the camera to the new termling
 	elif _focused_id == -1:
-		_set_focus(id)
+		_set_focus(id, false)
 
 
 func _remove_group(id: int) -> void:
@@ -423,13 +436,9 @@ func _remove_group(id: int) -> void:
 	_attention.remove(id)
 	if _focused_id == id:
 		_focused_id = -1
-		var nxt: int = _attention.on_leave()   # whoever's waiting for you comes next
-		if nxt != -1 and _groups.has(nxt):
-			_set_focus(nxt)
-		else:
-			for other in _groups:
-				_set_focus(other)
-				break
+		for other in _groups:
+			_set_focus(other, false)
+			break
 
 
 # --- cross-Mac termling handoff --------------------------------------------
@@ -682,8 +691,9 @@ func _close_origin(id: int) -> void:
 	_remove_group(id)
 
 
-func _set_focus(id: int) -> void:
-	var prev := _focused_id
+# dismiss: this is you attending to it, so its notification goes. Focus that
+# isn't you (a ping taking the camera, a drag, restoring after a reload) keeps it.
+func _set_focus(id: int, dismiss := true) -> void:
 	_focused_id = id
 	for oid in _groups:
 		_groups[oid].terminal.set_focused(oid == id)
@@ -691,7 +701,12 @@ func _set_focus(id: int) -> void:
 		_bd_stop_edit()   # a termling took the keyboard: the board lets go
 		_bd_sel = []
 	_bd_update_hint()
-	# Attending to a terminal clears its "needs you" note.
+	if dismiss:
+		_dismiss_note(id)
+
+
+# You attended to a terminal: clear its "needs you" note and queue entry.
+func _dismiss_note(id: int) -> void:
 	var kept := []
 	var changed := false
 	for n in _notes:
@@ -703,20 +718,22 @@ func _set_focus(id: int) -> void:
 		_notes = kept
 		_update_panel()
 	_attention.on_focus(id)
-	if id == -1 and prev != -1:
-		var nxt: int = _attention.on_leave()
-		if nxt != -1 and _groups.has(nxt):
-			call_deferred("_attend", nxt)
 
 
+# Frontmost termling under world_pos. Ones faded out of the way (in front of the
+# tracked termling) are see-through to clicks when something solid is behind.
 func _group_at(world_pos: Vector2) -> Node2D:
 	var best: Node2D = null
+	var best_faded: Node2D = null
 	for id in _groups:
 		var g: Node2D = _groups[id]
 		if g.terminal.contains_point(world_pos):
-			if best == null or g.position.y > best.position.y:
+			if g.terminal.screen.modulate.a < 0.5:
+				if best_faded == null or g.position.y > best_faded.position.y:
+					best_faded = g
+			elif best == null or g.position.y > best.position.y:
 				best = g
-	return best
+	return best if best != null else best_faded
 
 
 func _is_modifier_key(kc: int) -> bool:
@@ -789,6 +806,12 @@ func _input(event: InputEvent) -> void:
 		_avy_key(event)
 		get_viewport().set_input_as_handled()
 		return
+	# Stepping notifications: Cmd+' / Tab / arrows step, Enter focuses, and any
+	# other key is swallowed and swoops back to where you started.
+	if _notif_open and _bd_edit_id == "":
+		_notif_key(event)
+		get_viewport().set_input_as_handled()
+		return
 	# While the rename dialog is open, Esc cancels it and other keys go to it.
 	if _rename_id != -1:
 		if event.keycode == KEY_ESCAPE:
@@ -859,6 +882,11 @@ func _input(event: InputEvent) -> void:
 		_open_avy()
 		get_viewport().set_input_as_handled()
 		return
+	# Cmd+' steps through the notifications (camera only until you press Enter).
+	if _is_apostrophe(event) and event.meta_pressed and not event.ctrl_pressed:
+		_open_notif()
+		get_viewport().set_input_as_handled()
+		return
 	if event.keycode == KEY_N and (event.meta_pressed or event.ctrl_pressed):
 		_spawn_follow = true   # the next fresh termling is framed by the camera + followed
 		_spawn_terminal()
@@ -872,7 +900,7 @@ func _world_mouse() -> Vector2:
 # Start sliding the pressed termling along the ground. can_send: the drag may
 # fling it off the window edge (plain drag); Alt-drag only relocates.
 func _begin_move(can_send: bool) -> void:
-	_set_focus(_press_group.term_id)
+	_set_focus(_press_group.term_id, false)   # moving it isn't attending to it
 	_moving = true
 	_move_can_send = can_send
 	_move_grab = _press_group.get_ground_pos() - _press_world
@@ -915,6 +943,15 @@ func _unhandled_input(event: InputEvent) -> void:
 			_close_radial(false)
 		if _avy_open and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
 			_close_avy(false)
+		# While stepping notifications, a click on the one being shown focuses it
+		# (like Enter); a click anywhere else takes over.
+		if _notif_open and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
+			var pid := _preview_id
+			if _groups.has(pid) and _groups[pid].terminal.contains_point(_world_mouse()):
+				_notif_commit(pid)
+				get_viewport().set_input_as_handled()
+				return
+			_close_notif(false)
 		if event.pressed:
 			_cycle_active = false   # any click ends a focus-cycle run
 		var wpos := _world_mouse()
@@ -1089,7 +1126,9 @@ func _zoom_by(factor: float) -> void:
 	_zoom_goal = 0.0
 	_fly_id = -1   # a manual zoom cancels any camera flight
 	var before := _cam.get_global_mouse_position()
-	var z := clampf(_cam.zoom.x * factor, MIN_ZOOM, MAX_ZOOM)
+	# (from past MAX_ZOOM, after a present or a notification jump, zoom out smoothly
+	# rather than snapping back to MAX_ZOOM)
+	var z := clampf(_cam.zoom.x * factor, MIN_ZOOM, maxf(MAX_ZOOM, _cam.zoom.x))
 	_cam.zoom = Vector2(z, z)
 	var after := _cam.get_global_mouse_position()
 	_cam.position += before - after  # keep the point under the cursor stable
@@ -1271,56 +1310,117 @@ func _toggle_present(g: Node2D) -> void:
 # In present mode the new one is presented instead, otherwise the present-mode
 # camera glue would keep holding the old one. Outside it the camera tracks the
 # new one and zooms out if it wouldn't fit the window.
-func _jump_focus(id: int, track := true, zoom := 0.0) -> void:
+func _jump_focus(id: int, track := true, zoom := 0.0, dismiss := true) -> void:
 	if not _groups.has(id):
 		return
 	if _present_id != -1:
 		if _present_id != id:
 			_toggle_present(_groups[id])
 		return
-	_set_focus(id)
+	_set_focus(id, dismiss)
 	if track:
 		_tracking_id = id
 	# Fly there, zooming out if it wouldn't fit (or to the caller's zoom).
 	_fly_to(id, zoom if zoom > 0.0 else minf(_cam.zoom.x, _fit_zoom_for(_groups[id])))
 
 
-# Glide the camera onto id while easing the zoom to z, as one motion. The
-# target's on-screen offset from centre shrinks steadily as the zoom changes, so
-# it slides straight in rather than the view zooming about the old centre first.
+# Camera flights. A short hop glides straight onto the target while easing the
+# zoom: its on-screen offset from centre shrinks steadily as the zoom changes, so
+# it slides in rather than the view zooming about the old centre first. A long
+# one (the target well off screen) zooms out, floats over and zooms back in, on
+# van Wijk & Nuij's smooth pan-zoom path, taking a little longer the further it
+# goes. Both chase a moving target: the path is laid out relative to where the
+# target is now.
+const FLY_POINT := -2          # _fly_id for a flight to a fixed point (_fly_pt)
+const FLY_RHO := 1.4           # how far a long flight zooms out (van Wijk's rho, ~sqrt 2)
+const FLY_FAR := 0.75          # "long": the target is more than this many view-widths away
+var _fly_pt := Vector2.ZERO    # goal of a FLY_POINT flight
+var _fly_dur := FLY_TIME       # seconds this flight takes
+var _fly_S := 0.0              # a long flight's path length (0 = short glide)
+var _fly_r0 := 0.0             # van Wijk's r0 for it
+var _fly_w0 := 1.0             # visible world width at take-off
+var _fly_u1 := 1.0             # distance to the target at take-off
+var _fly_d0 := Vector2.ZERO    # take-off camera position minus the target's
+var _fly_vpw := 1.0            # viewport width the world widths are measured against
+
 func _fly_to(id: int, z: float) -> void:
+	_fly_start(id, _groups[id].terminal.global_position, z)
+
+
+func _fly_to_point(p: Vector2, z: float) -> void:
+	_fly_pt = p
+	_fly_start(FLY_POINT, p, z)
+
+
+func _fly_start(id: int, goal: Vector2, z: float) -> void:
 	_fly_id = id
 	_fly_t = 0.0
 	_fly_z0 = _cam.zoom.x
 	_fly_z1 = z
-	_fly_off = (_groups[id].terminal.global_position - _cam.position) * _fly_z0
+	_fly_off = (goal - _cam.position) * _fly_z0
+	_fly_d0 = _cam.position - goal
+	_fly_vpw = get_viewport().get_visible_rect().size.x
+	_fly_w0 = _fly_vpw / _fly_z0
+	var w1 := _fly_vpw / z
+	_fly_u1 = _fly_d0.length()
+	_fly_S = 0.0
+	_fly_dur = FLY_TIME
+	if _fly_u1 > FLY_FAR * maxf(_fly_w0, w1):
+		var p2 := FLY_RHO * FLY_RHO
+		var b0 := (w1 * w1 - _fly_w0 * _fly_w0 + p2 * p2 * _fly_u1 * _fly_u1) / (2.0 * _fly_w0 * p2 * _fly_u1)
+		var b1 := (w1 * w1 - _fly_w0 * _fly_w0 - p2 * p2 * _fly_u1 * _fly_u1) / (2.0 * w1 * p2 * _fly_u1)
+		_fly_r0 = -_asinh(b0)
+		_fly_S = (-_asinh(b1) - _fly_r0) / FLY_RHO
+		_fly_dur = clampf(0.45 + 0.18 * _fly_S, 0.6, 1.6)
 	_zoom_goal = 0.0
 	_present_leaving = false
 	_cam_return = false
 
 
+# log(x + sqrt(x^2 + 1)), kept accurate for large negative x.
+func _asinh(x: float) -> float:
+	return log(x + sqrt(x * x + 1.0)) if x >= 0.0 else -log(-x + sqrt(x * x + 1.0))
+
+
 func _fly_step(delta: float) -> void:
-	if not _groups.has(_fly_id) or _panning:
+	if _panning or (_fly_id != FLY_POINT and not _groups.has(_fly_id)):
 		_fly_id = -1   # target gone, or the user grabbed the camera
 		return
-	_fly_t = minf(_fly_t + delta / FLY_TIME, 1.0)
+	var goal: Vector2 = _fly_pt if _fly_id == FLY_POINT else _groups[_fly_id].terminal.global_position
+	_fly_t = minf(_fly_t + delta / _fly_dur, 1.0)
 	var e := _fly_t * _fly_t * (3.0 - 2.0 * _fly_t)   # smoothstep
-	var z := _fly_z0 * pow(_fly_z1 / _fly_z0, e)      # geometric, so zoom speed feels even
-	_cam.zoom = Vector2(z, z)
-	_cam.position = _groups[_fly_id].terminal.global_position - _fly_off * (1.0 - e) / z
 	if _fly_t >= 1.0:
+		_cam.zoom = Vector2(_fly_z1, _fly_z1)
+		_cam.position = goal
 		_fly_id = -1
+	elif _fly_S > 0.0:
+		# van Wijk & Nuij: visible width w(s) and distance travelled u(s) along the path
+		var a := FLY_RHO * _fly_S * e + _fly_r0
+		var w := _fly_w0 * cosh(_fly_r0) / cosh(a)
+		var u := _fly_w0 / (FLY_RHO * FLY_RHO) * (cosh(_fly_r0) * tanh(a) - sinh(_fly_r0))
+		var z := _fly_vpw / w
+		_cam.zoom = Vector2(z, z)
+		_cam.position = goal + _fly_d0 * (1.0 - u / _fly_u1)
+	else:
+		var z := _fly_z0 * pow(_fly_z1 / _fly_z0, e)      # geometric, so zoom speed feels even
+		_cam.zoom = Vector2(z, z)
+		_cam.position = goal - _fly_off * (1.0 - e) / z
 
 
 # A "needs you" jump: focus it, pan over, and zoom in (or out) until it fills
-# ATTEND_FILL of the window, so it's readable the moment focus lands.
-const ATTEND_FILL := 0.8
-func _attend(id: int) -> void:
+# ATTEND_FILL of the window (as full as a triple-click present, and allowed past
+# MAX_ZOOM like it), so it's readable the moment focus lands. dismiss: you asked
+# for it (so its notification goes), rather than a ping taking the camera.
+const ATTEND_FILL := VIEW_FILL
+func _attend(id: int, dismiss := true) -> void:
 	if not _groups.has(id):
 		return
-	_jump_focus(id, false)
+	# Follow it (like a search / radial commit): otherwise a previously tracked
+	# termling pulls the camera back once the flight lands, and the ones in front
+	# of this one stop fading, so your next click lands on them instead.
+	_jump_focus(id, true, 0.0, dismiss)
 	if _present_id == -1:
-		_zoom_goal = clampf(_fit_zoom_for(_groups[id], ATTEND_FILL), MIN_ZOOM, MAX_ZOOM)
+		_zoom_goal = _fit_zoom_for(_groups[id], ATTEND_FILL)
 
 
 func _ease_zoom(goal: float, delta: float) -> void:
@@ -1548,7 +1648,7 @@ func _restore_after_reconcile() -> void:
 			_follows[fid] = _saved["follows"][fid]
 	var foc := int(_saved.get("focused", -1))
 	if foc != -1 and _groups.has(foc):
-		_set_focus(foc)
+		_set_focus(foc, false)
 	# Re-queue whoever was waiting for you (by session first: kitty ids change on restart).
 	for q in _saved.get("queue", []):
 		if typeof(q) != TYPE_DICTIONARY:
@@ -1772,9 +1872,7 @@ func _apply_agent_state() -> void:
 			# kitty raising the flag (a bell, an agent waiting) is a ping too
 			if _attn_live and not _kitty_attn.has(id):
 				_kitty_attn[id] = true
-				var now: int = _attention.ping(id, _attention_focus())
-				if now != -1:
-					_attend.call_deferred(now)
+				_ping(id, true)
 		else:
 			_kitty_attn.erase(id)
 		g.set_attention(_attn_ids.has(id))
@@ -2147,6 +2245,9 @@ func _pump_notify() -> void:
 			g = _find(int(n.get("pane", -1)))
 		if g == null:
 			continue
+		var ev := str(n.get("event", ""))
+		if ev == "working":
+			continue   # back at it; its notification stays until you focus it yourself
 		got = true
 		# de-dupe: one live note per terminal
 		var kept := []
@@ -2154,18 +2255,37 @@ func _pump_notify() -> void:
 			if existing.get("term_id", -2) != g.term_id:
 				kept.append(existing)
 		_notes = kept
-		var ev := str(n.get("event", ""))
-		if ev == "working":
-			_attention.resolve(g.term_id)   # back at it: it doesn't need you any more
-			continue
 		_notes.push_front({"project": str(n.get("project", "")), "event": ev, "term_id": g.term_id, "ts": int(n.get("ts", 0))})
 		if _notes.size() > 8:
 			_notes.resize(8)
-		var now: int = _attention.ping(g.term_id, _attention_focus())
-		if now != -1:
-			_attend(now)
+		_ping(g.term_id)
 	if got:
 		_update_panel()
+
+
+# A termling needs you. It only takes the camera when nothing has focus and
+# you're zoomed out over the board (it'd span under STEAL_FILL of the window
+# where it is): then a jump is a glance, not a yank. Otherwise it waits in the
+# queue and the notifications panel; Cmd+' steps through them.
+const STEAL_FILL := 0.4
+func _ping(id: int, deferred := false) -> void:
+	if not _groups.has(id):
+		return
+	var steal: bool = _present_id == -1 and not _overlay_open() \
+		and _cam.zoom.x < _fit_zoom_for(_groups[id], STEAL_FILL)
+	var now: int = _attention.ping(id, _attention_focus(), steal)
+	if now == -1:
+		return
+	# (the notification stays: the camera came to it, you didn't)
+	if deferred:
+		_attend.call_deferred(now, false)
+	else:
+		_attend(now, false)
+
+
+# An overlay (search, radial, avy, notification stepping) owns the camera.
+func _overlay_open() -> bool:
+	return _search_open or _radial_open or _avy_open or _notif_open or _rename_id != -1
 
 
 func _find_by_session(sess: String) -> Node2D:
@@ -2534,7 +2654,7 @@ func _search_choose(id: int) -> void:
 # --- preview: camera + occluder fade while stepping search hits / radial jumps
 
 func _previewing() -> bool:
-	return (_search_open or _radial_open) and _preview_id != -1 and _groups.has(_preview_id)
+	return (_search_open or _radial_open or _notif_open) and _preview_id != -1 and _groups.has(_preview_id)
 
 
 # Remember the view a search / radial jump started from, so Esc can put it back.
@@ -2543,6 +2663,7 @@ func _begin_preview() -> void:
 	_preview_return_cam = _cam.position
 	_preview_return_zoom = _cam.zoom.x
 	_zoom_goal = 0.0
+	_fly_id = -1   # the preview takes the camera from any flight under way
 
 
 # restore_view (Esc): swoop back to the starting view, unless a tracked or
@@ -2596,8 +2717,8 @@ func _occludes(a: Node2D, target: Node2D) -> bool:
 # front of it, so a wanderer crossing the foreground never hides what you're
 # watching. The search overlay owns the dimming while it's open, so we defer to it.
 func _update_occluder_fade(delta: float) -> void:
-	if _search_open or _radial_open:
-		return
+	if _search_open or _radial_open or _notif_open:
+		return   # the preview does its own fading
 	if _tracking_id != -1 and _groups.has(_tracking_id):
 		var target: Node2D = _groups[_tracking_id]
 		for oid in _groups:
@@ -2995,6 +3116,7 @@ func _open_avy() -> void:
 		box = box.merge(_term_rect(_groups[ids[i]]))
 	box = box.grow(60.0)
 	var fit := clampf(minf(vp.x / box.size.x, vp.y / box.size.y), MIN_ZOOM, MAX_ZOOM)
+	_fly_id = -1   # the labels take the camera from any flight under way
 	_avy_zoom = _cam.zoom.x
 	_avy_cam = _cam.position
 	if fit < _cam.zoom.x:
@@ -3131,6 +3253,106 @@ func _close_avy(restore_view: bool) -> void:
 	_avy_prefix = ""
 
 
+# --- stepping notifications (Cmd+') ------------------------------------------
+# Cmd+' previews the newest notification's termling: the camera flies over and
+# zooms onto it, and its row lights up in the panel. Cmd+' again (or Tab / Down)
+# steps to the next, Shift (or Up) steps back. Enter focuses the one you're on;
+# any other key swoops back to where you started. A click takes over.
+
+func _is_apostrophe(ev: InputEventKey) -> bool:
+	return ev.keycode == KEY_APOSTROPHE or ev.physical_keycode == KEY_APOSTROPHE
+
+
+# Termlings with a notification, in panel order (newest first).
+func _notif_targets() -> Array:
+	var ids := []
+	for n in _notes:
+		var tid: int = n.get("term_id", -1)
+		if tid != -1 and _groups.has(tid) and not ids.has(tid):
+			ids.append(tid)
+	return ids
+
+
+func _open_notif() -> void:
+	var ids := _notif_targets()
+	if ids.is_empty():
+		return
+	_notif_ids = ids
+	_notif_idx = 0
+	_notif_open = true
+	_begin_preview()
+	_notif_go(_notif_ids[0])
+	_update_panel()
+
+
+# Preview id and fly the camera onto it, zoomed to read (a long hop zooms out,
+# floats over and back in).
+func _notif_go(id: int) -> void:
+	_preview(id)
+	_fly_to(id, _fit_zoom_for(_groups[id], ATTEND_FILL))
+
+
+# Enter, or a click on the one being shown: focus it for real.
+func _notif_commit(id: int) -> void:
+	var flying := _fly_id == id
+	_close_notif(false)
+	if not _groups.has(id):
+		return
+	if flying and _present_id == -1:
+		# the flight under way already lands on it at the right zoom; don't restart it
+		_set_focus(id)
+		_tracking_id = id
+	else:
+		_attend(id)
+
+
+func _notif_step(d: int) -> void:
+	var cur: int = _notif_ids[_notif_idx] if _notif_idx < _notif_ids.size() else -1
+	_notif_ids = _notif_ids.filter(func(x): return _groups.has(x))
+	for t in _notif_targets():   # ones that arrived since you started go on the end
+		if not _notif_ids.has(t):
+			_notif_ids.append(t)
+	if _notif_ids.is_empty():
+		_close_notif(true)
+		return
+	var at := _notif_ids.find(cur)
+	_notif_idx = posmod(at + d, _notif_ids.size()) if at != -1 else clampi(_notif_idx, 0, _notif_ids.size() - 1)
+	_notif_go(_notif_ids[_notif_idx])
+	_update_panel()
+
+
+func _notif_key(ev: InputEventKey) -> void:
+	var k := ev.keycode
+	if _is_modifier_key(k):
+		return   # the Shift of Shift+Cmd+' isn't a keypress of its own
+	if (_is_apostrophe(ev) and ev.meta_pressed) or k == KEY_TAB or k == KEY_DOWN:
+		_notif_step(-1 if ev.shift_pressed else 1)
+	elif k == KEY_UP:
+		_notif_step(-1)
+	elif k == KEY_ENTER or k == KEY_KP_ENTER:
+		_notif_commit(_notif_ids[_notif_idx] if _notif_idx < _notif_ids.size() else -1)
+	else:
+		_close_notif(true)
+
+
+func _close_notif(restore_view: bool) -> void:
+	if not _notif_open:
+		return
+	_notif_open = false
+	_notif_ids = []
+	# Going back flies home the same way (a long hop zooms out and back in);
+	# present mode re-fits its own termling instead.
+	if restore_view and _present_id == -1:
+		_end_preview(false)
+		if _tracking_id != -1 and _groups.has(_tracking_id):
+			_fly_to(_tracking_id, _preview_return_zoom)
+		else:
+			_fly_to_point(_preview_return_cam, _preview_return_zoom)
+	else:
+		_end_preview(restore_view)
+	_update_panel()
+
+
 func _update_panel() -> void:
 	if _panel_vbox == null:
 		return
@@ -3146,6 +3368,7 @@ func _update_panel() -> void:
 		empty.add_theme_color_override("font_color", Color(0.6, 0.62, 0.66))
 		_panel_vbox.add_child(empty)
 		return
+	var cur: int = _notif_ids[_notif_idx] if _notif_open and _notif_idx < _notif_ids.size() else -1
 	for n in _notes:
 		var row := Label.new()
 		var tid: int = n.get("term_id", -1)
@@ -3154,10 +3377,23 @@ func _update_panel() -> void:
 			who = "termling %d" % tid
 			if _groups.has(tid) and _groups[tid].terminal.custom_name != "":
 				who = _groups[tid].terminal.custom_name
-		row.text = "• %s" % who
+		var on := tid != -1 and tid == cur
+		row.text = ("▸ %s" if on else "• %s") % who
 		row.add_theme_font_size_override("font_size", 13)
-		row.add_theme_color_override("font_color", Color(0.92, 0.9, 0.85))
+		row.add_theme_color_override("font_color", Color(1, 1, 1) if on else Color(0.92, 0.9, 0.85))
+		if on:   # the one Cmd+' is showing
+			var sb := StyleBoxFlat.new()
+			sb.bg_color = Color(0.45, 0.85, 1.0, 0.25)
+			sb.set_corner_radius_all(4)
+			sb.content_margin_left = 4
+			sb.content_margin_right = 4
+			row.add_theme_stylebox_override("normal", sb)
 		_panel_vbox.add_child(row)
+	var hint := Label.new()
+	hint.text = "↵ focus  ·  ⌘' next  ·  ⇧⌘' back  ·  other keys: return" if _notif_open else "⌘' step through"
+	hint.add_theme_font_size_override("font_size", 11)
+	hint.add_theme_color_override("font_color", Color(0.6, 0.62, 0.66))
+	_panel_vbox.add_child(hint)
 
 
 # =============================================================================
@@ -3331,7 +3567,6 @@ var _bd_rot_center := Vector2.ZERO
 var _bd_rot_start := 0.0
 var _bd_tex := {}               # image src -> Texture2D (null if it failed to load)
 var _bd_last_input_ms := 0      # last board click/key, for _bd_owns_keyboard
-var _bd_left_focus := false     # this board press is the click that unfocused a termling
 # Redraw on change, not every frame (see _bd_tick).
 var _bd_live_layer: Node2D      # arrows tied to termlings, which move on their own
 var _bd_dirty := true
@@ -3397,11 +3632,6 @@ func _bd_tick(delta: float) -> void:
 		_bd_unfurl_poll()
 		if absf(_bd_ui_target_scale() - _bd_ui_scale) > 0.01:
 			_bd_apply_ui_scale()   # the window moved to another screen
-		# Nothing focused and the board gone quiet: whoever's waiting for you gets focus.
-		if _focused_id == -1 and not _bd_owns_keyboard():
-			var nxt: int = _attention.on_leave()
-			if nxt != -1 and _groups.has(nxt):
-				_attend(nxt)
 	# Redraw only what changed. Redrawing every shape every frame (at up to 144
 	# fps) was the Cove's biggest main-thread cost. The shapes redraw when they
 	# change, while a drag/edit is shaping them, or when the zoom (frame titles)
@@ -3934,7 +4164,6 @@ func _bd_wants_press(p: Vector2, over_termling: bool) -> bool:
 func _bd_pointer_down(p: Vector2, ev: InputEventMouseButton) -> void:
 	_bd_cam_goal = null
 	_bd_last_input_ms = Time.get_ticks_msec()
-	_bd_left_focus = _focused_id != -1
 	_bd_unfocus_termling()   # the keyboard now drives the board
 	_bd_down = p
 	_bd_down_screen = ev.position
@@ -4106,11 +4335,6 @@ func _bd_pointer_up(p: Vector2, _ev: InputEventMouseButton) -> void:
 	_bd_g = ""
 	_bd_bind_hint = ""
 	_bd_guides = []
-	# A plain click on empty ground is how you leave a termling: whoever's
-	# waiting for you comes next. (Checked after this click's selection settles.)
-	if _bd_left_focus and not _bd_moved and _bd_tool == "select":
-		_bd_attend_next.call_deferred()
-	_bd_left_focus = false
 	match g:
 		"pending":   # a click on a shape without dragging
 			if _bd_shift and _bd_press_id != "" and _bd_sel.has(_bd_press_id):
@@ -5181,15 +5405,6 @@ func _bd_owns_keyboard() -> bool:
 	return _bd_edit_id != "" or _bd_tool != "select" \
 		or (_bd_g != "" and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)) \
 		or Time.get_ticks_msec() - _bd_last_input_ms < 4000
-
-
-# The unfocusing click landed on nothing: jump to the head of the "needs you" queue.
-func _bd_attend_next() -> void:
-	if _focused_id != -1 or not _bd_sel.is_empty() or _bd_edit_id != "":
-		return
-	var nxt: int = _attention.on_leave()
-	if nxt != -1 and _groups.has(nxt):
-		_attend(nxt)
 
 
 func _bd_camera_changed() -> void:
