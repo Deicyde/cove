@@ -16,7 +16,7 @@ Register in ~/.claude.json under mcpServers, e.g.:
   "cove": {"command": "python3",
            "args": ["/Users/.../kitty/cove/mcp/cove_mcp.py"]}
 """
-import sys, json, os, time, uuid
+import sys, json, os, re, time, uuid
 import cove_find  # sibling module: semantic terminal resolver
 
 DIR = os.environ.get("KITTY_COVE_DIR", "/tmp/cove")
@@ -183,6 +183,9 @@ TOOLS = [
          "items": {"type": "array", "items": {"type": "string"}, "description": "todo items (type=todo)"},
          "color": {"type": "string"}},
          "required": ["type"]}},
+    {"name": "add_link",
+     "description": "Put a link on the board next to your termling as a bookmark card (title, preview image, favicon), as pasting a URL into tldraw does. GitHub pull requests and issues show their live state (open/draft/merged/closed) and +/- lines, re-checked every few minutes, so this is the way to hand the user a PR you opened. You own the card (delete it with delete_notes). Returns its id.",
+     "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
     {"name": "update_note",
      "description": "Change one of your own board shapes: replace text/color/items, append add_items, or check/uncheck/remove a todo item (by index or text).",
      "inputSchema": {"type": "object", "properties": {
@@ -257,6 +260,18 @@ def call_tool(name, args):
         for k in ("text", "items", "color"):
             if k in args:
                 cmd[k] = args[k]
+        return dict(send(CMDS, cmd), id=sid)
+    if name == "add_link":
+        t = require_me()
+        sess = my_session()
+        if not sess:
+            raise ValueError("no COVE_SESSION: board shapes need an owner")
+        url = str(args["url"]).strip()
+        if not re.match(r"^https?://\S+$", url):
+            raise ValueError("url must be an http(s) URL")
+        sid = "%s.%s" % (sess, uuid.uuid4().hex[:6])
+        cmd = {"cmd": "board", "op": "add", "type": "bookmark", "id": sid, "near": t["id"],
+               "owner": sess, "url": url}
         return dict(send(CMDS, cmd), id=sid)
     if name == "update_note":
         require_own(args["id"])

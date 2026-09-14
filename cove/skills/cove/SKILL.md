@@ -60,6 +60,11 @@ you (and the user) can change them.
   `add_items`, or `check` / `uncheck` / `remove` an item (by index or text).
 - **`link(to, from?, text?)`**: an arrow from one of your shapes (or `me`, your
   termling) to a termling id or shape id.
+- **`add_link(url)`**: a bookmark card for a link (title, preview image,
+  favicon), next to your termling. For a GitHub PR or issue the card shows its
+  live state (open / draft / merged / closed) and +/- lines, so when you open a
+  PR, put its link on the board. `board` shows the card's `title` and `github`
+  state.
 - **`delete_notes(ids)`**: remove shapes you own.
 
 Keep it tidy: update one todo list as you go rather than adding new notes, and

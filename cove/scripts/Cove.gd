@@ -3205,6 +3205,25 @@ const BD_GEO := ["rectangle", "ellipse", "diamond", "triangle"]
 const BD_STICKY_TOOLS := ["hand", "draw", "highlight", "eraser", "laser"]  # stay armed after use
 const BD_ASSETS := "user://board-assets"   # images are copied in, so the board keeps them
 const BD_IMAGE_EXTS := ["png", "jpg", "jpeg", "webp", "svg", "bmp", "tga"]
+# Link bookmarks: tldraw's BookmarkShapeUtil sizes and its dark theme colours.
+const BD_BM_W := 300.0
+const BD_BM_H := 320.0              # with a preview image (or still loading)
+const BD_BM_SHORT := 101.0          # title, no image
+const BD_BM_JUST_URL := 46.0        # nothing but the address
+const BD_BM_FIELDS := ["title", "description", "image", "favicon", "site", "github", "fetched"]
+const BD_BM_REFRESH_MS := 300000    # GitHub PR/issue cards re-check their state this often
+const BD_BM_PANEL := Color(0.126, 0.127, 0.144)     # --color-panel
+const BD_BM_EDGE := Color(0.203, 0.198, 0.262)      # --color-panel-contrast
+const BD_BM_DIVIDER := Color(0.200, 0.200, 0.240)   # --color-divider
+const BD_BM_MUTED0 := Color(1, 1, 1, 0.02)          # --color-muted-0
+const BD_BM_MUTED2 := Color(1, 1, 1, 0.05)          # --color-muted-2
+const BD_BM_TEXT := Color(0.85, 0.85, 0.85)         # --color-text-1
+const BD_BM_TEXT2 := Color(0.74, 0.752, 0.76)       # --color-text-3
+const BD_GH_STATES := {   # GitHub's own dark-mode state colours
+	"open": ["Open", Color(0.137, 0.525, 0.212)], "draft": ["Draft", Color(0.431, 0.463, 0.506)],
+	"merged": ["Merged", Color(0.537, 0.341, 0.898)], "closed": ["Closed", Color(0.855, 0.212, 0.2)],
+	"not_planned": ["Not planned", Color(0.431, 0.463, 0.506)],
+}
 const BD_SNAP_COL := Color(1.0, 0.32, 0.45)
 const BD_ARRANGE := [   # [glyph, menu label, mode]
 	["⇤", "Align left   ⌥A", "left"], ["⇔", "Align centre   ⌥H", "center-h"], ["⇥", "Align right   ⌥D", "right"],
@@ -3246,6 +3265,7 @@ Dragging: ⇧ keeps the aspect or snaps the angle, ⌥ scales from the centre, �
 ⌘ snaps to other shapes and termlings (the 🧲 button makes snapping the default).
 Double-click empty ground to type; double-click a shape to edit its label.
 Paste or drop images onto the ground; drop files onto a termling to type their paths.
+Paste a link for a bookmark card (GitHub PRs show their state); click its address to open it.
 Drop a termling inside a frame or box and it lives there, moving when the frame moves."""
 
 var _bd_layer: Node2D           # paints the shapes (above the ground, below termlings)
@@ -3318,6 +3338,11 @@ var _bd_dirty := true
 var _bd_drawn_zoom := 0.0
 var _bd_member_sig := 0
 var _bd_overlay_was_live := true
+# Link bookmarks (see "board: link bookmarks").
+var _bd_unfurl := {}            # url -> metadata from cove_unfurl.py (title, image, favicon, github...)
+var _bd_unfurl_pending := {}    # url -> {out, t} while the helper runs
+var _bd_bm_next_refresh := 0    # ticks msec of the next GitHub state re-check
+var _bd_bm_styles := {}         # StyleBoxFlats for the card
 
 
 func _bd_setup() -> void:
@@ -3369,6 +3394,7 @@ func _bd_tick(delta: float) -> void:
 	if _bd_hint_accum > 0.3:
 		_bd_hint_accum = 0.0
 		_bd_update_hint()
+		_bd_unfurl_poll()
 		if absf(_bd_ui_target_scale() - _bd_ui_scale) > 0.01:
 			_bd_apply_ui_scale()   # the window moved to another screen
 		# Nothing focused and the board gone quiet: whoever's waiting for you gets focus.
@@ -3455,7 +3481,7 @@ func _bd_bounds(s: Dictionary) -> Rect2:
 
 
 func _bd_is_box(s: Dictionary) -> bool:
-	return str(s["type"]) in ["geo", "text", "note", "frame", "todo", "image"]
+	return str(s["type"]) in ["geo", "text", "note", "frame", "todo", "image", "bookmark"]
 
 
 func _bd_reindex() -> void:
@@ -3463,6 +3489,8 @@ func _bd_reindex() -> void:
 	_bd_by_id.clear()
 	for s in _bd_shapes:
 		_bd_by_id[str(s["id"])] = s
+		if str(s["type"]) == "bookmark":
+			_bd_bm_apply(s)   # undo and reloads pick up what's been unfurled since
 	_bd_sel = _bd_sel.filter(func(i): return _bd_by_id.has(i))
 
 
@@ -3484,6 +3512,8 @@ func _bd_add(s: Dictionary) -> void:
 	_bd_dirty = true
 	_bd_shapes.append(s)
 	_bd_by_id[str(s["id"])] = s
+	if str(s["type"]) == "bookmark":
+		_bd_bm_apply(s)
 
 
 func _bd_remove(ids: Array) -> void:
@@ -3775,7 +3805,7 @@ func _bd_hit_solid(s: Dictionary, p: Vector2, tol: float) -> bool:
 					and Geometry2D.is_point_in_polygon(p, poly):
 				return true
 			return _bd_dist_poly(p, poly, true) <= tol + _bd_sw(s) * 0.5
-		"note", "text", "todo", "image":
+		"note", "text", "todo", "image", "bookmark":
 			return _bd_rect(s).grow(tol * 0.5).has_point(p)
 		"frame":
 			if _bd_frame_label_rect(s).has_point(p):
@@ -3870,6 +3900,8 @@ func _bd_handles() -> Array:
 		r = _bd_rect(_bd_by_id[_bd_sel[0]])
 		xf = _bd_xform(_bd_by_id[_bd_sel[0]])
 	var c := r.get_center()
+	if _bd_sel.size() == 1 and str(_bd_by_id[_bd_sel[0]]["type"]) == "bookmark":   # tldraw: bookmarks don't resize
+		return [{"kind": "rotate", "pos": xf * Vector2(c.x, r.position.y - 28.0 / _cam.zoom.x)}]
 	for n in ["tl", "t", "tr", "r", "br", "b", "bl", "l"]:
 		var x: float = r.position.x if n in ["tl", "l", "bl"] else (r.end.x if n in ["tr", "r", "br"] else c.x)
 		var y: float = r.position.y if n in ["tl", "t", "tr"] else (r.end.y if n in ["bl", "b", "br"] else c.y)
@@ -3983,6 +4015,13 @@ func _bd_select_down(p: Vector2, ev: InputEventMouseButton) -> void:
 		_bd_g = "handle"
 		return
 	var id := _bd_hit(p)
+	# A bookmark opens from its address row (as tldraw's link does) or a double-click.
+	if id != "" and str(_bd_by_id[id]["type"]) == "bookmark" and not ev.shift_pressed:
+		var bm: Dictionary = _bd_by_id[id]
+		if ev.double_click or _bd_bm_link_rect(bm).has_point(_bd_local(bm, p)):
+			_bd_bm_open(bm)
+			_bd_g = "none"
+			return
 	# A todo list's checkboxes and "+ add item" row work on a single click.
 	if id != "" and str(_bd_by_id[id]["type"]) == "todo" and not ev.double_click:
 		var part := _bd_todo_part_at(_bd_by_id[id], p)
@@ -4433,7 +4472,7 @@ func _bd_edit_text(s: Dictionary, part: int) -> String:
 func _bd_start_edit(id: String, part := -1) -> void:
 	_bd_stop_edit()
 	var s = _bd_by_id.get(id, null)
-	if s == null or bool(s.get("locked", false)):
+	if s == null or bool(s.get("locked", false)) or str(s["type"]) == "bookmark":
 		return
 	var type := str(s["type"])
 	if type in ["line", "draw"]:
@@ -4690,6 +4729,8 @@ func _bd_draw_shape(ci: CanvasItem, s: Dictionary) -> void:
 			_bd_draw_geo(ci, s)
 		"image":
 			_bd_draw_image(ci, s)
+		"bookmark":
+			_bd_draw_bookmark(ci, s)
 		"text":
 			if str(s["id"]) != _bd_edit_id:
 				var fs := _bd_fs(s)
@@ -5334,6 +5375,8 @@ func _bd_paste(at: Vector2) -> void:
 		var id := _bd_add_image(DisplayServer.clipboard_get_image(), at)
 		if id != "":
 			_bd_sel = [id]
+	elif _bd_is_url(txt.strip_edges()):
+		_bd_sel = [_bd_add_bookmark(txt.strip_edges(), at)]
 	elif txt.strip_edges() != "":
 		var s := _bd_new("text")
 		s["text"] = txt.strip_edges()
@@ -5691,8 +5734,10 @@ func _bd_command(c: Dictionary) -> String:
 	match op:
 		"add":
 			var kind := str(c.get("type", "note"))
-			if not (kind in BD_GEO or kind in ["note", "text", "todo", "frame", "arrow", "image"]):
+			if not (kind in BD_GEO or kind in ["note", "text", "todo", "frame", "arrow", "image", "bookmark"]):
 				return "unknown shape type: " + kind
+			if kind == "bookmark" and not _bd_is_url(str(c.get("url", ""))):
+				return "a bookmark needs an http(s) url"
 		"update":
 			if _bd_lookup(str(c.get("id", c.get("name", "")))) == "":
 				return "no such shape"
@@ -5753,7 +5798,7 @@ func _bd_norm_items(v) -> Array:
 func _bd_exec_add(c: Dictionary) -> void:
 	var kind := str(c.get("type", "note"))
 	var type := "geo" if kind in BD_GEO else kind
-	if not type in ["geo", "note", "text", "todo", "frame", "arrow", "image"]:
+	if not type in ["geo", "note", "text", "todo", "frame", "arrow", "image", "bookmark"]:
 		return
 	var s := _bd_new(type)
 	if type == "geo":
@@ -5807,6 +5852,9 @@ func _bd_exec_add(c: Dictionary) -> void:
 			s["src"] = src
 			var iw := float(c.get("w", minf(480.0, float(img.get_width()))))
 			_bd_set_rect(s, Rect2(at, Vector2(iw, iw * float(img.get_height()) / maxf(float(img.get_width()), 1.0))))
+		"bookmark":
+			s["url"] = str(c.get("url", ""))
+			_bd_set_rect(s, Rect2(at, Vector2(BD_BM_W, BD_BM_H)))   # _bd_add fits the height to what's known
 		_:
 			_bd_set_rect(s, Rect2(at, sz))
 	if c.has("rotation") and type != "arrow":
@@ -6636,6 +6684,303 @@ func _bd_insert_media() -> void:
 func _bd_media_chosen(ok: bool, paths: PackedStringArray, _filter: int) -> void:
 	if ok and not paths.is_empty():
 		_bd_place_files(paths, _cam.position)
+
+
+# --- board: link bookmarks -------------------------------------------------------------
+# Paste a URL (or an agent's add_link) and it lands as tldraw's bookmark card:
+# preview image, bold title, description, and a favicon + address row. The
+# metadata comes from mcp/cove_unfurl.py, run as its own process and polled.
+# It's cached per URL, so undo, copies and reloads draw at once, and written
+# into the shape, so agents reading the board see it. GitHub PRs and issues also
+# carry their state (a pill on the address row) and re-check it every few minutes.
+
+func _bd_is_url(t: String) -> bool:
+	if t.length() < 10 or t.contains(" ") or t.contains("\n") or t.contains("\t"):
+		return false
+	var lo := t.to_lower()
+	return lo.begins_with("https://") or lo.begins_with("http://")
+
+
+func _bd_add_bookmark(url: String, at: Vector2) -> String:
+	var s := _bd_new("bookmark")
+	s["url"] = url
+	_bd_set_rect(s, Rect2(at - Vector2(BD_BM_W, BD_BM_H) * 0.5, Vector2(BD_BM_W, BD_BM_H)))
+	_bd_add(s)
+	return str(s["id"])
+
+
+# Bring a bookmark up to date with what's known about its URL, and size it the
+# way tldraw does: full card with an image (or while loading), short with just a
+# title, a single row with nothing.
+func _bd_bm_apply(s: Dictionary) -> void:
+	var url := str(s.get("url", ""))
+	if url == "":
+		return
+	if _bd_unfurl.has(url):
+		var m: Dictionary = _bd_unfurl[url]
+		for k in BD_BM_FIELDS:
+			if m.has(k):
+				s[k] = m[k]
+			else:
+				s.erase(k)
+	elif s.has("fetched"):   # saved with the board: trust it, but re-check a PR's state
+		var m := {}
+		for k in BD_BM_FIELDS:
+			if s.has(k):
+				m[k] = s[k]
+		_bd_unfurl[url] = m
+		if s.has("github"):
+			_bd_unfurl_start(url)
+	else:
+		_bd_unfurl_start(url)
+	if not s.has("fetched") or str(s.get("image", "")) != "":
+		s["h"] = BD_BM_H
+	else:
+		s["h"] = BD_BM_SHORT if str(s.get("title", "")) != "" else BD_BM_JUST_URL
+
+
+func _bd_unfurl_start(url: String) -> void:
+	if _bd_unfurl_pending.has(url):
+		return
+	var dir := DIR + "/unfurl"
+	DirAccess.make_dir_recursive_absolute(dir)
+	var out := dir + "/%s.json" % url.md5_text()
+	if FileAccess.file_exists(out):
+		DirAccess.remove_absolute(out)
+	var script := ProjectSettings.globalize_path("res://mcp/cove_unfurl.py")
+	var assets := ProjectSettings.globalize_path(BD_ASSETS) + "/links"
+	if OS.create_process("/usr/bin/python3", [script, url, out, assets]) != -1:
+		_bd_unfurl_pending[url] = {"out": out, "t": Time.get_ticks_msec()}
+
+
+func _bd_unfurl_poll() -> void:
+	var now := Time.get_ticks_msec()
+	if now >= _bd_bm_next_refresh:
+		if _bd_bm_next_refresh != 0:
+			for s in _bd_shapes:
+				if str(s["type"]) == "bookmark" and s.has("github"):
+					_bd_unfurl_start(str(s["url"]))
+		_bd_bm_next_refresh = now + BD_BM_REFRESH_MS
+	for url in _bd_unfurl_pending.keys():
+		var p: Dictionary = _bd_unfurl_pending[url]
+		var res = null
+		if FileAccess.file_exists(p["out"]):
+			var f := FileAccess.open(p["out"], FileAccess.READ)
+			if f:
+				res = JSON.parse_string(f.get_as_text())
+				f.close()
+			DirAccess.remove_absolute(p["out"])
+		elif now - int(p["t"]) < 45000:
+			continue
+		_bd_unfurl_pending.erase(url)
+		var got: Dictionary = res if typeof(res) == TYPE_DICTIONARY else {}
+		var old: Dictionary = _bd_unfurl.get(url, {})
+		if not bool(got.get("ok", false)) and str(old.get("title", "")) != "":
+			continue   # a failed re-check keeps what the card shows
+		var m := {"fetched": int(got.get("fetched", Time.get_unix_time_from_system()))}
+		for k in BD_BM_FIELDS:
+			if got.has(k) and str(got[k]) != "":
+				m[k] = got[k]
+		for k in ["image", "favicon"]:   # GitHub rate-limits its preview images: keep the last one
+			if not m.has(k) and old.has(k):
+				m[k] = old[k]
+		if not m.has("site"):
+			m["site"] = url
+		_bd_unfurl[url] = m
+		for s in _bd_shapes:
+			if str(s["type"]) == "bookmark" and str(s.get("url", "")) == url:
+				_bd_bm_apply(s)
+		_bd_dirty = true
+		_bd_save_in = 0.4
+
+
+func _bd_bm_open(s: Dictionary) -> void:
+	var url := str(s.get("url", ""))
+	if _bd_is_url(url):
+		OS.shell_open(url)
+
+
+func _bd_bm_font(bold: bool) -> Font:
+	var key := "bm-bold" if bold else "bm"
+	if not _bd_fonts.has(key):
+		var f := SystemFont.new()
+		f.font_names = PackedStringArray(BD_FONT_NAMES["sans"])
+		f.font_weight = 700 if bold else 400
+		f.multichannel_signed_distance_field = true
+		_bd_fonts[key] = f
+	return _bd_fonts[key]
+
+
+func _bd_bm_style(kind: String) -> StyleBoxFlat:
+	if not _bd_bm_styles.has(kind):
+		var b := StyleBoxFlat.new()
+		b.anti_aliasing = true
+		match kind:
+			"card":   # .tl-bookmark__container + tldraw's rotated box shadow
+				b.set_corner_radius_all(6)
+				b.set_border_width_all(1)
+				b.shadow_size = 5
+				b.shadow_offset = Vector2(0, 2.5)
+			"copy":   # .tl-bookmark__copy_container: the card's rounded bottom
+				b.corner_radius_bottom_left = 5
+				b.corner_radius_bottom_right = 5
+			"pill":
+				b.set_corner_radius_all(9)
+		_bd_bm_styles[kind] = b
+	return _bd_bm_styles[kind]
+
+
+func _bd_bm_address(s: Dictionary) -> String:
+	var site := str(s.get("site", ""))
+	if site != "":
+		return site
+	var url := str(s.get("url", ""))
+	var host := url.get_slice("://", 1).get_slice("/", 0)
+	return host.trim_prefix("www.") if host != "" else url
+
+
+# The address row (favicon + address), in the card's own frame. Clicking it opens the link.
+func _bd_bm_link_rect(s: Dictionary) -> Rect2:
+	var r := _bd_rect(s)
+	var w := _bd_bm_font(false).get_string_size(_bd_bm_address(s), HORIZONTAL_ALIGNMENT_LEFT, -1, 12).x
+	return Rect2(r.position.x + 12.0, r.end.y - 12.0 - 18.0, minf(24.0 + w, r.size.x - 24.0), 18.0)
+
+
+func _bd_bm_para(text: String, font: Font, px: int, line_h: float, width: float, max_lines: int) -> TextParagraph:
+	var p := TextParagraph.new()
+	p.add_string(text, font, px)
+	p.width = width
+	p.max_lines_visible = max_lines
+	p.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	p.break_flags = TextServer.BREAK_MANDATORY | TextServer.BREAK_WORD_BOUND | TextServer.BREAK_ADAPTIVE
+	p.line_spacing = maxf(line_h - font.get_height(px), 0.0)
+	return p
+
+
+func _bd_bm_lines(p: TextParagraph, max_lines: int) -> int:
+	return mini(p.get_line_count(), max_lines)
+
+
+# A rect with its top corners rounded: the image well at the top of the card.
+func _bd_bm_round_top(rect: Rect2, rad: float) -> PackedVector2Array:
+	var pts := PackedVector2Array()
+	for i in 7:
+		var t := PI + PI * 0.5 * i / 6.0
+		pts.append(rect.position + Vector2(rad, rad) + Vector2(cos(t), sin(t)) * rad)
+	for i in 7:
+		var t := PI * 1.5 + PI * 0.5 * i / 6.0
+		pts.append(Vector2(rect.end.x - rad, rect.position.y + rad) + Vector2(cos(t), sin(t)) * rad)
+	pts.append(rect.end)
+	pts.append(Vector2(rect.position.x, rect.end.y))
+	return pts
+
+
+# tldraw's BookmarkShapeComponent, laid out as its CSS does: the image well
+# takes whatever the copy (12px padding, 16px bold title x2 lines, 12px
+# description x3 lines, 12px address row) leaves.
+func _bd_draw_bookmark(ci: CanvasItem, s: Dictionary) -> void:
+	var a := _bd_alpha
+	var rid := ci.get_canvas_item()
+	var r := _bd_rect(s)
+	var card := _bd_bm_style("card")
+	card.bg_color = Color(BD_BM_PANEL, a)
+	card.border_color = Color(BD_BM_EDGE, a)
+	card.shadow_color = Color(0, 0, 0, 0.32 * a)
+	card.draw(rid, r)
+	var pad := 12.0
+	var inner := r.size.x - pad * 2.0
+	var loaded := s.has("fetched")
+	var image := str(s.get("image", ""))
+	var show_image := not loaded or image != ""
+	var title := str(s.get("title", ""))
+	var desc := str(s.get("description", "")) if image != "" else ""
+	var bold := _bd_bm_font(true)
+	var font := _bd_bm_font(false)
+	var tp: TextParagraph = _bd_bm_para(title, bold, 16, 16.0 * 1.6, inner, 2) if title != "" else null
+	var dp: TextParagraph = _bd_bm_para(desc, font, 12, 12.0 * 1.5, inner, 3) if desc != "" else null
+	var title_h := _bd_bm_lines(tp, 2) * 16.0 * 1.6 + 4.0 if tp else 0.0
+	var desc_h := _bd_bm_lines(dp, 3) * 12.0 * 1.5 + 8.0 if dp else 0.0
+	var copy_h := pad + title_h + desc_h + (8.0 if tp or dp else 0.0) + 18.0 + pad
+	var copy := r
+	if show_image:
+		var well := Rect2(r.position + Vector2(1, 1), Vector2(r.size.x - 2.0, maxf(r.size.y - copy_h - 1.0, 0.0)))
+		var poly := _bd_bm_round_top(well, 4.0)
+		var tex = _bd_texture(image) if image != "" else null
+		if tex != null:   # object-fit: cover
+			var ts: Vector2 = tex.get_size()
+			var k := maxf(well.size.x / ts.x, well.size.y / ts.y)
+			var src := Rect2((ts - well.size / k) * 0.5, well.size / k)
+			var uvs := PackedVector2Array()
+			for pt in poly:
+				uvs.append((src.position + (pt - well.position) / k) / ts)
+			ci.draw_colored_polygon(poly, Color(1, 1, 1, a), uvs, tex)
+		else:
+			ci.draw_colored_polygon(poly, Color(BD_BM_MUTED2, BD_BM_MUTED2.a * a))   # .tl-bookmark__placeholder
+		var outline := poly.duplicate()
+		outline.append(poly[0])
+		ci.draw_polyline(outline, Color(BD_BM_DIVIDER, a), 1.0, true)
+		copy = Rect2(r.position.x, well.end.y, r.size.x, r.end.y - well.end.y)
+	var cb := _bd_bm_style("copy")
+	cb.bg_color = Color(BD_BM_MUTED0, BD_BM_MUTED0.a * a)
+	cb.draw(rid, copy.grow_individual(-1, 0, -1, -1))
+	# Title and description from the top of the copy, the address row at its bottom.
+	var y := copy.position.y + pad
+	if tp:
+		tp.draw(rid, Vector2(r.position.x + pad, y + tp.line_spacing * 0.5), Color(BD_BM_TEXT, a))
+		y += title_h
+	if dp:
+		dp.draw(rid, Vector2(r.position.x + pad, y + 4.0 + dp.line_spacing * 0.5), Color(BD_BM_TEXT2, a))
+	_bd_bm_draw_address(ci, s, Rect2(r.position.x + pad, r.end.y - pad - 18.0, inner, 18.0))
+
+
+# Favicon (or tldraw's link glyph) + address; GitHub PRs/issues add their
+# +/- lines and a state pill at the right.
+func _bd_bm_draw_address(ci: CanvasItem, s: Dictionary, row: Rect2) -> void:
+	var a := _bd_alpha
+	var rid := ci.get_canvas_item()
+	var font := _bd_bm_font(false)
+	var bold := _bd_bm_font(true)
+	var right := row.end.x
+	var gh = s.get("github", null)
+	if typeof(gh) == TYPE_DICTIONARY and BD_GH_STATES.has(str(gh.get("state", ""))):
+		var st: Array = BD_GH_STATES[str(gh["state"])]
+		var label: String = st[0]
+		var lw := bold.get_string_size(label, HORIZONTAL_ALIGNMENT_LEFT, -1, 11).x
+		var pr := Rect2(right - lw - 14.0, row.get_center().y - 9.0, lw + 14.0, 18.0)
+		var pill := _bd_bm_style("pill")
+		pill.bg_color = Color(st[1], a)
+		pill.draw(rid, pr)
+		ci.draw_string(bold, Vector2(pr.position.x + 7.0, pr.get_center().y + bold.get_ascent(11) * 0.5 - 1.0), label,
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color(1, 1, 1, a))
+		right = pr.position.x - 8.0
+		if gh.get("additions", null) != null and gh.get("deletions", null) != null:
+			var base := row.get_center().y + font.get_ascent(11) * 0.5 - 1.0
+			var dels := "−%d" % int(gh["deletions"])
+			var dw := font.get_string_size(dels, HORIZONTAL_ALIGNMENT_LEFT, -1, 11).x
+			ci.draw_string(font, Vector2(right - dw, base), dels, HORIZONTAL_ALIGNMENT_LEFT, -1, 11,
+				Color(0.973, 0.318, 0.286, a))
+			var adds := "+%d" % int(gh["additions"])
+			var aw := font.get_string_size(adds, HORIZONTAL_ALIGNMENT_LEFT, -1, 11).x
+			ci.draw_string(font, Vector2(right - dw - 5.0 - aw, base), adds, HORIZONTAL_ALIGNMENT_LEFT, -1, 11,
+				Color(0.247, 0.725, 0.314, a))
+			right -= dw + aw + 13.0
+	var icon := Rect2(row.position.x, row.get_center().y - 8.0, 16, 16)
+	var fav = _bd_texture(str(s.get("favicon", "")))
+	if fav != null:
+		ci.draw_texture_rect(fav, icon, false, Color(1, 1, 1, a))
+	else:   # tldraw's LINK_ICON (a 30x30 path), stroked
+		var k := 16.0 / 30.0
+		var col := Color(BD_BM_TEXT2, a)
+		for path in [[13, 5, 7, 5, 5, 7, 5, 23, 7, 25, 23, 25, 25, 23, 25, 17], [19, 5, 25, 5, 25, 11], [25, 5, 13, 17]]:
+			var pts := PackedVector2Array()
+			for i in range(0, path.size(), 2):
+				pts.append(icon.position + Vector2(path[i], path[i + 1]) * k)
+			ci.draw_polyline(pts, col, 1.2, true)
+	var line := TextLine.new()
+	line.add_string(_bd_bm_address(s), font, 12)
+	line.width = maxf(right - (row.position.x + 24.0), 10.0)
+	line.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	line.draw(rid, Vector2(row.position.x + 24.0, row.get_center().y - line.get_size().y * 0.5), Color(BD_BM_TEXT2, a))
 
 
 # --- board: tldraw's look (hand-drawn strokes, pattern fill, tapered ink) ------------
