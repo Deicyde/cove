@@ -153,6 +153,12 @@ var _preview_return_cam := Vector2.ZERO  # camera to restore if the search is es
 var _cam_return := false       # true while swooping the camera back after an Esc
 var _preview_return_zoom := 0.0 # camera zoom to restore if the search is escaped
 var _zoom_goal := 0.0          # zoom to ease toward outside present mode (0 = none)
+var _fly_id := -1              # termling the camera is flying onto (pan + zoom as one), or -1
+var _fly_t := 0.0              # 0->1 progress of that flight
+var _fly_z0 := 1.0             # zoom at take-off
+var _fly_z1 := 1.0             # zoom on landing
+var _fly_off := Vector2.ZERO   # target's on-screen offset from centre at take-off
+const FLY_TIME := 0.45         # seconds per camera flight
 const SEARCH_HINT := "↵ jump  ·  ⇥ ✨ ask AI  ·  esc"
 const SEARCH_DIM := 0.2       # alpha for termlings occluding the previewed one
 
@@ -174,6 +180,18 @@ var _radial_dots: Array = []   # [screen point, keyed?] true-bearing ticks drawn
 const RADIAL_HINT := "hjkl / arrows hop  ·  ⇥ next nearest  ·  ↵ or click jump  ·  esc back"
 const RADIAL_DIRS := {"h": Vector2.LEFT, "j": Vector2.DOWN, "k": Vector2.UP, "l": Vector2.RIGHT}
 const RADIAL_ARROWS := {"h": "◂", "j": "▾", "k": "▴", "l": "▸"}
+
+# avy jump (Cmd+;): big letter labels on every visible termling; type one to jump
+var _avy_open := false
+var _avy_layer: Control
+var _avy_hint: Label
+var _avy_labels := {}          # label string -> term id
+var _avy_nodes := {}           # term id -> Label drawn over it
+var _avy_prefix := ""          # keys typed so far (two-letter labels only)
+var _avy_cam := Vector2.ZERO   # camera goal while the labels are up
+var _avy_zoom := 1.0           # zoom goal while the labels are up
+const AVY_KEYS := "asdfghjklqwertyuiopzxcvbnm"   # home row first, like avy
+const AVY_NEAR := 6            # zoom out (if needed) until this many nearby termlings fit
 
 # proof mode
 var _shot_path := ""
@@ -282,6 +300,10 @@ func _process(delta: float) -> void:
 	# Track the terminal's centre, not the group's ground point (well below it).
 	if _previewing():
 		_cam.position = _cam.position.lerp(_groups[_preview_id].terminal.global_position, 8.0 * delta)
+	elif _avy_open:
+		_cam.position = _cam.position.lerp(_avy_cam, 8.0 * delta)
+	elif _fly_id != -1:
+		_fly_step(delta)   # owns pan *and* zoom until it lands; then tracking takes over
 	elif _present_id != -1 and _groups.has(_present_id):
 		_present_lock = minf(_present_lock + 3.0 * delta, 1.0)
 		_snap_present_cam.call_deferred(delta)   # after this frame's bob is applied
@@ -301,6 +323,8 @@ func _process(delta: float) -> void:
 		# The radial jump always fits smaller, so its ring has room around the termling.
 		var fit := _fit_zoom_for(_groups[_preview_id], RADIAL_FILL if _radial_open else VIEW_FILL)
 		_ease_zoom(fit if _present_id != -1 or _radial_open else minf(_preview_return_zoom, fit), delta)
+	elif _avy_open:
+		_ease_zoom(_avy_zoom, delta)
 	elif _present_id != -1:
 		if _groups.has(_present_id):
 			_present_zoom = _fit_zoom_for(_groups[_present_id])
@@ -322,6 +346,8 @@ func _process(delta: float) -> void:
 	_update_occluder_fade(delta)
 	if _radial_open:
 		_radial_layout()   # markers ride the camera as the preview swoops
+	if _avy_open:
+		_avy_layout()      # labels ride the camera as it zooms out
 	_frames += 1
 	if _shot_path != "" and _frames == 320:
 		var img := get_viewport().get_texture().get_image()
@@ -680,7 +706,7 @@ func _set_focus(id: int) -> void:
 	if id == -1 and prev != -1:
 		var nxt: int = _attention.on_leave()
 		if nxt != -1 and _groups.has(nxt):
-			call_deferred("_jump_focus", nxt, false)
+			call_deferred("_attend", nxt)
 
 
 func _group_at(world_pos: Vector2) -> Node2D:
@@ -758,6 +784,11 @@ func _input(event: InputEvent) -> void:
 		_radial_key(event)
 		get_viewport().set_input_as_handled()
 		return
+	# Likewise the avy jump: every key is a label letter (or Esc / Backspace).
+	if _avy_open and _bd_edit_id == "":
+		_avy_key(event)
+		get_viewport().set_input_as_handled()
+		return
 	# While the rename dialog is open, Esc cancels it and other keys go to it.
 	if _rename_id != -1:
 		if event.keycode == KEY_ESCAPE:
@@ -823,6 +854,11 @@ func _input(event: InputEvent) -> void:
 		_open_radial()
 		get_viewport().set_input_as_handled()
 		return
+	# Cmd+; opens the avy jump (like avy's C-;): type a termling's label to go there.
+	if event.keycode == KEY_SEMICOLON and event.meta_pressed and not event.ctrl_pressed:
+		_open_avy()
+		get_viewport().set_input_as_handled()
+		return
 	if event.keycode == KEY_N and (event.meta_pressed or event.ctrl_pressed):
 		_spawn_follow = true   # the next fresh termling is framed by the camera + followed
 		_spawn_terminal()
@@ -877,6 +913,8 @@ func _unhandled_input(event: InputEvent) -> void:
 		# A click out in the world (not on a marker) takes over from the radial jump.
 		if _radial_open and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
 			_close_radial(false)
+		if _avy_open and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
+			_close_avy(false)
 		if event.pressed:
 			_cycle_active = false   # any click ends a focus-cycle run
 		var wpos := _world_mouse()
@@ -1049,6 +1087,7 @@ func _zoom_by(factor: float) -> void:
 	_present_id = -1
 	_present_leaving = false
 	_zoom_goal = 0.0
+	_fly_id = -1   # a manual zoom cancels any camera flight
 	var before := _cam.get_global_mouse_position()
 	var z := clampf(_cam.zoom.x * factor, MIN_ZOOM, MAX_ZOOM)
 	_cam.zoom = Vector2(z, z)
@@ -1232,7 +1271,7 @@ func _toggle_present(g: Node2D) -> void:
 # In present mode the new one is presented instead, otherwise the present-mode
 # camera glue would keep holding the old one. Outside it the camera tracks the
 # new one and zooms out if it wouldn't fit the window.
-func _jump_focus(id: int, track := true) -> void:
+func _jump_focus(id: int, track := true, zoom := 0.0) -> void:
 	if not _groups.has(id):
 		return
 	if _present_id != -1:
@@ -1242,9 +1281,46 @@ func _jump_focus(id: int, track := true) -> void:
 	_set_focus(id)
 	if track:
 		_tracking_id = id
-	else:
-		_pan_once = id
-	_zoom_goal = minf(_cam.zoom.x, _fit_zoom_for(_groups[id]))
+	# Fly there, zooming out if it wouldn't fit (or to the caller's zoom).
+	_fly_to(id, zoom if zoom > 0.0 else minf(_cam.zoom.x, _fit_zoom_for(_groups[id])))
+
+
+# Glide the camera onto id while easing the zoom to z, as one motion. The
+# target's on-screen offset from centre shrinks steadily as the zoom changes, so
+# it slides straight in rather than the view zooming about the old centre first.
+func _fly_to(id: int, z: float) -> void:
+	_fly_id = id
+	_fly_t = 0.0
+	_fly_z0 = _cam.zoom.x
+	_fly_z1 = z
+	_fly_off = (_groups[id].terminal.global_position - _cam.position) * _fly_z0
+	_zoom_goal = 0.0
+	_present_leaving = false
+	_cam_return = false
+
+
+func _fly_step(delta: float) -> void:
+	if not _groups.has(_fly_id) or _panning:
+		_fly_id = -1   # target gone, or the user grabbed the camera
+		return
+	_fly_t = minf(_fly_t + delta / FLY_TIME, 1.0)
+	var e := _fly_t * _fly_t * (3.0 - 2.0 * _fly_t)   # smoothstep
+	var z := _fly_z0 * pow(_fly_z1 / _fly_z0, e)      # geometric, so zoom speed feels even
+	_cam.zoom = Vector2(z, z)
+	_cam.position = _groups[_fly_id].terminal.global_position - _fly_off * (1.0 - e) / z
+	if _fly_t >= 1.0:
+		_fly_id = -1
+
+
+# A "needs you" jump: focus it, pan over, and zoom in (or out) until it fills
+# ATTEND_FILL of the window, so it's readable the moment focus lands.
+const ATTEND_FILL := 0.8
+func _attend(id: int) -> void:
+	if not _groups.has(id):
+		return
+	_jump_focus(id, false)
+	if _present_id == -1:
+		_zoom_goal = clampf(_fit_zoom_for(_groups[id], ATTEND_FILL), MIN_ZOOM, MAX_ZOOM)
 
 
 func _ease_zoom(goal: float, delta: float) -> void:
@@ -1698,7 +1774,7 @@ func _apply_agent_state() -> void:
 				_kitty_attn[id] = true
 				var now: int = _attention.ping(id, _attention_focus())
 				if now != -1:
-					_jump_focus.call_deferred(now, false)
+					_attend.call_deferred(now)
 		else:
 			_kitty_attn.erase(id)
 		g.set_attention(_attn_ids.has(id))
@@ -2087,7 +2163,7 @@ func _pump_notify() -> void:
 			_notes.resize(8)
 		var now: int = _attention.ping(g.term_id, _attention_focus())
 		if now != -1:
-			_jump_focus(now, false)
+			_attend(now)
 	if got:
 		_update_panel()
 
@@ -2139,7 +2215,7 @@ func _build_ui() -> void:
 	panel.add_child(_panel_vbox)
 
 	var title := Label.new()
-	title.text = "⚓ crew wants you"
+	title.text = "🔔 notifications"
 	title.add_theme_font_size_override("font_size", 15)
 	title.add_theme_color_override("font_color", Color(0.9, 0.8, 0.55))
 	_panel_vbox.add_child(title)
@@ -2148,6 +2224,7 @@ func _build_ui() -> void:
 	_bd_build_ui()
 	_build_search_dialog()
 	_build_radial()
+	_build_avy()
 	_scale_ui_layers()
 
 
@@ -2877,6 +2954,183 @@ func _radial_draw() -> void:
 			Color(0.55, 0.95, 0.75, 0.95) if lit else Color(0.8, 0.8, 0.85, 0.6))
 
 
+# --- avy jump ---------------------------------------------------------------
+# Cmd+; zooms out (never in) just far enough to take in the termlings nearest
+# the view, then drops a big letter label on every visible termling, nearest
+# first on the home row. Type a label to jump there (focus + track, easing back
+# to the zoom you started at); past 26 termlings labels are two letters and the
+# first one narrows. Backspace un-types, Esc swoops back, a click abandons it.
+
+func _build_avy() -> void:
+	var layer := CanvasLayer.new()
+	layer.layer = 6
+	add_child(layer)
+	_avy_layer = Control.new()
+	_avy_layer.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_avy_layer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_avy_layer.visible = false
+	layer.add_child(_avy_layer)
+	_avy_hint = Label.new()
+	_avy_hint.text = "type a label to jump  ·  ⌫ back  ·  esc"
+	_avy_hint.add_theme_font_size_override("font_size", RADIAL_FONT - 8)
+	_avy_hint.add_theme_color_override("font_color", Color(0.75, 0.77, 0.8))
+	_avy_hint.add_theme_stylebox_override("normal", _radial_box(Color(0.98, 0.84, 0.35, 0.6)))
+	_avy_hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_avy_layer.add_child(_avy_hint)
+
+
+func _open_avy() -> void:
+	if _avy_layer == null or _groups.is_empty():
+		return
+	_begin_preview()   # so Esc can put the view back
+	var vp := get_viewport().get_visible_rect().size
+	var ids: Array = _groups.keys()
+	var here := _cam.position
+	ids.sort_custom(func(a, b):
+		return _groups[a].terminal.global_position.distance_squared_to(here) \
+			< _groups[b].terminal.global_position.distance_squared_to(here))
+	# Zoom out only if the few nearest termlings don't already fit, then frame them.
+	var box := _term_rect(_groups[ids[0]])
+	for i in mini(AVY_NEAR, ids.size()):
+		box = box.merge(_term_rect(_groups[ids[i]]))
+	box = box.grow(60.0)
+	var fit := clampf(minf(vp.x / box.size.x, vp.y / box.size.y), MIN_ZOOM, MAX_ZOOM)
+	_avy_zoom = _cam.zoom.x
+	_avy_cam = _cam.position
+	if fit < _cam.zoom.x:
+		_avy_zoom = fit
+		_avy_cam = box.get_center()
+	# Label everything that will be on screen once the camera settles, nearest first.
+	var view := Rect2(_avy_cam - vp * 0.5 / _avy_zoom, vp / _avy_zoom)
+	var vis := []
+	for id in ids:
+		if view.intersects(_term_rect(_groups[id])):
+			vis.append(id)
+	if vis.is_empty():
+		_end_preview(false)
+		return
+	var labels := _avy_make_labels(vis.size())
+	_avy_labels = {}
+	_avy_nodes = {}
+	for i in vis.size():
+		_avy_labels[labels[i]] = vis[i]
+		_avy_nodes[vis[i]] = _avy_label_node(labels[i])
+	_avy_prefix = ""
+	_avy_open = true
+	_avy_layer.visible = true
+	_avy_hint.reset_size()
+	_avy_layout()
+
+
+# n prefix-free labels: single keys while they last, else all two-key pairs.
+func _avy_make_labels(n: int) -> Array:
+	var out := []
+	if n <= AVY_KEYS.length():
+		for i in n:
+			out.append(AVY_KEYS[i])
+		return out
+	for a in AVY_KEYS:
+		for b in AVY_KEYS:
+			if out.size() == n:
+				return out
+			out.append(a + b)
+	return out
+
+
+# A label sized off the window height, so it reads at any resolution or zoom.
+func _avy_label_node(text: String) -> Label:
+	var px := int(clampf(_avy_layer.size.y * 0.07, 32.0, 140.0))   # overlay units, not raw pixels
+	var l := Label.new()
+	l.text = text
+	l.add_theme_font_size_override("font_size", px)
+	l.add_theme_color_override("font_color", Color(0.12, 0.10, 0.09))
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.98, 0.84, 0.35, 0.95)
+	sb.border_color = Color(0.12, 0.10, 0.09, 0.9)
+	sb.set_border_width_all(3)
+	sb.set_corner_radius_all(int(px * 0.2))
+	sb.content_margin_left = px * 0.3
+	sb.content_margin_right = px * 0.3
+	sb.content_margin_top = px * 0.04
+	sb.content_margin_bottom = px * 0.08
+	l.add_theme_stylebox_override("normal", sb)
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_avy_layer.add_child(l)
+	l.reset_size()
+	return l
+
+
+# The overlay lives under a UI root scaled for Retina (_scale_ui_layers), so map
+# world -> window pixels (camera) -> the overlay's own units (its inverse transform).
+func _avy_layout() -> void:
+	var vp := _avy_layer.size
+	_avy_hint.position = Vector2((vp.x - _avy_hint.size.x) * 0.5, vp.y - _avy_hint.size.y - 18)
+	var xf := _avy_layer.get_global_transform_with_canvas().affine_inverse() \
+		* get_viewport().get_canvas_transform()
+	for id in _avy_nodes:
+		if not _groups.has(id):
+			continue
+		var l: Label = _avy_nodes[id]
+		var p: Vector2 = xf * _groups[id].terminal.global_position
+		l.position = (p - l.size * 0.5).clamp(Vector2(8, 8), vp - l.size - Vector2(8, 8))
+
+
+func _avy_key(ev: InputEventKey) -> void:
+	var k := ev.keycode
+	if k == KEY_ESCAPE or (k == KEY_SEMICOLON and ev.meta_pressed):
+		_close_avy(true)
+		return
+	if k == KEY_BACKSPACE:
+		_avy_prefix = _avy_prefix.left(-1)
+		_avy_refresh()
+		return
+	if ev.meta_pressed or ev.ctrl_pressed or ev.unicode == 0:
+		return
+	var typed := _avy_prefix + String.chr(ev.unicode).to_lower()
+	if _avy_labels.has(typed):
+		_avy_commit(_avy_labels[typed])
+		return
+	for lab in _avy_labels:
+		if lab.begins_with(typed):
+			_avy_prefix = typed
+			_avy_refresh()
+			return
+	# no label starts that way: ignore the key
+
+
+# Show only the labels still reachable from what's been typed, minus that prefix.
+func _avy_refresh() -> void:
+	for lab in _avy_labels:
+		var id: int = _avy_labels[lab]
+		if not _avy_nodes.has(id):
+			continue
+		var l: Label = _avy_nodes[id]
+		l.visible = lab.begins_with(_avy_prefix)
+		l.text = lab.substr(_avy_prefix.length())
+		l.reset_size()
+
+
+func _avy_commit(id: int) -> void:
+	_close_avy(false)
+	if not _groups.has(id):
+		return
+	# Land zoomed to fit the chosen termling, in or out, whatever zoom you started at.
+	_jump_focus(id, true, _fit_zoom_for(_groups[id]))
+
+
+func _close_avy(restore_view: bool) -> void:
+	if not _avy_open:
+		return
+	_end_preview(restore_view)
+	_avy_open = false
+	_avy_layer.visible = false
+	for id in _avy_nodes:
+		_avy_nodes[id].queue_free()
+	_avy_nodes = {}
+	_avy_labels = {}
+	_avy_prefix = ""
+
+
 func _update_panel() -> void:
 	if _panel_vbox == null:
 		return
@@ -2887,7 +3141,7 @@ func _update_panel() -> void:
 		c.queue_free()
 	if _notes.is_empty():
 		var empty := Label.new()
-		empty.text = "all quiet…"
+		empty.text = "no notifications"
 		empty.add_theme_font_size_override("font_size", 12)
 		empty.add_theme_color_override("font_color", Color(0.6, 0.62, 0.66))
 		_panel_vbox.add_child(empty)
@@ -2900,7 +3154,7 @@ func _update_panel() -> void:
 			who = "termling %d" % tid
 			if _groups.has(tid) and _groups[tid].terminal.custom_name != "":
 				who = _groups[tid].terminal.custom_name
-		row.text = "• %s — needs you" % who
+		row.text = "• %s" % who
 		row.add_theme_font_size_override("font_size", 13)
 		row.add_theme_color_override("font_color", Color(0.92, 0.9, 0.85))
 		_panel_vbox.add_child(row)
@@ -3057,6 +3311,7 @@ var _bd_rot_center := Vector2.ZERO
 var _bd_rot_start := 0.0
 var _bd_tex := {}               # image src -> Texture2D (null if it failed to load)
 var _bd_last_input_ms := 0      # last board click/key, for _bd_owns_keyboard
+var _bd_left_focus := false     # this board press is the click that unfocused a termling
 # Redraw on change, not every frame (see _bd_tick).
 var _bd_live_layer: Node2D      # arrows tied to termlings, which move on their own
 var _bd_dirty := true
@@ -3120,7 +3375,7 @@ func _bd_tick(delta: float) -> void:
 		if _focused_id == -1 and not _bd_owns_keyboard():
 			var nxt: int = _attention.on_leave()
 			if nxt != -1 and _groups.has(nxt):
-				_jump_focus(nxt, false)
+				_attend(nxt)
 	# Redraw only what changed. Redrawing every shape every frame (at up to 144
 	# fps) was the Cove's biggest main-thread cost. The shapes redraw when they
 	# change, while a drag/edit is shaping them, or when the zoom (frame titles)
@@ -3647,6 +3902,7 @@ func _bd_wants_press(p: Vector2, over_termling: bool) -> bool:
 func _bd_pointer_down(p: Vector2, ev: InputEventMouseButton) -> void:
 	_bd_cam_goal = null
 	_bd_last_input_ms = Time.get_ticks_msec()
+	_bd_left_focus = _focused_id != -1
 	_bd_unfocus_termling()   # the keyboard now drives the board
 	_bd_down = p
 	_bd_down_screen = ev.position
@@ -3811,6 +4067,11 @@ func _bd_pointer_up(p: Vector2, _ev: InputEventMouseButton) -> void:
 	_bd_g = ""
 	_bd_bind_hint = ""
 	_bd_guides = []
+	# A plain click on empty ground is how you leave a termling: whoever's
+	# waiting for you comes next. (Checked after this click's selection settles.)
+	if _bd_left_focus and not _bd_moved and _bd_tool == "select":
+		_bd_attend_next.call_deferred()
+	_bd_left_focus = false
 	match g:
 		"pending":   # a click on a shape without dragging
 			if _bd_shift and _bd_press_id != "" and _bd_sel.has(_bd_press_id):
@@ -4874,8 +5135,20 @@ func _bd_unfocus_termling() -> void:
 
 
 func _bd_owns_keyboard() -> bool:
-	return _bd_edit_id != "" or _bd_g != "" or _bd_tool != "select" \
-		or Time.get_ticks_msec() - _bd_last_input_ms < 10000
+	# (_bd_g only counts while the button is held, so a gesture whose release
+	# never arrived can't block the attention queue forever)
+	return _bd_edit_id != "" or _bd_tool != "select" \
+		or (_bd_g != "" and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)) \
+		or Time.get_ticks_msec() - _bd_last_input_ms < 4000
+
+
+# The unfocusing click landed on nothing: jump to the head of the "needs you" queue.
+func _bd_attend_next() -> void:
+	if _focused_id != -1 or not _bd_sel.is_empty() or _bd_edit_id != "":
+		return
+	var nxt: int = _attention.on_leave()
+	if nxt != -1 and _groups.has(nxt):
+		_attend(nxt)
 
 
 func _bd_camera_changed() -> void:
