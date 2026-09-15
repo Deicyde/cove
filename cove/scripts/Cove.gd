@@ -161,6 +161,8 @@ var _fly_z0 := 1.0             # zoom at take-off
 var _fly_z1 := 1.0             # zoom on landing
 var _fly_off := Vector2.ZERO   # target's on-screen offset from centre at take-off
 const FLY_TIME := 0.45         # seconds per camera flight
+var _track_lock := 0.0         # 0->1 ramp from easing onto the tracked termling to gluing to it
+var _track_of := -1            # which termling that ramp belongs to
 const SEARCH_HINT := "↵ jump  ·  ⇥ ✨ ask AI  ·  esc"
 const SEARCH_DIM := 0.2       # alpha for termlings occluding the previewed one
 
@@ -306,7 +308,9 @@ func _process(delta: float) -> void:
 	# otherwise it follows the tracked terminal (double-click / committed jump).
 	# Track the terminal's centre, not the group's ground point (well below it).
 	if _fly_id != -1:
-		_fly_step(delta)   # owns pan *and* zoom until it lands; then tracking (or the preview) takes over
+		# Deferred (like present mode): after this frame's bob, so a termling we're
+		# flying onto holds still instead of juddering against a camera a frame behind.
+		_fly_step.call_deferred(delta)   # owns pan *and* zoom until it lands; then tracking (or the preview) takes over
 	elif _previewing():
 		_cam.position = _cam.position.lerp(_groups[_preview_id].terminal.global_position, 8.0 * delta)
 	elif _avy_open:
@@ -317,7 +321,11 @@ func _process(delta: float) -> void:
 	elif _tracking_id != -1 and _groups.has(_tracking_id) \
 			and not (_moving and _press_group != null and _press_group.term_id == _tracking_id):
 		# (paused while dragging it: a chasing camera drags the cursor's world point along)
-		_cam.position = _cam.position.lerp(_groups[_tracking_id].terminal.global_position, 6.0 * delta)
+		if _track_of != _tracking_id:
+			_track_of = _tracking_id   # a fresh target eases in rather than snapping
+			_track_lock = 0.0
+		_track_lock = minf(_track_lock + 3.0 * delta, 1.0)
+		_snap_track_cam.call_deferred(delta)   # after this frame's bob is applied
 	elif _cam_return:
 		_cam.position = _cam.position.lerp(_preview_return_cam, 8.0 * delta)
 		if _cam.position.distance_to(_preview_return_cam) < 2.0:
@@ -1392,6 +1400,10 @@ func _fly_step(delta: float) -> void:
 	if _fly_t >= 1.0:
 		_cam.zoom = Vector2(_fly_z1, _fly_z1)
 		_cam.position = goal
+		# Landed centred, so hand over to tracking already glued: easing in from here
+		# would let the termling bob against the camera at close zoom.
+		_track_of = _fly_id
+		_track_lock = 1.0
 		_fly_id = -1
 	elif _fly_S > 0.0:
 		# van Wijk & Nuij: visible width w(s) and distance travelled u(s) along the path
@@ -1440,6 +1452,15 @@ func _leave_present() -> void:
 # transform, so the presented termling holds still on screen instead of bobbing
 # against a camera that trails it by a frame. _present_lock ramps 0->1 so entering
 # present mode still swoops in rather than jumping.
+# Tracking's camera follow. Deferred for the same reason as present mode's, and
+# _track_lock ramps 0->1 so it still eases onto a new target before gluing.
+func _snap_track_cam(delta: float) -> void:
+	if _tracking_id == -1 or not _groups.has(_tracking_id):
+		return
+	var target: Vector2 = _groups[_tracking_id].terminal.global_position
+	_cam.position = _cam.position.lerp(target, maxf(_track_lock, 6.0 * delta))
+
+
 func _snap_present_cam(delta: float) -> void:
 	if _present_id == -1 or not _groups.has(_present_id):
 		return
