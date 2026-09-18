@@ -8,3 +8,4 @@ gdext/godot-cpp/
 *.log
 gdext/.sconsign.dblite
 gdext/*.dblite
+bin/

@@ -20,7 +20,8 @@ KITTY="$REPO/kitty/launcher/kitty"
 KITTEN="${COVE_KITTEN:-$REPO/kitty/launcher/kitty.app/Contents/MacOS/kitten}"
 WRAPPER="$REPO/cove/cove-shell.sh"
 SOCK="${COVE_KITTY_SOCKET:-unix:/tmp/cove-kitty}"
-ABDUCO="$(command -v abduco 2>/dev/null || echo /opt/homebrew/bin/abduco)"
+ABDUCO="$REPO/cove/bin/abduco"   # patched: no alt screen (build-abduco.sh)
+[ -x "$ABDUCO" ] || ABDUCO="$(command -v abduco 2>/dev/null || echo /opt/homebrew/bin/abduco)"
 
 [ -e "$KITTY" ] || { echo "kitty not built ($KITTY). Run cove/dev.sh first." >&2; exit 1; }
 

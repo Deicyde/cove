@@ -1580,7 +1580,9 @@ func _load_layout() -> void:
 		if id == -1:
 			continue
 		pos[id] = t.get("pos", [0, 0])
-		if str(t.get("name", "")) != "":
+		# Names with a session are restored by session (_learn_session), never by
+		# id: ids are reissued when kitty restarts.
+		if str(t.get("name", "")) != "" and str(t.get("session", "")) == "":
 			_names[id] = str(t["name"])
 		if t.get("following", null) != null:
 			follows[id] = int(t["following"])
@@ -1963,7 +1965,10 @@ func _learn_session(id: int, g: Node2D, session: String) -> void:
 	if _pos_by_session.has(session):
 		var p = _pos_by_session[session]
 		g.position = Vector2(p[0], p[1])
-	if _name_by_session.has(session) and g.terminal.custom_name == "":
+	# The session name beats whatever the id-keyed restore applied: after a kitty
+	# restart the ids are fresh, so an id-keyed name belongs to some other termling.
+	if _name_by_session.has(session):
+		_names[id] = _name_by_session[session]
 		g.terminal.set_custom_name(_name_by_session[session])
 
 

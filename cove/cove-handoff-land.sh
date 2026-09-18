@@ -17,7 +17,8 @@ AGENT="${1:-shell}"
 SID="${2:-}"
 
 sess="cove-$$"
-ABDUCO="$(command -v abduco 2>/dev/null || echo /opt/homebrew/bin/abduco)"
+ABDUCO="$(dirname "$0")/bin/abduco"   # patched: no alt screen (build-abduco.sh)
+[ -x "$ABDUCO" ] || ABDUCO="$(command -v abduco 2>/dev/null || echo /opt/homebrew/bin/abduco)"
 SH="${SHELL:-/bin/zsh}"
 
 if [ "$AGENT" = "claude" ] && [ -n "$SID" ] && command -v claude >/dev/null 2>&1; then
