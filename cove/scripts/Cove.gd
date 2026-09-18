@@ -104,6 +104,8 @@ var _ls_thread: Thread
 var _ls_mutex: Mutex
 var _ls_data := {}            # pane_id -> {agent, busy, attention, cwd}
 var _ls_run := true
+var _child_mutex := Mutex.new()
+var _child_pids: Array[int] = []
 var _state_accum := 0.0
 var _cmd_accum := 0.0
 var _follows := {}           # follower term_id -> target term_id
@@ -282,6 +284,7 @@ func _process(delta: float) -> void:
 	_rescan_accum += delta
 	if _rescan_accum > 0.4:
 		_rescan_accum = 0.0
+		_reap_children()
 		_reconcile()
 		_apply_zones()
 	if _sock != null and not _sock.call("is_connected") and _input_tries < 100:
@@ -609,7 +612,7 @@ func _land_handoff(drop: Dictionary) -> void:
 	if name != "":
 		args.append_array(["--title", name])
 	args.append_array([land, agent, sid])
-	OS.create_process(kitten_exe, args, false)
+	_create_process(kitten_exe, args, false)
 	print("cove: landed %s termling (sid=%s) in %s" % [agent, sid if sid != "" else "-", cwd])
 
 
@@ -640,7 +643,7 @@ func _detach_inflight(ended: Dictionary) -> void:
 	if nm != "" and kitten_exe != "" and _groups.has(id):
 		var pane: int = _groups[id].terminal.pane_id
 		if pane != 0:
-			OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "set-window-title",
+			_create_process(kitten_exe, ["@", "--to", kitty_socket, "set-window-title",
 				"--match", "id:%d" % pane, nm], false)
 	print("cove: termling %d left the cove for the desktop" % id)
 
@@ -691,11 +694,11 @@ func _close_origin(id: int) -> void:
 	if kitten_exe != "" and _groups.has(id):
 		var pane: int = _groups[id].terminal.pane_id
 		if pane != 0:
-			OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "close-window",
+			_create_process(kitten_exe, ["@", "--to", kitty_socket, "close-window",
 				"--match", "id:%d" % pane], false)
 	var sess := str(_sessions.get(id, ""))
 	if sess != "":
-		OS.create_process("/usr/bin/pkill", ["-f", "abduco -A %s " % sess], false)
+		_create_process("/usr/bin/pkill", ["-f", "abduco -A %s " % sess], false)
 	_remove_group(id)
 
 
@@ -1226,7 +1229,7 @@ func _pty(pane: int, data: PackedByteArray) -> void:
 	if _sock != null and _sock.call("is_connected"):
 		_sock.call("send_bytes", pane, data)
 	elif kitten_exe != "":
-		OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "send-text",
+		_create_process(kitten_exe, ["@", "--to", kitty_socket, "send-text",
 			"--match", "id:%d" % pane, data.get_string_from_utf8()], false)
 
 
@@ -1242,7 +1245,7 @@ func _copy_focused() -> void:
 	var pane := _focused_pane()
 	if pane == 0 or kitten_exe == "":
 		return
-	OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "action",
+	_create_process(kitten_exe, ["@", "--to", kitty_socket, "action",
 		"--match", "id:%d" % pane, "copy_to_clipboard"], false)
 
 
@@ -1257,7 +1260,7 @@ func _paste_focused() -> void:
 		return
 	if DisplayServer.clipboard_has():
 		if kitten_exe != "":
-			OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "action",
+			_create_process(kitten_exe, ["@", "--to", kitty_socket, "action",
 				"--match", "id:%d" % pane, "paste_from_clipboard"], false)
 	elif DisplayServer.clipboard_has_image():
 		_pty(pane, PackedByteArray([22]))  # ^V
@@ -1273,7 +1276,7 @@ func _spawn_terminal() -> void:
 	var shell := OS.get_environment("SHELL")
 	if shell == "":
 		shell = "/bin/zsh"
-	OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "launch", "--type=os-window", shell], false)
+	_create_process(kitten_exe, ["@", "--to", kitty_socket, "launch", "--type=os-window", shell], false)
 
 
 # A Cmd+N termling waits here until its first frame arrives, then we present it:
@@ -1490,7 +1493,7 @@ func _resize_group(g: Node2D, dir: int) -> void:
 	if _sock != null and _sock.call("is_connected"):
 		_sock.call("send_resize", g.term_id, nc, nr)
 	elif kitten_exe != "":
-		OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "resize-os-window",
+		_create_process(kitten_exe, ["@", "--to", kitty_socket, "resize-os-window",
 			"--match", "id:%d" % t.pane_id, "--unit", "cells",
 			"--width", str(nc), "--height", str(nr)], false)
 
@@ -1513,7 +1516,7 @@ func _scroll_terminal(g: Node2D, up: bool, lines: int) -> void:
 	elif kitten_exe != "":
 		# `<n>l` scrolls down, `<n>l-` scrolls up (toward older lines).
 		var amount := "%dl%s" % [mini(lines, 10), "-" if up else ""]
-		OS.create_process(kitten_exe, ["@", "--to", kitty_socket, "scroll-window",
+		_create_process(kitten_exe, ["@", "--to", kitty_socket, "scroll-window",
 			"--match", "id:%d" % pane, amount], false)
 
 
@@ -1717,6 +1720,26 @@ func _position_on_some_screen(p: Vector2i) -> bool:
 	return false
 
 
+# Keep every asynchronous child until it exits. On Unix, checking its status
+# also waits for the exited child; discarding the PID leaves a zombie. The
+# watchdog launches from the polling thread, so protect the shared PID list.
+func _create_process(path: String, args: PackedStringArray, open_console: bool = false) -> int:
+	_child_mutex.lock()
+	var pid := OS.create_process(path, args, open_console)
+	if pid > 0:
+		_child_pids.append(pid)
+	_child_mutex.unlock()
+	return pid
+
+
+func _reap_children() -> void:
+	_child_mutex.lock()
+	for i in range(_child_pids.size() - 1, -1, -1):
+		if not OS.is_process_running(_child_pids[i]):
+			_child_pids.remove_at(i)
+	_child_mutex.unlock()
+
+
 # --- kitty ls polling (background thread) -----------------------------------
 
 func _start_ls_poll() -> void:
@@ -1737,7 +1760,7 @@ func _ls_loop() -> void:
 		if watchdog_tick >= 30:
 			watchdog_tick = 0
 			var wd := ProjectSettings.globalize_path("res://cove-watchdog.py")
-			OS.create_process("/usr/bin/python3", [wd])
+			_create_process("/usr/bin/python3", [wd])
 		var out := []
 		OS.execute(kitten_exe, ["@", "--to", kitty_socket, "ls"], out, false)
 		var txt: String = out[0] if out.size() > 0 else ""
@@ -2772,7 +2795,7 @@ func _run_semantic_search() -> void:
 	_search_poll = 0.0
 	_search_hint.text = "✨ finding…"
 	var script := ProjectSettings.globalize_path("res://mcp/cove_find.py")
-	OS.create_process("/usr/bin/python3", [script, "--json", q])
+	_create_process("/usr/bin/python3", [script, "--json", q])
 
 
 func _poll_search(delta: float) -> void:
@@ -6985,7 +7008,7 @@ func _bd_unfurl_start(url: String) -> void:
 		DirAccess.remove_absolute(out)
 	var script := ProjectSettings.globalize_path("res://mcp/cove_unfurl.py")
 	var assets := ProjectSettings.globalize_path(BD_ASSETS) + "/links"
-	if OS.create_process("/usr/bin/python3", [script, url, out, assets]) != -1:
+	if _create_process("/usr/bin/python3", [script, url, out, assets]) != -1:
 		_bd_unfurl_pending[url] = {"out": out, "t": Time.get_ticks_msec()}
 
 
