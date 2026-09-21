@@ -1546,8 +1546,21 @@ func _fit_zoom_for(g: Node2D, fill := VIEW_FILL) -> float:
 # Reflow the terminal by changing its cols/rows (scroll to resize).
 func _resize_group(g: Node2D, dir: int) -> void:
 	var t = g.terminal
-	if t.cols <= 0 or t.page:
-		return   # a page's size is its tab's viewport (Vibefox owns it)
+	if t.page:
+		# Ask Vibefox for a bigger/smaller frame (it re-renders the tab at a scale
+		# that yields about this size); the sprite follows the frame's new w/h.
+		var ns: Vector2i = t.native_size()
+		if ns.x <= 0 or ns.y <= 0:
+			return
+		var f := PAGE_RESIZE_STEP if dir > 0 else 1.0 / PAGE_RESIZE_STEP
+		var w := clampi(roundi(ns.x * f), PAGE_MIN_W, PAGE_MAX_W)
+		var h := maxi(1, roundi(float(w) * float(ns.y) / float(ns.x)))
+		if w == ns.x:
+			return
+		_page_input(t.pane_id, "resize", {"w": w, "h": h})
+		return
+	if t.cols <= 0:
+		return
 	var nc := clampi(t.cols + dir * 8, 24, 400)
 	var nr := clampi(t.rows + dir * 3, 6, 200)
 	if nc == t.cols and nr == t.rows:
@@ -2278,6 +2291,9 @@ func _exec_command(c: Dictionary) -> String:
 
 const PAGE_PANE_BASE := 1000000   # Vibefox pane id = 1000000 + tab id
 const PAGE_WHEEL_PX := 40         # critter pixels per wheel notch line
+const PAGE_RESIZE_STEP := 1.15    # frame growth per Cmd+wheel notch
+const PAGE_MIN_W := 240           # critter frame width bounds (px) we ask Vibefox for
+const PAGE_MAX_W := 2400
 
 
 # One bridge process for the life of the Cove: we write JSON lines to its stdin
