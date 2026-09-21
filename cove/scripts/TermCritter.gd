@@ -35,6 +35,7 @@ var remote := false      # a read-only shadow of a termling on another device
 var remote_peer := ""    # which device it lives on (shown on the nameplate)
 var page := false        # a Vibefox page critter: input goes to the browser, not kitty
 var page_title := ""     # the tab's title (from the term-<N>.json sidecar), nameplate fallback
+var _srgb_mat: ShaderMaterial = null  # linear->sRGB encode for kitty frames (not pages)
 var _focused := false     # last focus state, so set_remote can re-tint
 var _default_border_sb: StyleBox = null  # the local (blue) border style
 var _remote_border_sb: StyleBox = null   # a red variant for remote shadows
@@ -61,6 +62,7 @@ func setup(id: int, path: String) -> void:
 	# ($Screen, not `screen`: setup() runs before add_child, so @onready is unset.)
 	var mat := ShaderMaterial.new()
 	mat.shader = preload("res://shaders/term_srgb.gdshader")
+	_srgb_mat = mat
 	$Screen.material = mat
 	if ClassDB.class_exists("CoveIOSurface"):
 		_importers = [ClassDB.instantiate("CoveIOSurface"), ClassDB.instantiate("CoveIOSurface")]
@@ -82,6 +84,9 @@ func poll() -> void:
 	var was_page := page
 	page = (flags & FLAG_PAGE) != 0
 	if page != was_page:
+		# Vibefox snapshots are already sRGB; kitty's frames are linear light. Only
+		# the latter want the encode shader, or a page comes out washed-out white.
+		screen.material = null if page else _srgb_mat
 		_update_nameplate()
 	pane_id = int(head.decode_u32(24)) | (int(head.decode_u32(28)) << 32)
 	cols = int(head.decode_u32(32))
