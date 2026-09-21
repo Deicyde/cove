@@ -149,6 +149,18 @@ var _search_list: VBoxContainer
 var _search_hint: Label
 var _search_open := false
 var _search_rows := []        # [{id, why, source}] currently displayed, best-first
+# Page critters: Vibefox mirrors a browser tab into term-<1000000+tab>.rgba (header
+# flag 0x10000). They are external to kitty -- the ls poll never sees them and must
+# never drop them -- and their input goes to the browser's control socket through
+# cove-vibefox-bridge.py (one JSON line per event; replies are dropped).
+const VIBEFOX_SOCK := "/tmp/vibefox/control.sock"
+var _vf_pipe: FileAccess = null   # the bridge's stdin
+var _vf_pid := -1
+var _vf_retry := 0.0              # seconds until we try to respawn a dead bridge
+var _vf_seq := 0                  # "id" on each control-socket request
+var _page_meta := {}              # term id -> {title, url, tab} from term-<N>.json
+var _page_meta_accum := 1.0       # re-read the sidecars about once a second
+var _press_dbl := false           # the current press was a double-click (skip its click)
 var _search_sel := 0          # highlighted row index
 var _search_awaiting := ""    # query we're waiting on cove-find for ("" = idle)
 var _search_poll := 0.0
@@ -221,6 +233,7 @@ func _ready() -> void:
 	else:
 		push_warning("cove: CoveInput extension not loaded — input falls back to `kitten @ send` (slow). Check cove.gdextension / rebuild gdext.")
 	_setup_handoff()
+	_start_vibefox_bridge()
 	_load_layout()   # restore positions/names/camera from the previous run
 	_restore_window()  # put the os-window back where (and how big / maximized) it was
 	_build_world()
@@ -289,6 +302,7 @@ func _process(delta: float) -> void:
 		_apply_zones()
 	if _sock != null and not _sock.call("is_connected") and _input_tries < 100:
 		_try_connect_sock()
+	_tick_vibefox(delta)
 	_apply_agent_state()
 	_apply_follows()
 	_poll_handoff()
@@ -417,6 +431,10 @@ func _add_group(id: int) -> void:
 		var p = _saved["pos"][id]
 		g.position = Vector2(p[0], p[1])
 		_pos_restored[id] = true
+	elif _is_page_file(id) and _focused_id != -1 and _groups.has(_focused_id):
+		# A page critter walks on beside the termling the user is working in.
+		var fg: Node2D = _groups[_focused_id]
+		g.position = fg.position + Vector2(fg.terminal.onscreen_size().x * 0.5 + 200.0, 30.0)
 	else:
 		# Spawn near the camera so new terminals appear in view, then they wander off.
 		var center := _cam.position if _cam else Vector2.ZERO
@@ -439,12 +457,26 @@ func _add_group(id: int) -> void:
 		_set_focus(id, false)
 
 
+# Is term-<id>.rgba a Vibefox page critter (header flag 0x10000)? Read before the
+# group exists, so a new page can be placed next to the focused termling.
+func _is_page_file(id: int) -> bool:
+	var f := FileAccess.open("%s/term-%d.rgba" % [DIR, id], FileAccess.READ)
+	if f == null:
+		return false
+	var head := f.get_buffer(TermCritter.HEADER)
+	if head.size() < TermCritter.HEADER or head.decode_u32(0) != TermCritter.MAGIC:
+		return false
+	return (int(head.decode_u32(20)) & TermCritter.FLAG_PAGE) != 0
+
+
 func _remove_group(id: int) -> void:
 	if _groups.has(id):
 		_groups[id].queue_free()
 		_groups.erase(id)
+	_page_meta.erase(id)
 	_zone_of.erase(id)
 	_attention.remove(id)
+	_drop_note(id)   # a dead termling's "needs you" can't be attended, so it goes
 	if _focused_id == id:
 		_focused_id = -1
 		for other in _groups:
@@ -525,8 +557,8 @@ func _build_handoff_payload(g: Node2D) -> String:
 func _try_begin_handoff() -> void:
 	if _drag == null or _inflight_id != -1 or _drag.call("is_dragging"):
 		return
-	if _press_group == null:
-		return
+	if _press_group == null or _press_group.terminal.page:
+		return   # a page critter lives in this Mac's browser; it can't be handed off
 	var g := _press_group
 	var id: int = g.term_id
 	var label := _handoff_name(id)
@@ -718,17 +750,22 @@ func _set_focus(id: int, dismiss := true) -> void:
 
 # You attended to a terminal: clear its "needs you" note and queue entry.
 func _dismiss_note(id: int) -> void:
-	var kept := []
-	var changed := false
-	for n in _notes:
-		if n.get("term_id", -2) == id:
-			changed = true
-		else:
-			kept.append(n)
-	if changed:
-		_notes = kept
-		_update_panel()
+	_drop_note(id)
 	_attention.on_focus(id)
+
+
+# Forget a termling's note (the panel row and its Cmd+' stop). Returns whether
+# there was one.
+func _drop_note(id: int) -> bool:
+	var kept := []
+	for n in _notes:
+		if n.get("term_id", -2) != id:
+			kept.append(n)
+	if kept.size() == _notes.size():
+		return false
+	_notes = kept
+	_update_panel()
+	return true
 
 
 # Frontmost termling under world_pos. Ones faded out of the way (in front of the
@@ -912,6 +949,10 @@ func _world_mouse() -> Vector2:
 # fling it off the window edge (plain drag); Alt-drag only relocates.
 func _begin_move(can_send: bool) -> void:
 	_set_focus(_press_group.term_id, false)   # moving it isn't attending to it
+	if _press_group.term_id == _tracking_id:
+		# The follow pauses while it's dragged (see _process); un-glue now so the
+		# camera eases over to where it lands instead of snapping there on drop.
+		_track_lock = 0.0
 	_moving = true
 	_move_can_send = can_send
 	_move_grab = _press_group.get_ground_pos() - _press_world
@@ -936,7 +977,7 @@ func _poll_hold() -> void:
 # 1 drag-update, 2 end (kitty copies the selection to the clipboard on end).
 # Only the fast socket carries this; there's no kitten fallback for selection.
 func _send_select(g: Node2D, world: Vector2, phase: int) -> void:
-	if g == null or _sock == null or not _sock.call("is_connected"):
+	if g == null or g.terminal.page or _sock == null or not _sock.call("is_connected"):
 		return
 	var t = g.terminal
 	var pane: int = t.pane_id
@@ -1020,7 +1061,10 @@ func _unhandled_input(event: InputEvent) -> void:
 				# away, and Alt-drag always moves.
 				_selecting = _press_group != null and not event.alt_pressed and not event.double_click \
 					and (_press_group.term_id == _focused_id or _press_group.term_id == _tracking_id)
+				if _press_group != null and _press_group.terminal.page:
+					_selecting = false   # a page has no text selection: a drag moves it, a click clicks the page
 				_hold_armed = _selecting and _press_group.term_id != _present_id  # a presented one stays put
+				_press_dbl = event.double_click
 				_press_ms = Time.get_ticks_msec()
 				_lifting = false
 				_moving = false
@@ -1028,6 +1072,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				if event.double_click and _press_group != null:
 					_set_focus(_press_group.term_id)
 					_tracking_id = _press_group.term_id  # double-click: focus + follow
+					if _press_group.terminal.page:
+						_page_activate(_press_group)   # and raise the tab in the browser
 				# Triple-click a termling -> present it full-window (click again or Esc
 				# to leave). A click on empty ground also leaves present mode.
 				var now_ms := Time.get_ticks_msec()
@@ -1053,6 +1099,8 @@ func _unhandled_input(event: InputEvent) -> void:
 					_press_group.end_drag_move()
 					_reassign_zone_on_drop(_press_group)
 				elif _press_group != null:
+					if _press_group.terminal.page and not _press_dbl:
+						_page_click(_press_group, _world_mouse(), 0)
 					_set_focus(_press_group.term_id)
 				_press_group = null
 				_lifting = false
@@ -1153,7 +1201,12 @@ func _on_key(event: InputEventKey) -> void:
 	# Cmd/Ctrl+N is handled early in _input(); here we only route typing.
 	if _focused_id == -1 or not _groups.has(_focused_id):
 		return
-	var pane: int = _groups[_focused_id].terminal.pane_id
+	var t = _groups[_focused_id].terminal
+	if t.page:
+		if _page_key(t, event):
+			get_viewport().set_input_as_handled()
+		return
+	var pane: int = t.pane_id
 	if pane == 0:
 		return
 	var bytes := _encode_key(event)
@@ -1243,7 +1296,12 @@ func _focused_pane() -> int:
 # Runs through `kitten @ action` so kitty's own copy machinery does the work.
 func _copy_focused() -> void:
 	var pane := _focused_pane()
-	if pane == 0 or kitten_exe == "":
+	if pane == 0:
+		return
+	if _groups[_focused_id].terminal.page:
+		_page_input(pane, "key", {"key": "c", "modifiers": ["meta"]})   # the browser's own copy
+		return
+	if kitten_exe == "":
 		return
 	_create_process(kitten_exe, ["@", "--to", kitty_socket, "action",
 		"--match", "id:%d" % pane, "copy_to_clipboard"], false)
@@ -1257,6 +1315,10 @@ func _copy_focused() -> void:
 func _paste_focused() -> void:
 	var pane := _focused_pane()
 	if pane == 0:
+		return
+	if _groups[_focused_id].terminal.page:
+		if DisplayServer.clipboard_has():
+			_page_input(pane, "text", {"text": DisplayServer.clipboard_get()})
 		return
 	if DisplayServer.clipboard_has():
 		if kitten_exe != "":
@@ -1484,8 +1546,8 @@ func _fit_zoom_for(g: Node2D, fill := VIEW_FILL) -> float:
 # Reflow the terminal by changing its cols/rows (scroll to resize).
 func _resize_group(g: Node2D, dir: int) -> void:
 	var t = g.terminal
-	if t.cols <= 0:
-		return
+	if t.cols <= 0 or t.page:
+		return   # a page's size is its tab's viewport (Vibefox owns it)
 	var nc := clampi(t.cols + dir * 8, 24, 400)
 	var nr := clampi(t.rows + dir * 3, 6, 200)
 	if nc == t.cols and nr == t.rows:
@@ -1506,6 +1568,10 @@ func _scroll_terminal(g: Node2D, up: bool, lines: int) -> void:
 	var t = g.terminal
 	var pane: int = t.pane_id
 	if pane == 0 or lines <= 0:
+		return
+	if t.page:
+		# Browser pixels (critter scale): about three lines of a page per notch.
+		_page_input(pane, "wheel", {"dx": 0, "dy": (-1 if up else 1) * mini(lines, 10) * PAGE_WHEEL_PX})
 		return
 	if t.mouse_mode != 0:
 		var wheel := _wheel_bytes(t, up)
@@ -1900,6 +1966,21 @@ func _apply_agent_state() -> void:
 		_ls_mutex.lock()
 		_agents = _ls_data.duplicate(true)
 		_ls_mutex.unlock()
+	# Page critters aren't kitty windows, so the ls poll knows nothing of them:
+	# describe them here (agent "page", the tab's title/url from the sidecar) so
+	# state.json, search and the nameplate treat them like any termling.
+	for id in _groups:
+		var pt = _groups[id].terminal
+		if not pt.page:
+			continue
+		var meta: Dictionary = _page_meta.get(id, {})
+		var title := str(meta.get("title", ""))
+		pt.set_page_title(title)
+		_agents[pt.pane_id] = {
+			"session": "", "agent": "page", "busy": false, "attention": false,
+			"cwd": "", "title": title if title != "" else "page",
+			"url": str(meta.get("url", "")), "tab": int(meta.get("tab", pt.pane_id - PAGE_PANE_BASE)),
+		}
 	# recompute attention set: kitty needs_attention OR a pending note
 	_attn_ids.clear()
 	for note in _notes:
@@ -2135,6 +2216,14 @@ func _pump_commands(delta: float) -> void:
 # replies file.
 func _exec_command(c: Dictionary) -> String:
 	var cmd := str(c.get("cmd", ""))
+	# "Send to Cove" in Vibefox is the user's own right-click, so its focus is
+	# theirs: camera to that termling and follow it (what cove-focus.sh does).
+	if cmd == "focus" and str(c.get("source", "")) == "vibefox":
+		var g := _find(int(c.get("id", -1)))
+		if g == null:
+			return "no such terminal"
+		_jump_focus(g.term_id)
+		return ""
 	# Agents don't move termlings, drive the camera or take focus: the user
 	# arranges the Cove. (Older MCP servers still send these; they get an error.)
 	if cmd in ["move", "follow", "stop", "focus", "gather", "scatter", "release", "autozone"]:
@@ -2179,16 +2268,132 @@ func _exec_command(c: Dictionary) -> String:
 					bc["near_pos"] = [nr.end.x + 60.0, nr.position.y]
 			return _bd_command(bc)
 		"dismiss":
-			var tid := int(c.get("id", -1))
-			var kept := []
-			for n in _notes:
-				if n.get("term_id", -2) != tid:
-					kept.append(n)
-			_notes = kept
-			_update_panel()
+			_drop_note(int(c.get("id", -1)))
 		var other:
 			return "unknown command: %s" % str(other)
 	return ""
+
+
+# --- page critters (Vibefox tabs on the board) -------------------------------
+
+const PAGE_PANE_BASE := 1000000   # Vibefox pane id = 1000000 + tab id
+const PAGE_WHEEL_PX := 40         # critter pixels per wheel notch line
+
+
+# One bridge process for the life of the Cove: we write JSON lines to its stdin
+# and it owns the (re)connection to Vibefox's control socket. Nothing here blocks
+# the frame: a missing browser just means the lines go nowhere.
+func _start_vibefox_bridge() -> void:
+	var script := ProjectSettings.globalize_path("res://cove-vibefox-bridge.py")
+	var r: Dictionary = OS.execute_with_pipe("/usr/bin/python3", [script, VIBEFOX_SOCK], false)
+	if r.is_empty() or not r.has("stdio") or int(r.get("pid", -1)) <= 0:
+		push_warning("cove: couldn't start cove-vibefox-bridge.py — page critters won't take input.")
+		_vf_pipe = null
+		_vf_pid = -1
+		return
+	_vf_pipe = r["stdio"]
+	_vf_pid = int(r["pid"])
+	_child_mutex.lock()
+	_child_pids.append(_vf_pid)
+	_child_mutex.unlock()
+
+
+func _tick_vibefox(delta: float) -> void:
+	# Respawn the bridge if it died (it only exits on error), at most every 5s.
+	if _vf_pid != -1 and not OS.is_process_running(_vf_pid):
+		_vf_pid = -1
+		_vf_pipe = null
+		_vf_retry = 5.0
+	if _vf_pid == -1:
+		_vf_retry -= delta
+		if _vf_retry <= 0.0:
+			_vf_retry = 5.0
+			_start_vibefox_bridge()
+	# The title/url sidecars Vibefox writes next to each page's frame file.
+	_page_meta_accum += delta
+	if _page_meta_accum < 1.0:
+		return
+	_page_meta_accum = 0.0
+	for id in _groups:
+		if not _groups[id].terminal.page:
+			continue
+		var f := FileAccess.open("%s/term-%d.json" % [DIR, id], FileAccess.READ)
+		if f == null:
+			_page_meta.erase(id)
+			continue
+		var d = JSON.parse_string(f.get_as_text())
+		if typeof(d) == TYPE_DICTIONARY:
+			_page_meta[id] = d
+
+
+# Send one request line to Vibefox's control socket. Fire-and-forget: the bridge
+# drains the reply. Ignored when the bridge (or the browser) isn't there.
+func _vf_send(cmd: String, args: Dictionary) -> void:
+	if _vf_pipe == null or _vf_pid == -1:
+		return
+	_vf_seq += 1
+	_vf_pipe.store_line(JSON.stringify({"id": _vf_seq, "cmd": cmd, "args": args}))
+	_vf_pipe.flush()
+
+
+func _page_input(pane: int, kind: String, data: Dictionary) -> void:
+	_vf_send("critter.input", {"id": pane, "kind": kind, "data": data})
+
+
+# A click on the page, in critter (frame) pixels. button: 0 left, 1 middle, 2 right.
+func _page_click(g: Node2D, world: Vector2, button: int) -> void:
+	var t = g.terminal
+	var px: Vector2 = t.pixel_at(world)
+	_page_input(t.pane_id, "mouse", {"x": roundi(px.x), "y": roundi(px.y), "button": button})
+
+
+# Double-click: raise the mirrored tab in the browser.
+func _page_activate(g: Node2D) -> void:
+	_vf_send("critter.activate", {"id": g.terminal.pane_id})
+
+
+# Keyboard into a page: a plain printable key is typed as text; anything else
+# (Enter, arrows, Ctrl/Cmd chords) goes as a named key with its modifiers.
+# Returns whether the key was sent.
+func _page_key(t, event: InputEventKey) -> bool:
+	var mods: Array = []
+	if event.shift_pressed: mods.append("shift")
+	if event.ctrl_pressed: mods.append("ctrl")
+	if event.alt_pressed: mods.append("alt")
+	if event.meta_pressed: mods.append("meta")
+	var name := ""
+	match event.keycode:
+		KEY_ENTER, KEY_KP_ENTER: name = "Enter"
+		KEY_TAB: name = "Tab"
+		KEY_BACKSPACE: name = "Backspace"
+		KEY_DELETE: name = "Delete"
+		KEY_ESCAPE: name = "Escape"
+		KEY_UP: name = "ArrowUp"
+		KEY_DOWN: name = "ArrowDown"
+		KEY_LEFT: name = "ArrowLeft"
+		KEY_RIGHT: name = "ArrowRight"
+		KEY_HOME: name = "Home"
+		KEY_END: name = "End"
+		KEY_PAGEUP: name = "PageUp"
+		KEY_PAGEDOWN: name = "PageDown"
+		KEY_SPACE: name = " "
+	if name == "":
+		if event.unicode == 0 or _is_modifier_key(event.keycode):
+			return false
+		var ch := String.chr(event.unicode)
+		if not (event.ctrl_pressed or event.alt_pressed or event.meta_pressed):
+			_page_input(t.pane_id, "text", {"text": ch})
+			return true
+		# A chord: name the key by its unmodified character (Ctrl+A -> "a").
+		if event.keycode >= KEY_A and event.keycode <= KEY_Z:
+			name = String.chr(event.keycode - KEY_A + 97)
+		else:
+			name = ch
+	if name == " " and mods.is_empty():
+		_page_input(t.pane_id, "text", {"text": " "})
+		return true
+	_page_input(t.pane_id, "key", {"key": name, "modifiers": mods})
+	return true
 
 
 # --- state.json (world -> agents) -------------------------------------------
@@ -2224,6 +2429,9 @@ func _write_state() -> void:
 			"zone": _bd_container_name(str(_zone_of.get(id, ""))),
 			"container": _zone_of.get(id, null),   # board shape id; "" loose, null not restored yet
 		})
+		if info.has("url"):   # a page critter: which tab it mirrors
+			terms[-1]["url"] = str(info["url"])
+			terms[-1]["tab"] = int(info["tab"])
 	# Remember the os-window geometry. Only refresh the windowed rect while actually
 	# windowed, so a maximized/fullscreen session still records the rect to fall back
 	# to when un-maximized (and across restarts).

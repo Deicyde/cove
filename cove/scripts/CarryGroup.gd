@@ -22,6 +22,7 @@ const AGENT_COLORS := {
 	"codex": Color(0.30, 0.80, 0.70),
 	"opencode": Color(0.62, 0.52, 0.92),
 	"shell": Color(0.5, 0.5, 0.55),
+	"page": Color(1.0, 0.76, 0.40),   # a Vibefox page critter (a browser tab)
 }
 
 var term_id := -1

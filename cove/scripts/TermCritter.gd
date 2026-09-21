@@ -9,6 +9,7 @@ class_name TermCritter
 const MAGIC := 0x4B4D454E
 const HEADER := 64
 const FLAG_BOTTOM_UP := 0x1
+const FLAG_PAGE := 0x10000  # a Vibefox page critter (a browser tab), not a kitty pane
 
 # On-screen pixels per native terminal pixel. Resizing (changing cols/rows)
 # grows/shrinks the whole window rather than rescaling the text. kitty renders at
@@ -16,6 +17,9 @@ const FLAG_BOTTOM_UP := 0x1
 # hidden window lands on), so poll() divides BASE_ZOOM by the detected render
 # scale: world size stays put, and a 2x render gives Retina-sharp glyphs.
 const BASE_ZOOM := 0.30
+# Page critters arrive at half the tab's viewport (Vibefox scale 0.5); this puts
+# them on the board at about a termling's size.
+const PAGE_ZOOM := 0.45
 const BASE_CELL_H := 19.0   # cell height in px at font_size=16 rendered at 1x
 var zoom := BASE_ZOOM
 
@@ -29,6 +33,8 @@ var frame_path := ""
 var custom_name := ""    # user/agent-assigned name shown on the nameplate
 var remote := false      # a read-only shadow of a termling on another device
 var remote_peer := ""    # which device it lives on (shown on the nameplate)
+var page := false        # a Vibefox page critter: input goes to the browser, not kitty
+var page_title := ""     # the tab's title (from the term-<N>.json sidecar), nameplate fallback
 var _focused := false     # last focus state, so set_remote can re-tint
 var _default_border_sb: StyleBox = null  # the local (blue) border style
 var _remote_border_sb: StyleBox = null   # a red variant for remote shadows
@@ -73,6 +79,10 @@ func poll() -> void:
 	var h := int(head.decode_u32(8))
 	var seq := int(head.decode_u32(12))
 	var flags := int(head.decode_u32(20))
+	var was_page := page
+	page = (flags & FLAG_PAGE) != 0
+	if page != was_page:
+		_update_nameplate()
 	pane_id = int(head.decode_u32(24)) | (int(head.decode_u32(28)) << 32)
 	cols = int(head.decode_u32(32))
 	rows = int(head.decode_u32(36))
@@ -92,7 +102,7 @@ func poll() -> void:
 	# Normalise for kitty's render scale (1x vs 2x Retina) so world size is
 	# stable and a 2x render shows as sharper glyphs, not a bigger window.
 	var render_scale := maxf(1.0, roundf(float(h) / float(maxi(rows, 1)) / BASE_CELL_H))
-	var z := BASE_ZOOM / render_scale
+	var z := PAGE_ZOOM if page else BASE_ZOOM / render_scale
 	if not is_equal_approx(z, zoom):
 		zoom = z
 		screen.scale = Vector2.ONE * zoom
@@ -179,6 +189,14 @@ func _update_nameplate() -> void:
 	if _nameplate == null:
 		return
 	var base := custom_name if custom_name != "" else "termling %d" % term_id
+	if page:
+		# A browser tab on the board: "▣" marks it a page (as ◈ marks a remote),
+		# named after the tab unless the user renamed it.
+		if custom_name == "":
+			base = page_title if page_title != "" else "page"
+		_nameplate.text = "▣ %s  (page)" % base
+		_nameplate.add_theme_color_override("font_color", Color(1.0, 0.86, 0.60))
+		return
 	if remote:
 		var who := (" @ " + remote_peer) if remote_peer != "" else ""
 		_nameplate.text = "◈ %s%s  (%d×%d)" % [base, who, cols, rows]
@@ -191,6 +209,22 @@ func _update_nameplate() -> void:
 func set_custom_name(n: String) -> void:
 	custom_name = n
 	_update_nameplate()
+
+
+# The tab title a page critter shows when it has no custom name.
+func set_page_title(t: String) -> void:
+	if page_title == t:
+		return
+	page_title = t
+	_update_nameplate()
+
+
+# Map a world position to native frame pixels (0..w, 0..h), clamped. Page
+# critters send these to the browser as "critter pixels".
+func pixel_at(world_pos: Vector2) -> Vector2:
+	var local := screen.to_local(world_pos) + Vector2(_size) * 0.5
+	return Vector2(clampf(local.x, 0.0, maxf(0.0, float(_size.x - 1))),
+		clampf(local.y, 0.0, maxf(0.0, float(_size.y - 1))))
 
 
 # Save the current terminal frame to a PNG. Used as the drag-out image when the
