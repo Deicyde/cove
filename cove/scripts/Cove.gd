@@ -3903,6 +3903,7 @@ func _bd_tick(delta: float) -> void:
 		_bd_hint_accum = 0.0
 		_bd_update_hint()
 		_bd_unfurl_poll()
+		_cal_tick()
 		if absf(_bd_ui_target_scale() - _bd_ui_scale) > 0.01:
 			_bd_apply_ui_scale()   # the window moved to another screen
 	# Redraw only what changed. Redrawing every shape every frame (at up to 144
@@ -3984,7 +3985,7 @@ func _bd_bounds(s: Dictionary) -> Rect2:
 
 
 func _bd_is_box(s: Dictionary) -> bool:
-	return str(s["type"]) in ["geo", "text", "note", "frame", "todo", "image", "bookmark"]
+	return str(s["type"]) in ["geo", "text", "note", "frame", "todo", "image", "bookmark", "calendar", "reminders"]
 
 
 func _bd_reindex() -> void:
@@ -3995,6 +3996,7 @@ func _bd_reindex() -> void:
 		if str(s["type"]) == "bookmark":
 			_bd_bm_apply(s)   # undo and reloads pick up what's been unfurled since
 	_bd_sel = _bd_sel.filter(func(i): return _bd_by_id.has(i))
+	_cal_apply_all()
 
 
 func _bd_fresh_id() -> String:
@@ -4308,7 +4310,7 @@ func _bd_hit_solid(s: Dictionary, p: Vector2, tol: float) -> bool:
 					and Geometry2D.is_point_in_polygon(p, poly):
 				return true
 			return _bd_dist_poly(p, poly, true) <= tol + _bd_sw(s) * 0.5
-		"note", "text", "todo", "image", "bookmark":
+		"note", "text", "todo", "image", "bookmark", "calendar", "reminders":
 			return _bd_rect(s).grow(tol * 0.5).has_point(p)
 		"frame":
 			if _bd_frame_label_rect(s).has_point(p):
@@ -4333,14 +4335,14 @@ func _bd_hit(p: Vector2, include_locked := false) -> String:
 	var tol := _bd_tol()
 	for i in range(_bd_shapes.size() - 1, -1, -1):
 		var s: Dictionary = _bd_shapes[i]
-		if bool(s.get("locked", false)) and not include_locked:
+		if (bool(s.get("locked", false)) and not include_locked) or not _bd_shown(s):
 			continue
 		if _bd_hit_solid(s, p, tol):
 			return str(s["id"])
 	var best := ""
 	var best_area := INF
 	for s in _bd_shapes:
-		if bool(s.get("locked", false)) and not include_locked:
+		if (bool(s.get("locked", false)) and not include_locked) or not _bd_shown(s):
 			continue
 		if str(s["type"]) == "geo" and Geometry2D.is_point_in_polygon(_bd_local(s, p), _bd_geo_poly(s)):
 			var area := float(s["w"]) * float(s["h"])
@@ -4524,6 +4526,11 @@ func _bd_select_down(p: Vector2, ev: InputEventMouseButton) -> void:
 			_bd_bm_open(bm)
 			_bd_g = "none"
 			return
+	# Calendar and reminders controls (arrows, view, checkboxes) work on a click.
+	if id != "" and str(_bd_by_id[id]["type"]) in ["calendar", "reminders"] and not ev.shift_pressed:
+		if _cal_click(_bd_by_id[id], p, ev):
+			_bd_g = "none"
+			return
 	# A todo list's checkboxes and "+ add item" row work on a single click.
 	if id != "" and str(_bd_by_id[id]["type"]) == "todo" and not ev.double_click:
 		var part := _bd_todo_part_at(_bd_by_id[id], p)
@@ -4580,7 +4587,7 @@ func _bd_pointer_move(p: Vector2, ev: InputEventMouseMotion) -> void:
 			var ids := _bd_marquee_base.duplicate()
 			for s in _bd_shapes:
 				var sid := str(s["id"])
-				if bool(s.get("locked", false)) or ids.has(sid):
+				if bool(s.get("locked", false)) or ids.has(sid) or not _bd_shown(s):
 					continue
 				var b := _bd_bounds(s).grow(0.5)
 				var inside: bool = _bd_marquee.encloses(b) if str(s["type"]) == "frame" else _bd_marquee.intersects(b)
@@ -4589,6 +4596,7 @@ func _bd_pointer_move(p: Vector2, ev: InputEventMouseMotion) -> void:
 			_bd_sel = _bd_with_groups(ids)
 		"handle":
 			_bd_do_handle(p, ev)
+			_cal_follow(_bd_sel)
 		"box":
 			_bd_do_box(p, ev)
 		"draw":
@@ -4772,6 +4780,7 @@ func _bd_do_move(p: Vector2, ev: InputEventWithModifiers) -> void:
 	var step := d - _bd_last_d
 	_bd_last_d = d
 	_bd_carry_members(_bd_move_ids, step)
+	_cal_follow(_bd_move_ids)
 
 
 func _bd_translate(s: Dictionary, o: Dictionary, d: Vector2) -> void:
@@ -4942,6 +4951,8 @@ func _bd_do_box(p: Vector2, ev: InputEventWithModifiers) -> void:
 
 func _bd_edit_at(id: String, p: Vector2) -> void:
 	var s: Dictionary = _bd_by_id[id]
+	if str(s["type"]) in ["calendar", "reminders"]:
+		return
 	if str(s["type"]) != "todo":
 		_bd_start_edit(id)
 		return
@@ -4956,6 +4967,8 @@ func _bd_edit_at(id: String, p: Vector2) -> void:
 
 
 func _bd_edit_text(s: Dictionary, part: int) -> String:
+	if str(s["type"]) == "reminders":
+		return _cal_draft
 	if str(s["type"]) == "todo":
 		if part == -2:
 			return str(s["text"])
@@ -4969,9 +4982,11 @@ func _bd_edit_text(s: Dictionary, part: int) -> String:
 func _bd_start_edit(id: String, part := -1) -> void:
 	_bd_stop_edit()
 	var s = _bd_by_id.get(id, null)
-	if s == null or bool(s.get("locked", false)) or str(s["type"]) == "bookmark":
+	if s == null or bool(s.get("locked", false)) or str(s["type"]) in ["bookmark", "calendar"]:
 		return
 	var type := str(s["type"])
+	if type == "reminders" and part != -4:
+		return
 	if type in ["line", "draw"]:
 		return
 	if type == "todo" and part == -1:
@@ -4985,7 +5000,10 @@ func _bd_start_edit(id: String, part := -1) -> void:
 	var font := _bd_font("sans") if type == "frame" else _bd_font_of(s)
 	var fs := _bd_frame_px() if type == "frame" else (_bd_fs(s) + 4 if type == "todo" and part == -2 else _bd_fs(s))
 	var ed: Control
-	if type == "frame" or type == "todo":
+	if type == "reminders":
+		fs = 13
+		font = _cal_font()
+	if type == "frame" or type == "todo" or type == "reminders":
 		var le := LineEdit.new()
 		le.text = _bd_edit_text(s, part)
 		le.flat = true
@@ -5003,7 +5021,7 @@ func _bd_start_edit(id: String, part := -1) -> void:
 		ed = te
 	ed.add_theme_font_override("font", font)
 	ed.add_theme_font_size_override("font_size", fs)
-	ed.add_theme_color_override("font_color", _bd_text_color(s))
+	ed.add_theme_color_override("font_color", BD_BM_TEXT if type == "reminders" else _bd_text_color(s))
 	ed.add_theme_color_override("caret_color", BD_SEL)
 	for sb in ["normal", "focus", "read_only"]:
 		ed.add_theme_stylebox_override(sb, StyleBoxEmpty.new())
@@ -5021,6 +5039,9 @@ func _bd_on_edit_text(t: String) -> void:
 	_bd_dirty = true
 	var s = _bd_by_id.get(_bd_edit_id, null)
 	if s == null:
+		return
+	if str(s["type"]) == "reminders":
+		_cal_draft = t
 		return
 	if str(s["type"]) == "todo" and _bd_edit_part >= 0:
 		var items: Array = s["items"]
@@ -5057,6 +5078,10 @@ func _bd_place_editor() -> void:
 			var sz := _bd_text_size(s, str(s["text"]), -1.0, fs)
 			size = Vector2(maxf(sz.x, 120.0) + fs, sz.y)
 			pos = m - size * 0.5
+		"reminders":
+			var ar: Rect2 = _cal_rem_layout(s)["add"]
+			pos = ar.position + Vector2(24.0, 2.0)
+			size = Vector2(ar.size.x - 26.0, ar.size.y - 4.0)
 		"todo":
 			var rows := _bd_todo_rows(s)
 			if _bd_edit_part == -2:
@@ -5082,6 +5107,7 @@ func _bd_stop_edit() -> void:
 	var part := _bd_edit_part
 	_bd_edit_id = ""
 	_bd_edit_part = -1
+	_cal_draft = ""
 	if _bd_editor != null:
 		_bd_editor.queue_free()
 		_bd_editor = null
@@ -5103,6 +5129,14 @@ func _bd_edit_submit() -> void:
 	var id := _bd_edit_id
 	var part := _bd_edit_part
 	var s = _bd_by_id.get(id, null)
+	if s != null and str(s["type"]) == "reminders":
+		var text := _cal_draft
+		_cal_draft = ""
+		_bd_stop_edit()
+		if text.strip_edges() != "":
+			_cal_task_add(s, text)
+			_bd_start_edit(id, -4)   # keep typing the next one
+		return
 	if s != null and str(s["type"]) == "todo" and part >= 0 \
 			and part < s["items"].size() and str(s["items"][part]["text"]).strip_edges() != "":
 		_bd_todo_insert(id, part + 1)
@@ -5198,7 +5232,7 @@ func _bd_draw() -> void:
 		if str(s["type"]) == "frame":
 			_bd_draw_shape(_bd_layer, s)
 	for s in _bd_shapes:
-		if str(s["type"]) != "frame" and not _bd_is_live(s):
+		if str(s["type"]) != "frame" and not _bd_is_live(s) and _bd_shown(s):
 			_bd_draw_shape(_bd_layer, s)
 
 
@@ -5212,7 +5246,7 @@ func _bd_draw_live() -> void:
 	if _cam == null:
 		return
 	for s in _bd_shapes:
-		if _bd_is_live(s):
+		if _bd_is_live(s) and _bd_shown(s):
 			_bd_draw_shape(_bd_live_layer, s)
 
 
@@ -5228,6 +5262,10 @@ func _bd_draw_shape(ci: CanvasItem, s: Dictionary) -> void:
 			_bd_draw_image(ci, s)
 		"bookmark":
 			_bd_draw_bookmark(ci, s)
+		"calendar":
+			_cal_draw(ci, s)
+		"reminders":
+			_cal_draw_rem(ci, s)
 		"text":
 			if str(s["id"]) != _bd_edit_id:
 				var fs := _bd_fs(s)
@@ -5703,6 +5741,7 @@ func _bd_commit() -> void:
 	_bd_dirty = true
 	if _bd_pre == "":
 		return
+	_cal_sync_pins()
 	var now := _bd_snapshot()
 	if now != _bd_pre:
 		_bd_undo_stack.append(_bd_pre)
@@ -5743,7 +5782,7 @@ func _bd_redo() -> void:
 func _bd_select_all() -> void:
 	_bd_sel = []
 	for s in _bd_shapes:
-		if not bool(s.get("locked", false)):
+		if not bool(s.get("locked", false)) and _bd_shown(s):
 			_bd_sel.append(str(s["id"]))
 
 
@@ -5955,6 +5994,8 @@ func _bd_zoom_to_fit(selection_only: bool) -> void:
 	var first := true
 	var ids: Array = _bd_sel if selection_only else _bd_by_id.keys()
 	for i in ids:
+		if not _bd_shown(_bd_by_id[i]):
+			continue
 		var b := _bd_bounds(_bd_by_id[i])
 		r = b if first else r.merge(b)
 		first = false
@@ -6679,6 +6720,15 @@ func _bd_context_menu(p: Vector2, screen: Vector2) -> void:
 		m.add_separator()
 		m.add_item("Delete   ⌫", 12)
 		m.add_separator()
+		if _bd_sel.size() == 1 and str(_bd_by_id[_bd_sel[0]]["type"]) in ["calendar", "reminders"]:
+			var w: Dictionary = _bd_by_id[_bd_sel[0]]
+			m.add_submenu_node_item("Calendars" if str(w["type"]) == "calendar" else "Lists", _cal_list_menu(w))
+			m.add_item("Refresh", 42)
+			m.add_item("Connect Google Calendar", 43)
+			m.add_separator()
+	m.add_item("Calendar", 40)
+	m.add_item("Reminders", 41)
+	m.add_separator()
 	m.add_item("Paste   ⌘V", 13)
 	m.add_item("Select all   ⌘A", 14)
 	m.add_item("Zoom to fit   ⇧1", 15)
@@ -6737,6 +6787,15 @@ func _bd_menu_pick(id: int) -> void:
 			_bd_ui_bump(1.15)
 		21:
 			_bd_ui_bump(1.0 / 1.15)
+		40:
+			_cal_add_widget("calendar", _bd_menu_pos)
+		41:
+			_cal_add_widget("reminders", _bd_menu_pos)
+		42:
+			_cal_err = ""
+			_cal_refetch_at = Time.get_ticks_msec()
+		43:
+			_cal_google_auth()
 	_bd_ui_refresh()
 
 
@@ -6856,7 +6915,7 @@ func _bd_toggle_snap() -> void:
 func _bd_snap_targets(exclude: Array) -> Array:
 	var out := []
 	for s in _bd_shapes:
-		if not exclude.has(str(s["id"])) and str(s["type"]) != "arrow":
+		if not exclude.has(str(s["id"])) and str(s["type"]) != "arrow" and _bd_shown(s):
 			out.append(_bd_bounds(s))
 	for id in _groups:
 		var tr = _bd_term_rect(_bd_term_key(id))
@@ -7569,3 +7628,1032 @@ func _bd_draw_tapered(ci: CanvasItem, pts: PackedVector2Array, c: Color, w: floa
 		ci.draw_line(pts[i], pts[i + 1], c, ww, true)
 		ci.draw_circle(pts[i + 1], ww * 0.5, c)
 		run += seg
+
+
+# --- board: calendar and reminders widgets -------------------------------------
+#
+# Two board shapes fed by mcp/cove_calendar.py: "calendar" (month or week, events
+# from Nextcloud and Google) and "reminders" (Nextcloud tasks and macOS Reminders
+# in one list). Whatever you draw on a calendar sticks to the day under it: the
+# shape keeps a "pin" with its geometry in that day cell's own 0..1 coordinates,
+# so switching month or week moves it to wherever the day is now, and hides it
+# while that day isn't showing.
+
+const CAL_HELPER := "res://mcp/cove_calendar.py"
+const CAL_W := 760.0
+const CAL_H := 580.0
+const CAL_REM_W := 340.0
+const CAL_REM_H := 420.0
+const CAL_HEAD := 42.0
+const CAL_DOW := 24.0
+const CAL_GUTTER := 44.0
+const CAL_ALLDAY := 42.0
+const CAL_CHIP := 17.0
+const CAL_ROW := 26.0
+const CAL_HOUR0 := 7
+const CAL_HOUR1 := 22
+const CAL_REFRESH_MS := 300000
+const CAL_PIN_SLACK := 24.0      # a shape may poke this far past the grid and still pin
+const CAL_TITLE_PX := 17
+const CAL_DAY_PX := 13
+const CAL_CHIP_PX := 11
+const CAL_LINE := Color(1, 1, 1, 0.07)
+const CAL_DIM := Color(0.55, 0.56, 0.6)
+const CAL_TODAY := Color(0.36, 0.62, 1.0)
+const CAL_DOW_NAMES := ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+const CAL_MONTHS := ["January", "February", "March", "April", "May", "June", "July",
+	"August", "September", "October", "November", "December"]
+const CAL_FALLBACK := ["#5b8def", "#e0864a", "#57b37a", "#c96dd8", "#d6b43f", "#4fb6c2", "#e06a7a"]
+
+var _cal_data := {"calendars": [], "events": [], "tasks": [], "errors": []}
+var _cal_by_day := {}           # "YYYY-MM-DD" -> [event]
+var _cal_cals := {}             # calendar id -> {name, color, events, tasks, source}
+var _cal_fetching := {}         # {out, t, start, end} while the helper runs
+var _cal_loaded := {"start": "", "end": "", "at": 0}
+var _cal_err := ""
+var _cal_ops := {}              # out path -> t for task writes in flight
+var _cal_refetch_at := 0        # ticks msec: fetch again soon (after a write)
+var _cal_auth := {}             # {out, t} while the Google sign-in runs
+var _cal_chip_boxes := {}
+var _cal_draft := ""             # the reminder being typed into "+ add reminder"
+var _cal_seen := {}             # calendar id -> geometry/view signature its pins were last placed for
+
+
+# --- dates (all "YYYY-MM-DD"; noon keeps DST out of the arithmetic) ---
+
+func _cal_today() -> String:
+	return Time.get_date_string_from_system()
+
+
+func _cal_unix(day: String) -> int:
+	return Time.get_unix_time_from_datetime_string(day.substr(0, 10) + "T12:00:00")
+
+
+func _cal_day(u: int) -> String:
+	return Time.get_date_string_from_unix_time(u)
+
+
+func _cal_add(day: String, n: int) -> String:
+	return _cal_day(_cal_unix(day) + n * 86400)
+
+
+func _cal_dow(day: String) -> int:   # 0 = Monday
+	return (int(Time.get_datetime_dict_from_unix_time(_cal_unix(day))["weekday"]) + 6) % 7
+
+
+func _cal_month_add(day: String, n: int) -> String:
+	var y := int(day.substr(0, 4))
+	var m := int(day.substr(5, 2)) - 1 + n
+	y += floori(m / 12.0)
+	m = posmod(m, 12)
+	return "%04d-%02d-01" % [y, m + 1]
+
+
+func _cal_anchor(s: Dictionary) -> String:
+	var a := str(s.get("anchor", ""))
+	return a if a.length() == 10 else _cal_today()
+
+
+func _cal_first(s: Dictionary) -> String:   # first day on the grid
+	var a := _cal_anchor(s)
+	if str(s.get("view", "month")) == "week":
+		return _cal_add(a, -_cal_dow(a))
+	var first := a.substr(0, 8) + "01"
+	return _cal_add(first, -_cal_dow(first))
+
+
+func _cal_ndays(s: Dictionary) -> int:
+	return 7 if str(s.get("view", "month")) == "week" else 42
+
+
+func _cal_title(s: Dictionary) -> String:
+	var a := _cal_anchor(s)
+	if str(s.get("view", "month")) != "week":
+		return "%s %s" % [CAL_MONTHS[int(a.substr(5, 2)) - 1], a.substr(0, 4)]
+	var d0 := _cal_first(s)
+	var d1 := _cal_add(d0, 6)
+	var m0: String = CAL_MONTHS[int(d0.substr(5, 2)) - 1].substr(0, 3)
+	var m1: String = CAL_MONTHS[int(d1.substr(5, 2)) - 1].substr(0, 3)
+	if m0 == m1:
+		return "%d – %d %s %s" % [int(d0.substr(8, 2)), int(d1.substr(8, 2)), m1, d1.substr(0, 4)]
+	return "%d %s – %d %s %s" % [int(d0.substr(8, 2)), m0, int(d1.substr(8, 2)), m1, d1.substr(0, 4)]
+
+
+func _cal_minutes(t: String) -> float:   # "…THH:MM:SS" -> minutes past midnight
+	if t.length() < 16:
+		return 0.0
+	return float(t.substr(11, 2)) * 60.0 + float(t.substr(14, 2))
+
+
+# --- data ---
+
+func _cal_tick() -> void:
+	var now := Time.get_ticks_msec()
+	_cal_poll_files()
+	var need := _cal_need()
+	if need.is_empty() or not _cal_fetching.is_empty():
+		return
+	var covered := str(_cal_loaded["start"]) != "" and str(_cal_loaded["start"]) <= str(need[0]) \
+		and str(_cal_loaded["end"]) >= str(need[1])
+	var stale := now - int(_cal_loaded["at"]) > CAL_REFRESH_MS
+	var poke := _cal_refetch_at != 0 and now >= _cal_refetch_at
+	if covered and not stale and not poke:
+		return
+	_cal_refetch_at = 0
+	# Fetch a month either side, so flipping a page doesn't wait on the network.
+	_cal_start_fetch(_cal_add(str(need[0]), -35), _cal_add(str(need[1]), 35))
+
+
+func _cal_need() -> Array:
+	var lo := ""
+	var hi := ""
+	var any := false
+	for s in _bd_shapes:
+		var t := str(s["type"])
+		if t == "reminders":
+			any = true
+		if t != "calendar":
+			continue
+		any = true
+		var a := _cal_first(s)
+		var b := _cal_add(a, _cal_ndays(s))
+		if lo == "" or a < lo:
+			lo = a
+		if hi == "" or b > hi:
+			hi = b
+	if not any:
+		return []
+	if lo == "":
+		lo = _cal_today()
+		hi = _cal_add(lo, 7)
+	return [lo, hi]
+
+
+func _cal_helper() -> String:
+	return ProjectSettings.globalize_path(CAL_HELPER)
+
+
+func _cal_start_fetch(a: String, b: String) -> void:
+	var dir := DIR + "/calendar"
+	DirAccess.make_dir_recursive_absolute(dir)
+	var out := dir + "/fetch-%d.json" % Time.get_ticks_msec()
+	if _create_process("/usr/bin/python3", [_cal_helper(), "fetch", out, a, b]) != -1:
+		_cal_fetching = {"out": out, "t": Time.get_ticks_msec(), "start": a, "end": b}
+
+
+func _cal_read_json(path: String):
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return null
+	var d = JSON.parse_string(f.get_as_text())
+	f.close()
+	DirAccess.remove_absolute(path)
+	return d
+
+
+func _cal_poll_files() -> void:
+	var now := Time.get_ticks_msec()
+	if not _cal_fetching.is_empty():
+		var out := str(_cal_fetching["out"])
+		if FileAccess.file_exists(out):
+			var d = _cal_read_json(out)
+			if typeof(d) == TYPE_DICTIONARY and bool(d.get("ok", false)):
+				# A source that failed this time (offline, token expired) keeps what it showed.
+				for sid in d.get("failed", []):
+					var mine := func(x): return str(x.get("source", "")) == str(sid) \
+						or str(x.get("cal", "")).get_slice("/", 0) == str(sid)
+					for k in ["calendars", "events", "tasks"]:
+						d[k] = d.get(k, []) + _cal_data.get(k, []).filter(mine)
+				_cal_data = d
+				_cal_loaded = {"start": _cal_fetching["start"], "end": _cal_fetching["end"], "at": now}
+				var errs: Array = d.get("errors", [])
+				_cal_err = str(errs[0]) if not errs.is_empty() else ""
+				_cal_index()
+			_cal_fetching = {}
+		elif now - int(_cal_fetching["t"]) > 90000:
+			_cal_fetching = {}
+			_cal_err = "calendar fetch timed out"
+			_cal_loaded["at"] = now   # don't hammer a dead server
+	for out in _cal_ops.keys():
+		if FileAccess.file_exists(out):
+			var d = _cal_read_json(out)
+			_cal_ops.erase(out)
+			if typeof(d) == TYPE_DICTIONARY and not bool(d.get("ok", false)):
+				_cal_err = str(d.get("error", "couldn't save the change"))
+			_cal_refetch_at = now + 500
+		elif now - int(_cal_ops[out]) > 60000:
+			_cal_ops.erase(out)
+	if not _cal_auth.is_empty():
+		var out := str(_cal_auth["out"])
+		var d = null
+		if FileAccess.file_exists(out):
+			var f := FileAccess.open(out, FileAccess.READ)
+			if f:
+				d = JSON.parse_string(f.get_as_text())
+				f.close()
+		if typeof(d) == TYPE_DICTIONARY and str(d.get("stage", "")) != "waiting":
+			DirAccess.remove_absolute(out)
+			_cal_auth = {}
+			_cal_err = "" if bool(d.get("ok", false)) else "Google: %s" % str(d.get("error", "sign-in failed"))
+			_cal_refetch_at = now
+		elif now - int(_cal_auth["t"]) > 320000:
+			_cal_auth = {}
+		_bd_dirty = true
+
+
+func _cal_index() -> void:
+	_cal_cals = {}
+	var i := 0
+	for c in _cal_data.get("calendars", []):
+		var col := str(c.get("color", ""))
+		if not col.begins_with("#"):
+			col = CAL_FALLBACK[i % CAL_FALLBACK.size()]
+		c["col"] = Color.from_string(col, Color(0.4, 0.55, 0.9))
+		_cal_cals[str(c["id"])] = c
+		i += 1
+	_cal_by_day = {}
+	for e in _cal_data.get("events", []):
+		var d0 := str(e["start"]).substr(0, 10)
+		var d1 := str(e["end"]).substr(0, 10)
+		var allday := bool(e.get("allday", false))
+		# All-day ends are exclusive; a timed event ending at 00:00 ends the day before.
+		if allday or str(e["end"]).substr(11, 5) == "00:00":
+			d1 = _cal_add(d1, -1)
+		if d1 < d0:
+			d1 = d0
+		var d := d0
+		var n := 0
+		while d <= d1 and n < 62:
+			if not _cal_by_day.has(d):
+				_cal_by_day[d] = []
+			_cal_by_day[d].append(e)
+			d = _cal_add(d, 1)
+			n += 1
+	for d in _cal_by_day:   # all-day first, then by start time
+		_cal_by_day[d].sort_custom(func(a, b):
+			if bool(a["allday"]) != bool(b["allday"]):
+				return bool(a["allday"])
+			return str(a["start"]) < str(b["start"]))
+	_bd_dirty = true
+
+
+func _cal_shown_cal(s: Dictionary, cal_id: String) -> bool:
+	var hide: Array = s.get("hidden_cals", [])
+	return not hide.has(cal_id)
+
+
+func _cal_events(s: Dictionary, day: String) -> Array:
+	var out := []
+	for e in _cal_by_day.get(day, []):
+		if _cal_shown_cal(s, str(e["cal"])):
+			out.append(e)
+	return out
+
+
+func _cal_color(cal_id: String) -> Color:
+	var c = _cal_cals.get(cal_id, null)
+	return c["col"] if c != null else Color(0.4, 0.55, 0.9)
+
+
+func _cal_tasks(s: Dictionary) -> Array:
+	var out := []
+	var show_done := bool(s.get("show_done", false))
+	for t in _cal_data.get("tasks", []):
+		if not _cal_shown_cal(s, str(t["cal"])):
+			continue
+		if bool(t.get("done", false)) and not show_done:
+			continue
+		out.append(t)
+	return out
+
+
+func _cal_task_op(op: String, id: String, text := "") -> void:
+	var dir := DIR + "/calendar"
+	DirAccess.make_dir_recursive_absolute(dir)
+	var out := dir + "/op-%d.json" % Time.get_ticks_msec()
+	var args := [_cal_helper(), "task", out, op, id]
+	if text != "":
+		args.append(text)
+	if _create_process("/usr/bin/python3", PackedStringArray(args)) != -1:
+		_cal_ops[out] = Time.get_ticks_msec()
+
+
+func _cal_task_add(s: Dictionary, text: String) -> void:
+	text = text.strip_edges()
+	if text == "":
+		return
+	var target := str(s.get("add_to", ""))
+	if target == "" or not _cal_cals.has(target):
+		target = ""
+		for c in _cal_data.get("calendars", []):
+			if bool(c.get("tasks", false)) and _cal_shown_cal(s, str(c["id"])):
+				target = str(c["id"])
+				break
+	if target == "":
+		_cal_err = "no reminders list to add to"
+		return
+	# Show it straight away; the next fetch replaces it with the real one.
+	_cal_data["tasks"].push_front({"id": target + "/pending-%d" % Time.get_ticks_msec(), "cal": target,
+		"title": text, "due": "", "done": false, "pending": true})
+	_cal_task_op("add", target, text)
+	_bd_dirty = true
+
+
+func _cal_google_auth() -> void:
+	var dir := DIR + "/calendar"
+	DirAccess.make_dir_recursive_absolute(dir)
+	var out := dir + "/google-auth.json"
+	if FileAccess.file_exists(out):
+		DirAccess.remove_absolute(out)
+	if _create_process("/usr/bin/python3", [_cal_helper(), "google-auth", out]) != -1:
+		_cal_auth = {"out": out, "t": Time.get_ticks_msec()}
+		_cal_err = "finish signing in to Google in the browser"
+
+
+# --- widgets ---
+
+func _cal_add_widget(kind: String, at: Vector2) -> void:
+	_bd_begin()
+	var s := _bd_new(kind)
+	var sz := Vector2(CAL_W, CAL_H) if kind == "calendar" else Vector2(CAL_REM_W, CAL_REM_H)
+	_bd_set_rect(s, Rect2(at - sz * 0.5, sz))
+	if kind == "calendar":
+		s["view"] = "month"
+		s["anchor"] = _cal_today()
+	_bd_add(s)
+	_bd_sel = [str(s["id"])]
+	_bd_commit()
+	_cal_refetch_at = Time.get_ticks_msec()
+
+
+func _cal_layout(s: Dictionary) -> Dictionary:
+	var r := _bd_rect(s)
+	var week := str(s.get("view", "month")) == "week"
+	var head := Rect2(r.position, Vector2(r.size.x, CAL_HEAD))
+	var gx := r.position.x + (CAL_GUTTER if week else 0.0)
+	var gw := r.size.x - (CAL_GUTTER if week else 0.0)
+	var cw := gw / 7.0
+	var dow := Rect2(gx, head.end.y, gw, CAL_DOW)
+	var area := Rect2(gx, dow.end.y, gw, maxf(r.end.y - dow.end.y, 10.0))
+	var cells := {}
+	var order := []
+	var d := _cal_first(s)
+	var rows := 1 if week else 6
+	var ch := area.size.y / rows
+	for i in _cal_ndays(s):
+		var rc := Rect2(gx + (i % 7) * cw, area.position.y + floori(i / 7.0) * ch, cw, ch)
+		cells[d] = rc
+		order.append(d)
+		d = _cal_add(d, 1)
+	var out := {"week": week, "head": head, "dow": dow, "area": area, "cells": cells, "order": order, "cw": cw}
+	if week:
+		out["allday"] = Rect2(gx, area.position.y, gw, CAL_ALLDAY)
+		out["grid"] = Rect2(gx, area.position.y + CAL_ALLDAY, gw, maxf(area.size.y - CAL_ALLDAY, 10.0))
+	return out
+
+
+func _cal_buttons(s: Dictionary) -> Array:   # [id, label, rect]
+	var r := _bd_rect(s)
+	var y := r.position.y + 8.0
+	var h := CAL_HEAD - 16.0
+	var x := r.end.x - 10.0
+	var out := []
+	var specs := [["next", "›", 28.0], ["prev", "‹", 28.0], ["today", "today", 54.0],
+		["week", "week", 50.0], ["month", "month", 56.0]]
+	for sp in specs:
+		x -= float(sp[2])
+		out.append([sp[0], sp[1], Rect2(x, y, float(sp[2]), h)])
+		x -= 4.0 if sp[0] != "today" else 12.0
+	return out
+
+
+func _cal_day_at(s: Dictionary, p: Vector2) -> String:
+	var L := _cal_layout(s)
+	for d: String in L["order"]:
+		if (L["cells"][d] as Rect2).has_point(p):
+			return d
+	return ""
+
+
+func _cal_shift(s: Dictionary, n: int) -> void:
+	var a := _cal_anchor(s)
+	s["anchor"] = _cal_add(a, 7 * n) if str(s.get("view", "month")) == "week" else _cal_month_add(a, n)
+
+
+func _cal_change(s: Dictionary, fn: Callable) -> void:
+	_bd_begin()
+	fn.call()
+	_cal_follow([str(s["id"])])
+	_bd_commit()
+
+
+# A click on a widget's own controls. False lets it fall through to select/drag.
+func _cal_click(s: Dictionary, p: Vector2, ev: InputEventMouseButton) -> bool:
+	p = _bd_local(s, p)
+	if str(s["type"]) == "reminders":
+		return _cal_rem_click(s, p)
+	for b in _cal_buttons(s):
+		if (b[2] as Rect2).has_point(p):
+			match str(b[0]):
+				"next":
+					_cal_change(s, func(): _cal_shift(s, 1))
+				"prev":
+					_cal_change(s, func(): _cal_shift(s, -1))
+				"today":
+					_cal_change(s, func(): s["anchor"] = _cal_today())
+				"week", "month":
+					_cal_change(s, func(): s["view"] = str(b[0]))
+			return true
+	if ev.double_click:   # a day opens its week; a week's day header goes back to its month
+		var d := _cal_day_at(s, p)
+		var L := _cal_layout(s)
+		if d != "" and not bool(L["week"]):
+			_cal_change(s, func():
+				s["view"] = "week"
+				s["anchor"] = d)
+			return true
+		if bool(L["week"]) and (L["dow"] as Rect2).has_point(p):
+			var i := int((p.x - (L["dow"] as Rect2).position.x) / float(L["cw"]))
+			_cal_change(s, func():
+				s["view"] = "month"
+				s["anchor"] = _cal_add(_cal_first(s), clampi(i, 0, 6)))
+			return true
+	return false
+
+
+# --- drawing ---
+
+func _cal_font(bold := false) -> Font:
+	return _bd_bm_font(bold)
+
+
+func _cal_box(col: Color, fill: bool, rad := 4.0) -> StyleBoxFlat:
+	var key := "%s/%s/%s" % [col.to_html(), fill, rad]
+	if not _cal_chip_boxes.has(key):
+		var sb := StyleBoxFlat.new()
+		sb.set_corner_radius_all(int(rad))
+		sb.anti_aliasing = true
+		if fill:
+			sb.bg_color = col
+		else:
+			sb.bg_color = Color(col.r, col.g, col.b, 0.18)
+			sb.border_width_left = 3
+			sb.border_color = col
+		_cal_chip_boxes[key] = sb
+	return _cal_chip_boxes[key]
+
+
+func _cal_draw_card(ci: CanvasItem, r: Rect2) -> void:
+	if not _cal_chip_boxes.has("card"):
+		var b := StyleBoxFlat.new()
+		b.anti_aliasing = true
+		b.set_corner_radius_all(8)
+		b.set_border_width_all(1)
+		b.bg_color = BD_BM_PANEL
+		b.border_color = BD_BM_EDGE
+		b.shadow_color = Color(0, 0, 0, 0.35)
+		b.shadow_size = 8
+		b.shadow_offset = Vector2(0, 3)
+		_cal_chip_boxes["card"] = b
+	ci.draw_style_box(_cal_chip_boxes["card"], r)
+
+
+func _cal_draw(ci: CanvasItem, s: Dictionary) -> void:
+	var r := _bd_rect(s)
+	var L := _cal_layout(s)
+	_cal_draw_card(ci, r)
+	var bold := _cal_font(true)
+	var f := _cal_font()
+	var head: Rect2 = L["head"]
+	ci.draw_string(bold, Vector2(r.position.x + 14.0, head.get_center().y + bold.get_ascent(CAL_TITLE_PX) * 0.38),
+		_cal_title(s), HORIZONTAL_ALIGNMENT_LEFT, r.size.x * 0.45, CAL_TITLE_PX, BD_BM_TEXT)
+	var view := str(s.get("view", "month"))
+	for b in _cal_buttons(s):
+		var br: Rect2 = b[2]
+		var on: bool = str(b[0]) == view
+		ci.draw_style_box(_cal_box(Color(1, 1, 1, 0.14) if on else Color(1, 1, 1, 0.05), true, 5.0), br)
+		ci.draw_string(f, Vector2(br.position.x, br.get_center().y + f.get_ascent(12) * 0.36), str(b[1]),
+			HORIZONTAL_ALIGNMENT_CENTER, br.size.x, 14 if str(b[1]).length() == 1 else 12,
+			BD_BM_TEXT if on else BD_BM_TEXT2)
+	var status := _cal_err
+	if status == "" and not _cal_fetching.is_empty() and _cal_data.get("events", []).is_empty():
+		status = "loading…"
+	if status != "":
+		var sx := r.position.x + 14.0 + bold.get_string_size(_cal_title(s), HORIZONTAL_ALIGNMENT_LEFT, -1, CAL_TITLE_PX).x + 14.0
+		var btn0: Rect2 = _cal_buttons(s).back()[2]
+		ci.draw_string(f, Vector2(sx, head.get_center().y + 4.0), status, HORIZONTAL_ALIGNMENT_LEFT,
+			maxf(btn0.position.x - sx - 8.0, 0.0), 11, Color(0.95, 0.6, 0.45) if _cal_err != "" else CAL_DIM)
+	ci.draw_line(Vector2(r.position.x, head.end.y), Vector2(r.end.x, head.end.y), BD_BM_DIVIDER, 1.0)
+	var dow: Rect2 = L["dow"]
+	var cw: float = L["cw"]
+	var first := _cal_first(s)
+	var today := _cal_today()
+	for i in 7:
+		var label: String = CAL_DOW_NAMES[i]
+		var col := CAL_DIM
+		if bool(L["week"]):
+			var d := _cal_add(first, i)
+			label = "%s %d" % [label, int(d.substr(8, 2))]
+			if d == today:
+				col = CAL_TODAY
+		ci.draw_string(f, Vector2(dow.position.x + i * cw, dow.get_center().y + 4.0), label,
+			HORIZONTAL_ALIGNMENT_CENTER, cw, 11, col)
+	if bool(L["week"]):
+		_cal_draw_week(ci, s, L)
+	else:
+		_cal_draw_month(ci, s, L)
+
+
+func _cal_draw_month(ci: CanvasItem, s: Dictionary, L: Dictionary) -> void:
+	var f := _cal_font()
+	var bold := _cal_font(true)
+	var month := _cal_anchor(s).substr(0, 7)
+	var today := _cal_today()
+	var area: Rect2 = L["area"]
+	for d: String in L["order"]:
+		var c: Rect2 = L["cells"][d]
+		var inside := d.substr(0, 7) == month
+		if not inside:
+			ci.draw_rect(c, Color(0, 0, 0, 0.12))
+		ci.draw_rect(c, CAL_LINE, false, 1.0)
+		var num := str(int(d.substr(8, 2)))
+		var np := Vector2(c.position.x + 7.0, c.position.y + 5.0 + f.get_ascent(CAL_DAY_PX))
+		if d == today:
+			ci.draw_circle(np + Vector2(bold.get_string_size(num, HORIZONTAL_ALIGNMENT_LEFT, -1, CAL_DAY_PX).x * 0.5, -4.5), 11.0, CAL_TODAY)
+			ci.draw_string(bold, np, num, HORIZONTAL_ALIGNMENT_LEFT, -1, CAL_DAY_PX, Color.WHITE)
+		else:
+			ci.draw_string(f, np, num, HORIZONTAL_ALIGNMENT_LEFT, -1, CAL_DAY_PX, BD_BM_TEXT if inside else CAL_DIM)
+		var evs := _cal_events(s, d)
+		var y := c.position.y + 24.0
+		var room := int((c.end.y - y - 2.0) / (CAL_CHIP + 2.0))
+		for i in evs.size():
+			if i >= room - 1 and evs.size() > room:
+				ci.draw_string(f, Vector2(c.position.x + 6.0, y + 12.0), "+%d more" % (evs.size() - i),
+					HORIZONTAL_ALIGNMENT_LEFT, c.size.x - 10.0, CAL_CHIP_PX, CAL_DIM)
+				break
+			_cal_chip(ci, Rect2(c.position.x + 3.0, y, c.size.x - 6.0, CAL_CHIP), evs[i], true)
+			y += CAL_CHIP + 2.0
+	ci.draw_rect(area, CAL_LINE, false, 1.0)
+
+
+func _cal_chip(ci: CanvasItem, r: Rect2, e: Dictionary, with_time: bool) -> void:
+	var col := _cal_color(str(e["cal"]))
+	var allday := bool(e.get("allday", false))
+	ci.draw_style_box(_cal_box(col, allday, 3.0), r)
+	var f := _cal_font()
+	var text := str(e.get("title", ""))
+	if with_time and not allday:
+		text = "%s %s" % [str(e["start"]).substr(11, 5), text]
+	var tc := Color.WHITE if allday else BD_BM_TEXT
+	var pad := 5.0 if allday else 7.0
+	ci.draw_string(f, Vector2(r.position.x + pad, r.position.y + r.size.y * 0.5 + f.get_ascent(CAL_CHIP_PX) * 0.38),
+		text, HORIZONTAL_ALIGNMENT_LEFT, maxf(r.size.x - pad - 3.0, 1.0), CAL_CHIP_PX, tc)
+
+
+func _cal_draw_week(ci: CanvasItem, s: Dictionary, L: Dictionary) -> void:
+	var f := _cal_font()
+	var r := _bd_rect(s)
+	var grid: Rect2 = L["grid"]
+	var ad: Rect2 = L["allday"]
+	var cw: float = L["cw"]
+	var hours := CAL_HOUR1 - CAL_HOUR0
+	var hh := grid.size.y / hours
+	var today := _cal_today()
+	ci.draw_line(Vector2(r.position.x, ad.end.y), Vector2(r.end.x, ad.end.y), BD_BM_DIVIDER, 1.0)
+	for h in range(hours + 1):
+		var y := grid.position.y + h * hh
+		ci.draw_line(Vector2(grid.position.x, y), Vector2(grid.end.x, y), CAL_LINE, 1.0)
+		if h < hours:
+			ci.draw_string(f, Vector2(r.position.x, y + 13.0), "%02d:00" % (CAL_HOUR0 + h),
+				HORIZONTAL_ALIGNMENT_CENTER, CAL_GUTTER, 10, CAL_DIM)
+	for i in 8:
+		var x := grid.position.x + i * cw
+		ci.draw_line(Vector2(x, ad.position.y), Vector2(x, grid.end.y), CAL_LINE, 1.0)
+	var i := 0
+	for d: String in L["order"]:
+		var col := Rect2(grid.position.x + i * cw, grid.position.y, cw, grid.size.y)
+		if d == today:
+			ci.draw_rect(Rect2(col.position.x, ad.position.y, cw, ad.size.y + grid.size.y), Color(CAL_TODAY.r, CAL_TODAY.g, CAL_TODAY.b, 0.06))
+		var evs := _cal_events(s, d)
+		var allday := evs.filter(func(e): return bool(e["allday"]))
+		var timed := evs.filter(func(e): return not bool(e["allday"]))
+		var ay := ad.position.y + 2.0
+		for k in allday.size():
+			if k == 1 and allday.size() > 2:
+				ci.draw_string(f, Vector2(col.position.x + 4.0, ay + 12.0), "+%d more" % (allday.size() - 1),
+					HORIZONTAL_ALIGNMENT_LEFT, cw - 6.0, CAL_CHIP_PX, CAL_DIM)
+				break
+			_cal_chip(ci, Rect2(col.position.x + 2.0, ay, cw - 4.0, CAL_CHIP), allday[k], false)
+			ay += CAL_CHIP + 2.0
+		# Overlapping events share the column side by side, each cluster of
+		# overlaps split only as many ways as it needs.
+		var lanes: Array = []   # end minute of the last event in each lane
+		var placed := []
+		var cluster := []
+		var cluster_end := -1.0
+		for e: Dictionary in timed:
+			var m0 := _cal_minutes(str(e["start"])) if str(e["start"]).substr(0, 10) == d else 0.0
+			var m1 := _cal_minutes(str(e["end"])) if str(e["end"]).substr(0, 10) == d else 1440.0
+			m1 = maxf(m1, m0 + 20.0)
+			if m0 >= cluster_end:
+				for pl in cluster:
+					pl.append(lanes.size())
+				cluster = []
+				lanes = []
+			var lane := -1
+			for li in lanes.size():
+				if float(lanes[li]) <= m0:
+					lane = li
+					break
+			if lane == -1:
+				lanes.append(m1)
+				lane = lanes.size() - 1
+			else:
+				lanes[lane] = m1
+			var pl := [e, m0, m1, lane]
+			cluster.append(pl)
+			placed.append(pl)
+			cluster_end = maxf(cluster_end, m1)
+		for pl in cluster:
+			pl.append(lanes.size())
+		for pl in placed:
+			var y0 := grid.position.y + clampf((float(pl[1]) / 60.0 - CAL_HOUR0) * hh, 0.0, grid.size.y - 8.0)
+			var y1 := grid.position.y + clampf((float(pl[2]) / 60.0 - CAL_HOUR0) * hh, 8.0, grid.size.y)
+			var lw := (cw - 4.0) / maxi(int(pl[4]), 1)
+			var er := Rect2(col.position.x + 2.0 + int(pl[3]) * lw, y0 + 1.0, lw - 2.0, maxf(y1 - y0 - 2.0, 12.0))
+			var e: Dictionary = pl[0]
+			var c := _cal_color(str(e["cal"]))
+			ci.draw_style_box(_cal_box(c, false, 3.0), er)
+			var tx := er.position.x + 6.0
+			var tw := maxf(er.size.x - 8.0, 1.0)
+			ci.draw_string(f, Vector2(tx, er.position.y + 12.0), str(e.get("title", "")), HORIZONTAL_ALIGNMENT_LEFT, tw, CAL_CHIP_PX, BD_BM_TEXT)
+			if er.size.y > 30.0:
+				var when := "%s – %s" % [str(e["start"]).substr(11, 5), str(e["end"]).substr(11, 5)]
+				ci.draw_string(f, Vector2(tx, er.position.y + 25.0), when, HORIZONTAL_ALIGNMENT_LEFT, tw, CAL_CHIP_PX - 1, CAL_DIM)
+		i += 1
+	# Now-line.
+	var now := Time.get_datetime_dict_from_system()
+	var ti: int = L["order"].find(today)
+	if ti != -1:
+		var nm := float(now["hour"]) * 60.0 + float(now["minute"])
+		var y := grid.position.y + (nm / 60.0 - CAL_HOUR0) * hh
+		if y >= grid.position.y and y <= grid.end.y:
+			var x0 := grid.position.x + ti * cw
+			ci.draw_line(Vector2(x0, y), Vector2(x0 + cw, y), Color(0.95, 0.35, 0.35), 2.0)
+			ci.draw_circle(Vector2(x0, y), 4.0, Color(0.95, 0.35, 0.35))
+
+
+# --- reminders ---
+
+func _cal_rem_layout(s: Dictionary) -> Dictionary:
+	var r := _bd_rect(s)
+	var head := Rect2(r.position, Vector2(r.size.x, CAL_HEAD))
+	var toggle := Rect2(r.end.x - 92.0, r.position.y + 8.0, 82.0, CAL_HEAD - 16.0)
+	var y := head.end.y + 4.0
+	var room := int((r.end.y - y - CAL_ROW - 6.0) / CAL_ROW)
+	var tasks := _cal_tasks(s)
+	var rows := []
+	for i in mini(tasks.size(), maxi(room, 0)):
+		rows.append([tasks[i], Rect2(r.position.x + 10.0, y, r.size.x - 20.0, CAL_ROW)])
+		y += CAL_ROW
+	var more := tasks.size() - rows.size()
+	var add := Rect2(r.position.x + 10.0, y, r.size.x - 20.0, CAL_ROW)
+	return {"head": head, "toggle": toggle, "rows": rows, "more": more, "add": add}
+
+
+func _cal_rem_click(s: Dictionary, p: Vector2) -> bool:
+	var L := _cal_rem_layout(s)
+	if (L["toggle"] as Rect2).has_point(p):
+		_bd_begin()
+		s["show_done"] = not bool(s.get("show_done", false))
+		_bd_commit()
+		return true
+	for row in L["rows"]:
+		var rr: Rect2 = row[1]
+		if rr.has_point(p) and p.x < rr.position.x + 26.0:
+			var t: Dictionary = row[0]
+			if bool(t.get("pending", false)):
+				return true
+			t["done"] = not bool(t.get("done", false))
+			_cal_task_op("done" if bool(t["done"]) else "undone", str(t["id"]))
+			_bd_dirty = true
+			return true
+	if (L["add"] as Rect2).has_point(p):
+		_bd_start_edit(str(s["id"]), -4)
+		return true
+	return false
+
+
+func _cal_due_label(due: String) -> Array:   # [text, overdue?]
+	if due == "":
+		return ["", false]
+	var d := due.substr(0, 10)
+	var today := _cal_today()
+	var t := ""
+	if d == today:
+		t = "today"
+	elif d == _cal_add(today, 1):
+		t = "tomorrow"
+	elif d == _cal_add(today, -1):
+		t = "yesterday"
+	else:
+		t = "%d %s" % [int(d.substr(8, 2)), CAL_MONTHS[int(d.substr(5, 2)) - 1].substr(0, 3)]
+	if due.length() > 10 and due.substr(11, 5) != "00:00":
+		t += " " + due.substr(11, 5)
+	return [t, d < today]
+
+
+func _cal_draw_rem(ci: CanvasItem, s: Dictionary) -> void:
+	var r := _bd_rect(s)
+	var L := _cal_rem_layout(s)
+	_cal_draw_card(ci, r)
+	var f := _cal_font()
+	var bold := _cal_font(true)
+	var head: Rect2 = L["head"]
+	var open := 0
+	for t in _cal_tasks(s):
+		if not bool(t.get("done", false)):
+			open += 1
+	ci.draw_string(bold, Vector2(r.position.x + 14.0, head.get_center().y + 6.0), "Reminders",
+		HORIZONTAL_ALIGNMENT_LEFT, -1, CAL_TITLE_PX, BD_BM_TEXT)
+	var tw := bold.get_string_size("Reminders", HORIZONTAL_ALIGNMENT_LEFT, -1, CAL_TITLE_PX).x
+	var sub := _cal_err if _cal_err != "" else ("loading…" if _cal_loaded["at"] == 0 else str(open))
+	ci.draw_string(f, Vector2(r.position.x + 22.0 + tw, head.get_center().y + 5.0), sub,
+		HORIZONTAL_ALIGNMENT_LEFT, maxf((L["toggle"] as Rect2).position.x - r.position.x - 30.0 - tw, 1.0), 12,
+		Color(0.95, 0.6, 0.45) if _cal_err != "" else CAL_DIM)
+	var tg: Rect2 = L["toggle"]
+	var show_done := bool(s.get("show_done", false))
+	ci.draw_style_box(_cal_box(Color(1, 1, 1, 0.14) if show_done else Color(1, 1, 1, 0.05), true, 5.0), tg)
+	ci.draw_string(f, Vector2(tg.position.x, tg.get_center().y + 4.0), "show done", HORIZONTAL_ALIGNMENT_CENTER,
+		tg.size.x, 11, BD_BM_TEXT if show_done else BD_BM_TEXT2)
+	ci.draw_line(Vector2(r.position.x, head.end.y), Vector2(r.end.x, head.end.y), BD_BM_DIVIDER, 1.0)
+	for row in L["rows"]:
+		var t: Dictionary = row[0]
+		var rr: Rect2 = row[1]
+		var col := _cal_color(str(t["cal"]))
+		var done := bool(t.get("done", false))
+		var cy := rr.get_center().y
+		var box := Rect2(rr.position.x + 2.0, cy - 8.0, 16.0, 16.0)
+		if done:
+			ci.draw_style_box(_cal_box(col, true, 8.0), box)
+			ci.draw_polyline(PackedVector2Array([box.position + Vector2(4.5, 8.5), box.position + Vector2(7.2, 11.2),
+				box.position + Vector2(11.8, 5.2)]), Color.WHITE, 1.8, true)
+		else:
+			ci.draw_arc(box.get_center(), 7.5, 0, TAU, 24, col, 1.6, true)
+		var due: Array = _cal_due_label(str(t.get("due", "")))
+		var dw := 0.0
+		if str(due[0]) != "":
+			dw = f.get_string_size(str(due[0]), HORIZONTAL_ALIGNMENT_LEFT, -1, 11).x + 6.0
+			ci.draw_string(f, Vector2(rr.end.x - dw + 6.0, cy + 4.0), str(due[0]), HORIZONTAL_ALIGNMENT_LEFT, -1, 11,
+				Color(0.95, 0.45, 0.4) if bool(due[1]) and not done else CAL_DIM)
+		var tc := CAL_DIM if done or bool(t.get("pending", false)) else BD_BM_TEXT
+		var title := str(t.get("title", ""))
+		var avail := rr.size.x - 28.0 - dw
+		ci.draw_string(f, Vector2(rr.position.x + 26.0, cy + 5.0), title, HORIZONTAL_ALIGNMENT_LEFT, avail, 13, tc)
+		if done:
+			var sw := minf(f.get_string_size(title, HORIZONTAL_ALIGNMENT_LEFT, -1, 13).x, avail)
+			ci.draw_line(Vector2(rr.position.x + 26.0, cy + 1.0), Vector2(rr.position.x + 26.0 + sw, cy + 1.0), tc, 1.2)
+	var ar: Rect2 = L["add"]
+	if int(L["more"]) > 0:
+		ci.draw_string(f, Vector2(ar.position.x + 26.0, ar.position.y - 4.0), "+%d more" % int(L["more"]),
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, CAL_DIM)
+	if not (str(s["id"]) == _bd_edit_id and _bd_edit_part == -4):
+		ci.draw_string(f, Vector2(ar.position.x + 26.0, ar.get_center().y + 5.0), "+ add reminder",
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color(1, 1, 1, 0.35))
+
+
+# --- pins: annotations that live on a day ---
+
+func _bd_shown(s: Dictionary) -> bool:
+	return not bool(s.get("hidden", false))
+
+
+func _cal_pinnable(s: Dictionary) -> bool:
+	return not (str(s["type"]) in ["calendar", "reminders", "frame"])
+
+
+# The shape's geometry in the calendar's own (unrotated) frame.
+func _cal_to_local(c: Dictionary, p: Vector2) -> Vector2:
+	return _bd_local(c, p)
+
+
+func _cal_norm(cell: Rect2, p: Vector2) -> Array:
+	return [snappedf((p.x - cell.position.x) / cell.size.x, 0.0001), snappedf((p.y - cell.position.y) / cell.size.y, 0.0001)]
+
+
+func _cal_denorm(c: Dictionary, cell: Rect2, a) -> Vector2:
+	return _bd_xform(c) * (cell.position + Vector2(float(a[0]), float(a[1])) * cell.size)
+
+
+func _cal_local_bounds(c: Dictionary, s: Dictionary) -> Rect2:
+	var b := _bd_bounds(s)
+	return _bd_pts_bounds(PackedVector2Array([_cal_to_local(c, b.position), _cal_to_local(c, Vector2(b.end.x, b.position.y)),
+		_cal_to_local(c, b.end), _cal_to_local(c, Vector2(b.position.x, b.end.y))]))
+
+
+func _cal_capture(s: Dictionary, c: Dictionary) -> bool:
+	var L := _cal_layout(c)
+	var lb := _cal_local_bounds(c, s)
+	if not (L["area"] as Rect2).grow(CAL_PIN_SLACK).encloses(lb):
+		return false
+	var mid := lb.get_center()
+	var day := ""
+	for d: String in L["order"]:
+		if (L["cells"][d] as Rect2).grow(0.5).has_point(mid):
+			day = d
+			break
+	if day == "":
+		return false
+	var cell: Rect2 = L["cells"][day]
+	var pin := {"cal": str(c["id"]), "day": day}
+	match str(s["type"]):
+		"arrow":
+			pin["a"] = _cal_norm(cell, _cal_to_local(c, _bd_v(s["a"])))
+			pin["b"] = _cal_norm(cell, _cal_to_local(c, _bd_v(s["b"])))
+		"line", "draw":
+			var pts := []
+			for q in s.get("points", []):
+				pts.append(_cal_norm(cell, _cal_to_local(c, _bd_v(q))))
+			pin["pts"] = pts
+		_:
+			var r := _bd_rect(s)
+			pin["mid"] = _cal_norm(cell, _cal_to_local(c, r.get_center()))
+			pin["size"] = [snappedf(r.size.x / cell.size.x, 0.0001), snappedf(r.size.y / cell.size.y, 0.0001)]
+			pin["rot"] = _bd_rot(s) - _bd_rot(c)
+	s["pin"] = pin
+	s.erase("hidden")
+	return true
+
+
+# Put a pinned shape where its day is now, or hide it if the day isn't showing.
+func _cal_apply(s: Dictionary) -> void:
+	var pin = s.get("pin", null)
+	if typeof(pin) != TYPE_DICTIONARY:
+		return
+	var c = _bd_by_id.get(str(pin.get("cal", "")), null)
+	if c == null or str(c["type"]) != "calendar":
+		s.erase("pin")
+		s.erase("hidden")
+		return
+	var L := _cal_layout(c)
+	var day := str(pin.get("day", ""))
+	if not L["cells"].has(day):
+		s["hidden"] = true
+		return
+	s.erase("hidden")
+	var cell: Rect2 = L["cells"][day]
+	match str(s["type"]):
+		"arrow":
+			s["a"] = _bd_a(_cal_denorm(c, cell, pin["a"]))
+			s["b"] = _bd_a(_cal_denorm(c, cell, pin["b"]))
+		"line", "draw":
+			var pts := []
+			for q in pin.get("pts", []):
+				pts.append(_bd_a(_cal_denorm(c, cell, q)))
+			s["points"] = pts
+		_:
+			var mid := _cal_denorm(c, cell, pin["mid"])
+			var size := _bd_rect(s).size
+			if str(s["type"]) != "text":   # text keeps its own size; it just moves
+				size = Vector2(float(pin["size"][0]) * cell.size.x, float(pin["size"][1]) * cell.size.y)
+			_bd_set_rect(s, Rect2(mid - size * 0.5, size))
+			if _bd_is_box(s):
+				var rot := float(pin.get("rot", 0.0)) + _bd_rot(c)
+				if rot == 0.0:
+					s.erase("rot")
+				else:
+					s["rot"] = rot
+
+
+# Rounded to whole units: a pin's 0..1 coordinates don't round-trip exactly.
+func _cal_geom_sig(s: Dictionary) -> String:
+	var g := PackedStringArray()
+	for k in ["x", "y", "w", "h", "a", "b", "points"]:
+		if s.has(k):
+			_cal_flat(s[k], g)
+	g.append(str(snappedf(float(s.get("rot", 0.0)), 0.001)))
+	return ",".join(g)
+
+
+func _cal_flat(v, out: PackedStringArray) -> void:
+	if typeof(v) == TYPE_ARRAY:
+		for x in v:
+			_cal_flat(x, out)
+	else:
+		out.append(str(roundi(float(v))))
+
+
+func _cal_follow(ids: Array) -> void:
+	var cals := []
+	for i in ids:
+		var c = _bd_by_id.get(i, null)
+		if c != null and str(c["type"]) == "calendar":
+			cals.append(str(i))
+			_cal_seen[str(i)] = _cal_sig(c)
+	if cals.is_empty():
+		return
+	for s in _bd_shapes:
+		var pin = s.get("pin", null)
+		if typeof(pin) == TYPE_DICTIONARY and cals.has(str(pin.get("cal", ""))):
+			_cal_apply(s)
+	_bd_dirty = true
+
+
+func _cal_sig(c: Dictionary) -> String:
+	return "%s|%s|%s" % [_cal_geom_sig(c), str(c.get("view", "")), str(c.get("anchor", ""))]
+
+
+func _cal_apply_all() -> void:
+	_cal_seen = {}
+	for s in _bd_shapes:
+		if str(s["type"]) == "calendar":
+			_cal_seen[str(s["id"])] = _cal_sig(s)
+		elif s.has("pin"):
+			_cal_apply(s)
+
+
+# At every commit: a pinned shape whose geometry no longer matches its pin was
+# moved by you, so it re-pins where it landed (or comes loose off the calendar);
+# a free shape dropped onto a calendar's days pins there.
+func _cal_sync_pins() -> void:
+	var cals := []
+	var moved := []
+	for s in _bd_shapes:
+		if str(s["type"]) == "calendar":
+			cals.push_front(s)   # topmost first
+			if str(_cal_seen.get(str(s["id"]), "")) != _cal_sig(s):
+				moved.append(str(s["id"]))
+	_cal_follow(moved)   # a calendar that moved/turned a page takes its days' shapes along first
+	for s in _bd_shapes:
+		if not _cal_pinnable(s):
+			continue
+		if s.has("pin"):
+			if not _bd_shown(s):
+				var c0 = _bd_by_id.get(str(s["pin"].get("cal", "")), null)
+				if c0 == null:
+					s.erase("pin")
+					s.erase("hidden")
+				continue
+			var before := _cal_geom_sig(s)
+			var probe: Dictionary = s.duplicate(true)
+			_cal_apply(probe)
+			if not probe.has("pin"):
+				s.erase("pin")
+				s.erase("hidden")
+			elif _cal_geom_sig(probe) == before:
+				continue
+			else:
+				s.erase("pin")
+		if cals.is_empty():
+			continue
+		for c in cals:
+			if _cal_capture(s, c):
+				break
+
+
+# Right-click ▸ Calendars / Lists: which calendars (or reminder lists) this widget shows.
+func _cal_list_menu(w: Dictionary) -> PopupMenu:
+	var sub: PopupMenu = _bd_menu.get_node_or_null("callists")
+	if sub == null:
+		sub = PopupMenu.new()
+		sub.name = "callists"
+		sub.hide_on_checkable_item_selection = false
+		sub.id_pressed.connect(_cal_list_pick)
+		_bd_menu.add_child(sub)
+	sub.clear()
+	sub.content_scale_factor = _bd_ui_scale
+	var want := "events" if str(w["type"]) == "calendar" else "tasks"
+	var i := 0
+	for c in _cal_data.get("calendars", []):
+		if not bool(c.get(want, false)):
+			continue
+		sub.add_check_item("%s  (%s)" % [str(c["name"]), str(c.get("source", ""))], 200 + i)
+		sub.set_item_metadata(sub.item_count - 1, [str(w["id"]), str(c["id"])])
+		sub.set_item_checked(sub.item_count - 1, _cal_shown_cal(w, str(c["id"])))
+		i += 1
+	if i == 0:
+		sub.add_item("(nothing loaded yet)", 199)
+		sub.set_item_disabled(0, true)
+	return sub
+
+
+func _cal_list_pick(id: int) -> void:
+	var sub: PopupMenu = _bd_menu.get_node_or_null("callists")
+	if sub == null:
+		return
+	var idx := sub.get_item_index(id)
+	var meta = sub.get_item_metadata(idx)
+	if typeof(meta) != TYPE_ARRAY:
+		return
+	var w = _bd_by_id.get(str(meta[0]), null)
+	if w == null:
+		return
+	_bd_begin()
+	var hide: Array = w.get("hidden_cals", []).duplicate()
+	if hide.has(str(meta[1])):
+		hide.erase(str(meta[1]))
+	else:
+		hide.append(str(meta[1]))
+	w["hidden_cals"] = hide
+	_bd_commit()
+	sub.set_item_checked(idx, not hide.has(str(meta[1])))

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key><string>me.kirancodes.cove.reminders</string>
+	<key>CFBundleName</key><string>cove-reminders</string>
+	<key>NSRemindersUsageDescription</key><string>The Cove shows your reminders on its board.</string>
+	<key>NSRemindersFullAccessUsageDescription</key><string>The Cove shows your reminders on its board and lets you tick them off.</string>
+	<key>NSCalendarsUsageDescription</key><string>The Cove can show your macOS calendars on its board.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key><string>The Cove can show your macOS calendars on its board.</string>
+</dict>
+</plist>
