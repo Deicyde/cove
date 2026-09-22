@@ -11,16 +11,37 @@ import os
 import socket
 import sys
 import threading
+import time
 
 SOCK = sys.argv[1] if len(sys.argv) > 1 else "/tmp/vibefox/control.sock"
+LOG = os.environ.get("COVE_VIBEFOX_LOG", "/tmp/cove-vibefox.log")
+LOG_MAX = 256 * 1024
 _lock = threading.Lock()
+_log_lock = threading.Lock()
 _sock = None
+
+
+def log(direction, text):
+    """Both halves of the conversation, so a dead input path is one file away."""
+    try:
+        with _log_lock:
+            if os.path.exists(LOG) and os.path.getsize(LOG) > LOG_MAX:
+                os.remove(LOG)
+            with open(LOG, "a") as f:
+                f.write("%s %s %s\n" % (time.strftime("%H:%M:%S"), direction, text[:400]))
+    except OSError:
+        pass
 
 
 def _drain(s):
     try:
-        while s.recv(65536):
-            pass
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            for line in chunk.decode("utf-8", "replace").splitlines():
+                if line.strip():
+                    log("<--", line.strip())
     except OSError:
         pass
     with _lock:
@@ -53,9 +74,11 @@ def _send(line):
         with _lock:
             s = _connect()
         if s is None:
+            log("!!!", "no connection to %s; dropped: %s" % (SOCK, line.decode("utf-8", "replace").strip()))
             return
         try:
             s.sendall(line)
+            log("-->", line.decode("utf-8", "replace").strip())
             return
         except OSError:
             with _lock:
@@ -67,7 +90,11 @@ def _send(line):
                 pass
 
 
-for raw in sys.stdin.buffer:
+while True:
+    raw = sys.stdin.buffer.readline()
+    if not raw:
+        break
     line = raw.strip()
     if line:
         _send(line + b"\n")
+time.sleep(0.3)   # let the drain thread log the last replies before we go

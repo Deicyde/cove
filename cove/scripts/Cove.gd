@@ -160,6 +160,8 @@ var _vf_retry := 0.0              # seconds until we try to respawn a dead bridg
 var _vf_seq := 0                  # "id" on each control-socket request
 var _page_meta := {}              # term id -> {title, url, tab} from term-<N>.json
 var _page_meta_accum := 1.0       # re-read the sidecars about once a second
+var _page_focus := {}             # term id -> last focus state sent to Vibefox
+var _app_focused := true          # does the Cove's own window have the OS focus
 var _press_dbl := false           # the current press was a double-click (skip its click)
 var _search_sel := 0          # highlighted row index
 var _search_awaiting := ""    # query we're waiting on cove-find for ("" = idle)
@@ -251,7 +253,19 @@ func _set_window_icon() -> void:
 		DisplayServer.set_icon(tex.get_image())
 
 
+# The Cove window gaining/losing the OS focus is context Vibefox uses to decide
+# when it's safe to hide a mirrored tab, so page critters hear about it.
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_APPLICATION_FOCUS_IN or what == NOTIFICATION_APPLICATION_FOCUS_OUT:
+		_app_focused = what == NOTIFICATION_APPLICATION_FOCUS_IN
+
+
 func _exit_tree() -> void:
+	# Never leave a mirrored tab hidden because the Cove went away.
+	for id in _groups:
+		var t = _groups[id].terminal
+		if t.page:
+			_page_input(t.pane_id, "focus", {"focused": false, "cove_focused": false})
 	_ls_run = false
 	if _ls_thread and _ls_thread.is_started():
 		_ls_thread.wait_to_finish()
@@ -303,6 +317,7 @@ func _process(delta: float) -> void:
 	if _sock != null and not _sock.call("is_connected") and _input_tries < 100:
 		_try_connect_sock()
 	_tick_vibefox(delta)
+	_sync_page_focus()
 	_apply_agent_state()
 	_apply_follows()
 	_poll_handoff()
@@ -2354,6 +2369,25 @@ func _vf_send(cmd: String, args: Dictionary) -> void:
 
 func _page_input(pane: int, kind: String, data: Dictionary) -> void:
 	_vf_send("critter.input", {"id": pane, "kind": kind, "data": data})
+
+
+# Tell Vibefox which page critter the user is working in, so it can keep the
+# mirrored tab out of Firefox's tab strip until someone's actually looking at it.
+# "focused" is the Cove's own focus and doesn't lapse when the Cove window loses
+# the OS focus; "cove_focused" carries that separately. Sent on change only.
+func _sync_page_focus() -> void:
+	for id in _groups:
+		var t = _groups[id].terminal
+		if not t.page:
+			continue
+		var st := [id == _focused_id, _app_focused]
+		if _page_focus.get(id, null) == st:
+			continue
+		_page_focus[id] = st
+		_page_input(t.pane_id, "focus", {"focused": st[0], "cove_focused": st[1]})
+	for id in _page_focus.keys():
+		if not _groups.has(id):
+			_page_focus.erase(id)
 
 
 # A click on the page, in critter (frame) pixels. button: 0 left, 1 middle, 2 right.
