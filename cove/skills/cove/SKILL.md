@@ -1,13 +1,14 @@
 ---
 name: cove
-description: Work inside the Cove, the user's board of live terminals ("termlings"). Use when you're running in a Cove termling (COVE=1) and want to tell the user your status, name your own termling, put yourself in a frame, keep your own notes or todo lists on the board, or look up other termlings. Agents never move termlings or change focus; the user arranges the board.
+description: Work inside the Cove, the user's board of live terminals ("termlings"). Use when you're running in a Cove termling (COVE=1) and want to tell the user your status, name your own termling, put yourself in a frame, keep your own notes or todo lists on the board, or look up other termlings, or orchestrate child termlings (spawn agents into frames, type into them, wait for them, screenshot the board). Agents never move the user's termlings or change focus; the user arranges the board.
 ---
 # The Cove
 
 The Cove is the user's board of live terminals. Each terminal is a **termling**
 that sits on a tldraw-style board next to the user's frames, boxes, text and
 arrows. **The user owns the layout and their attention.** You never move
-termlings, change focus, or drive the camera. You describe yourself, and the
+their termlings, change focus, or drive the camera. The exception is termlings
+*you* spawned (see Orchestrating). You describe yourself, and the
 Cove decides how to show it.
 
 The `cove` MCP server is already registered. Everything acts on your own
@@ -69,6 +70,45 @@ you (and the user) can change them.
 
 Keep it tidy: update one todo list as you go rather than adding new notes, and
 delete your notes when the work is done if they're no longer useful.
+
+## Orchestrating child termlings
+
+You can spawn agents as termlings instead of hidden subagents, so the user can
+watch every one on the board and step in. You own what you spawn (and what they
+spawn); only those can you drive. `cove-team` is the general workflow (tasks →
+frames → termlings → steer); `iterate-pr` is the PR version.
+
+- **`spawn(name, frame?, cwd?, command?, prompt?, link?, link_text?)`**:
+  a new termling in `frame` (with no frame, it gets a small frame of its own in
+  free space beside you), with a dashed grey arrow from your termling to it. `command` runs in
+  its shell, e.g. `claude` (a claude child is shift+tabbed into auto mode unless
+  `auto_mode=false`), and its folder-trust dialog is accepted when `cwd` is your
+  own repo or a worktree of it (otherwise `trust_prompt: true`: ask the user).
+  `prompt` becomes that agent's first message. Returns
+  `{id, session, rect, zone}`.
+- **`send(to, text?, enter?, keys?)`**: type into a child. Multi-line text is
+  pasted, then Enter. `keys=["ctrl+c"]` / `["escape"]` for single keys.
+- **`read(id, lines?, all?)`**: any termling's screen text.
+- **`wait(ids?, mode?, timeout?)`**: block until a child ends a turn (its Stop
+  hook), needs input (Notification), `report`s, or exits, counting only what
+  happened since your last `send`. Returns the event, reports and screen tail.
+  `timed_out` means call it again.
+- **`report(text, state?)`**: a child tells its parent how it went. Lead with
+  the verdict (`APPROVED: …`).
+- **`children`**: your descendants (alive, frame, last event) and reports.
+- **`place(id, frame? | pos?, teleport?)`** / **`kill(id)`**: move a child into
+  a frame; close it (and its descendants and your arrow to it).
+
+Laying out: **`add_frame(title, w, h, x?, y?, near?, inside?)`** draws a titled
+frame you own, in free space when you omit x/y (`inside` nests it in another
+frame). **`find_space(w, h, near?, inside?)`** finds room without placing
+anything. **`screenshot(target?)`** returns a PNG of a termling, a shape or
+frame, an `[x,y,w,h]` world rect, or the user's `view`, without moving their
+camera. Look after you lay things out, and fix overlaps with
+`update_note(id, x, y, w, h)`. A termling's screen is about 330×185 world units,
+and its crew stand below it, so a frame for three side by side is about 1300×480.
+
+No strays: every child goes in a frame, and you kill children whose job is done.
 
 ## Notes
 

@@ -10,6 +10,7 @@ const MAGIC := 0x4B4D454E
 const HEADER := 64
 const FLAG_BOTTOM_UP := 0x1
 const FLAG_PAGE := 0x10000  # a Vibefox page critter (a browser tab), not a kitty pane
+const FLAG_EMACS := 0x20000  # a Vibemacs frame; header [60] = backing scale * 100
 
 # On-screen pixels per native terminal pixel. Resizing (changing cols/rows)
 # grows/shrinks the whole window rather than rescaling the text. kitty renders at
@@ -29,13 +30,17 @@ var zoom := BASE_ZOOM
 
 var term_id := -1        # kitty OS-window id (from the file name)
 var pane_id := 0         # kitty window/pane id (for `@ --match id:`)
+var force_read := false  # read frames even off-screen (a board screenshot is looking)
 var frame_path := ""
 var custom_name := ""    # user/agent-assigned name shown on the nameplate
 var remote := false      # a read-only shadow of a termling on another device
 var remote_peer := ""    # which device it lives on (shown on the nameplate)
 var page := false        # a Vibefox page critter: input goes to the browser, not kitty
+var emacs := false       # a Vibemacs frame (also page: input goes to Vibemacs, not kitty)
+var emacs_scale := 1.0   # its backing scale (2.0 on Retina)
 var page_title := ""     # the tab's title (from the term-<N>.json sidecar), nameplate fallback
 var _srgb_mat: ShaderMaterial = null  # linear->sRGB encode for kitty frames (not pages)
+var _emacs_mat: ShaderMaterial = null  # opaque, for Vibemacs frames
 var _focused := false     # last focus state, so set_remote can re-tint
 var _default_border_sb: StyleBox = null  # the local (blue) border style
 var _remote_border_sb: StyleBox = null   # a red variant for remote shadows
@@ -49,6 +54,7 @@ var iosurface_id := 0
 var _tex: ImageTexture
 var _size := Vector2i.ZERO
 var _last_seq := -1
+var _file: FileAccess      # kept open: kitty rewrites the frame in place (mmap)
 # Zero-copy path: two importers/textures (double-buffered), swapped per frame.
 var _importers: Array = []          # [CoveIOSurface, CoveIOSurface]
 var _rd_tex: Array = [null, null]   # [Texture2DRD, Texture2DRD]
@@ -69,11 +75,19 @@ func setup(id: int, path: String) -> void:
 
 
 func poll() -> void:
-	if not FileAccess.file_exists(frame_path):
-		return
-	var f := FileAccess.open(frame_path, FileAccess.READ)
-	if f == null:
-		return
+	# Opening the file every frame for every termling was ~0.1 ms each, the
+	# Cove's biggest main-thread cost at idle. One handle stays open instead.
+	# Seeking far away first drops stdio's read buffer; a seek straight back to 0
+	# would reuse it and read a stale header.
+	if _file == null:
+		if not FileAccess.file_exists(frame_path):
+			return
+		_file = FileAccess.open(frame_path, FileAccess.READ)
+		if _file == null:
+			return
+	var f := _file
+	f.seek(1 << 40)
+	f.seek(0)
 	var head := f.get_buffer(HEADER)
 	if head.size() < HEADER or head.decode_u32(0) != MAGIC:
 		return
@@ -82,11 +96,14 @@ func poll() -> void:
 	var seq := int(head.decode_u32(12))
 	var flags := int(head.decode_u32(20))
 	var was_page := page
-	page = (flags & FLAG_PAGE) != 0
+	page = (flags & (FLAG_PAGE | FLAG_EMACS)) != 0
+	emacs = (flags & FLAG_EMACS) != 0
+	if emacs:
+		emacs_scale = maxf(1.0, float(head.decode_u32(60)) / 100.0)
 	if page != was_page:
 		# Vibefox snapshots are already sRGB; kitty's frames are linear light. Only
 		# the latter want the encode shader, or a page comes out washed-out white.
-		screen.material = null if page else _srgb_mat
+		screen.material = _emacs_opaque() if emacs else (null if page else _srgb_mat)
 		_update_nameplate()
 	pane_id = int(head.decode_u32(24)) | (int(head.decode_u32(28)) << 32)
 	cols = int(head.decode_u32(32))
@@ -101,13 +118,13 @@ func poll() -> void:
 	# An off-screen termling's frames aren't worth reading (at 2x each is 10-27 MB
 	# through the rgba file). Leaving _last_seq alone means it catches up the
 	# moment it's back in view.
-	if iosurface_id == 0 and _tex != null and _size == Vector2i(w, h) and not _on_screen():
+	if iosurface_id == 0 and _tex != null and _size == Vector2i(w, h) and not force_read and not _on_screen():
 		return
 	_last_seq = seq
 	# Normalise for kitty's render scale (1x vs 2x Retina) so world size is
 	# stable and a 2x render shows as sharper glyphs, not a bigger window.
 	var render_scale := maxf(1.0, roundf(float(h) / float(maxi(rows, 1)) / BASE_CELL_H))
-	var z := PAGE_ZOOM if page else BASE_ZOOM / render_scale
+	var z := BASE_ZOOM / emacs_scale if emacs else (PAGE_ZOOM if page else BASE_ZOOM / render_scale)
 	if not is_equal_approx(z, zoom):
 		zoom = z
 		screen.scale = Vector2.ONE * zoom
@@ -142,6 +159,13 @@ func _on_screen() -> bool:
 	return get_viewport_rect().grow(64.0).intersects(r)
 
 
+func _emacs_opaque() -> ShaderMaterial:
+	if _emacs_mat == null:
+		_emacs_mat = ShaderMaterial.new()
+		_emacs_mat.shader = preload("res://shaders/emacs_opaque.gdshader")
+	return _emacs_mat
+
+
 func _apply_iosurface(w: int, h: int, id_a: int, id_b: int, ready: int) -> void:
 	# Import both buffers once (ids are stable); then each frame just point the
 	# sprite at whichever buffer kitty says holds the latest complete frame.
@@ -150,7 +174,7 @@ func _apply_iosurface(w: int, h: int, id_a: int, id_b: int, ready: int) -> void:
 		_rd_tex[1] = _importers[1].call("import_surface", id_b, w, h)
 		_io_ids = Vector2i(id_a, id_b)
 		_size = Vector2i(w, h)
-		screen.flip_v = true  # IOSurface holds GL bottom-up pixels
+		screen.flip_v = not emacs  # kitty's IOSurface holds GL bottom-up pixels; Emacs's is top-down
 		screen.scale = Vector2.ONE * zoom
 		_layout_decorations()
 	var t = _rd_tex[ready] if ready >= 0 and ready < 2 else null
@@ -194,6 +218,13 @@ func _update_nameplate() -> void:
 	if _nameplate == null:
 		return
 	var base := custom_name if custom_name != "" else "termling %d" % term_id
+	if emacs:
+		# A Vibemacs frame: "✎", named after its buffer unless renamed.
+		if custom_name == "":
+			base = page_title if page_title != "" else "emacs"
+		_nameplate.text = "✎ %s  (emacs)" % base
+		_nameplate.add_theme_color_override("font_color", Color(0.96, 0.66, 0.72))
+		return
 	if page:
 		# A browser tab on the board: "▣" marks it a page (as ◈ marks a remote),
 		# named after the tab unless the user renamed it.
@@ -230,6 +261,12 @@ func pixel_at(world_pos: Vector2) -> Vector2:
 	var local := screen.to_local(world_pos) + Vector2(_size) * 0.5
 	return Vector2(clampf(local.x, 0.0, maxf(0.0, float(_size.x - 1))),
 		clampf(local.y, 0.0, maxf(0.0, float(_size.y - 1))))
+
+
+# The inverse of pixel_at: native frame pixels (clamped to the frame) to world.
+func world_at(px: Vector2) -> Vector2:
+	var p := Vector2(clampf(px.x, 0.0, float(_size.x)), clampf(px.y, 0.0, float(_size.y)))
+	return screen.to_global(p - Vector2(_size) * 0.5)
 
 
 # Save the current terminal frame to a PNG. Used as the drag-out image when the

@@ -97,6 +97,9 @@ const HANDOFF_EDGE_PX := 26.0  # drag a lifted termling this close to a window e
 # drag-out / drag-in (detach a termling to the desktop, adopt it back)
 var _evt_accum := 0.0          # pump cadence for kitty's events.jsonl
 var _pending_place := {}       # term_id -> world pos for a termling adopted at the cursor
+var _spawn_place := {}         # kitty pane id -> {zone, pos, name}: an agent's spawn, placed on arrival
+var _ground: Node2D            # the checkerboard floor (a screenshot widens what it paints)
+var _shooting := false         # a board screenshot is rendering
 var _land_queue: Array = []    # world positions for the next landed handoff drops
 
 # agent state / control channel / notifications
@@ -161,6 +164,17 @@ var _vf_seq := 0                  # "id" on each control-socket request
 var _page_meta := {}              # term id -> {title, url, tab} from term-<N>.json
 var _page_meta_accum := 1.0       # re-read the sidecars about once a second
 var _page_focus := {}             # term id -> last focus state sent to Vibefox
+# Emacs critters: Vibemacs publishes a frame as term-<2000000+n>.rgba (flag
+# 0x20000). They're page critters whose input goes to Vibemacs' control socket
+# through a second bridge; while one is focused every key goes to Emacs (Cmd is
+# its meta), except the Ctrl+` / Ctrl+Tab termling cycling.
+const VIBEMACS_SOCK := "/tmp/vibemacs/control.sock"
+const EMACS_PANE_BASE := 2000000
+var _vm_pipe: FileAccess = null
+var _vm_pid := -1
+var _vm_retry := 0.0
+var _vm_seq := 0
+var _mod_right := {}              # KEY_META/ALT/CTRL/SHIFT -> held on the right side
 var _app_focused := true          # does the Cove's own window have the OS focus
 var _press_dbl := false           # the current press was a double-click (skip its click)
 var _search_sel := 0          # highlighted row index
@@ -225,6 +239,9 @@ var _frames := 0
 
 func _ready() -> void:
 	_set_window_icon()   # cove pirate-map icon on the window + macOS dock
+	# Cmd+Q never reaches _input: the macOS app menu eats it and asks to close
+	# the window. We decide in _notification (an Emacs critter gets it as M-q).
+	get_tree().set_auto_accept_quit(false)
 	kitten_exe = OS.get_environment("COVE_KITTEN")
 	kitty_socket = OS.get_environment("COVE_KITTY_SOCKET")
 	_shot_path = OS.get_environment("COVE_SHOT")
@@ -236,6 +253,7 @@ func _ready() -> void:
 		push_warning("cove: CoveInput extension not loaded — input falls back to `kitten @ send` (slow). Check cove.gdextension / rebuild gdext.")
 	_setup_handoff()
 	_start_vibefox_bridge()
+	_start_vibemacs_bridge()
 	_load_layout()   # restore positions/names/camera from the previous run
 	_restore_window()  # put the os-window back where (and how big / maximized) it was
 	_build_world()
@@ -258,6 +276,16 @@ func _set_window_icon() -> void:
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_APPLICATION_FOCUS_IN or what == NOTIFICATION_APPLICATION_FOCUS_OUT:
 		_app_focused = what == NOTIFICATION_APPLICATION_FOCUS_IN
+	elif what == NOTIFICATION_WM_CLOSE_REQUEST:
+		if _emacs_focused():
+			var ev := InputEventKey.new()
+			ev.keycode = KEY_Q
+			ev.physical_keycode = KEY_Q
+			ev.meta_pressed = true
+			ev.pressed = true
+			_emacs_key(_groups[_focused_id].terminal, ev)
+		else:
+			get_tree().quit()
 
 
 func _exit_tree() -> void:
@@ -290,10 +318,10 @@ func _build_world() -> void:
 	_cam.make_current()
 
 	# Infinite grid (world space, follows the camera).
-	var ground := GroundGrid.new()
-	ground.camera = _cam
-	ground.z_index = -50
-	add_child(ground)
+	_ground = GroundGrid.new()
+	_ground.camera = _cam
+	_ground.z_index = -50
+	add_child(_ground)
 
 	# The board: shapes painted above the ground, below the termlings.
 	_bd_setup()
@@ -313,6 +341,7 @@ func _process(delta: float) -> void:
 		_rescan_accum = 0.0
 		_reap_children()
 		_reconcile()
+		_apply_spawn_places()
 		_apply_zones()
 	if _sock != null and not _sock.call("is_connected") and _input_tries < 100:
 		_try_connect_sock()
@@ -369,13 +398,12 @@ func _process(delta: float) -> void:
 	if _fly_id != -1:
 		pass   # the flight owns the zoom
 	elif _previewing():
-		# The radial jump always fits smaller, so its ring has room around the termling.
-		# Stepping notifications zooms onto each one (in or out) so it's readable.
+		# Previews zoom onto each one (in or out) so it's readable. The radial jump
+		# fits smaller, so its ring has room around the termling.
 		if _notif_open:
 			_ease_zoom(_fit_zoom_for(_groups[_preview_id], ATTEND_FILL), delta)
 		else:
-			var fit := _fit_zoom_for(_groups[_preview_id], RADIAL_FILL if _radial_open else VIEW_FILL)
-			_ease_zoom(fit if _present_id != -1 or _radial_open else minf(_preview_return_zoom, fit), delta)
+			_ease_zoom(_fit_zoom_for(_groups[_preview_id], RADIAL_FILL if _radial_open else VIEW_FILL), delta)
 	elif _avy_open:
 		_ease_zoom(_avy_zoom, delta)
 	elif _present_id != -1:
@@ -441,6 +469,7 @@ func _add_group(id: int) -> void:
 		# A handed-off termling landed here: appear under the drop point.
 		g.position = _land_queue.pop_front()
 		_pos_restored[id] = true
+		_zone_of[id] = _bd_container_at(g.position)   # "New terminal here" lands in its frame
 	elif _saved.get("pos", {}).has(id):
 		# Restore where it was on the previous run (hot-reload keeps positions).
 		var p = _saved["pos"][id]
@@ -465,6 +494,7 @@ func _add_group(id: int) -> void:
 	if _names.has(id):
 		g.terminal.set_custom_name(_names[id])
 	_groups[id] = g
+	_apply_spawn_places()
 	if _fit_pending.has(id):
 		_set_focus(id)
 		_tracking_id = id   # glue the camera to the new termling
@@ -840,6 +870,8 @@ func _order_by_proximity(from_id: int) -> Array:
 # Catch the spawn chord early (macOS can swallow Cmd-chords before they reach
 # _unhandled_input). Accept Cmd+N or Ctrl+N.
 func _input(event: InputEvent) -> void:
+	if event is InputEventKey and event.keycode in [KEY_META, KEY_ALT, KEY_CTRL, KEY_SHIFT]:
+		_mod_right[event.keycode] = event.pressed and event.location == KEY_LOCATION_RIGHT
 	if not (event is InputEventKey and event.pressed and not event.echo):
 		return
 	# While the search overlay is open, drive it: Esc closes, Up/Down move the
@@ -898,6 +930,13 @@ func _input(event: InputEvent) -> void:
 	if (_focused_id == -1 or not _groups.has(_focused_id)) and _bd_key(event):
 		get_viewport().set_input_as_handled()
 		return
+	# An Emacs critter takes every key (Cmd is Emacs' meta: M-c, M-v, M-f, M-;
+	# ...), except Ctrl+` / Ctrl+Tab, which still cycle termlings.
+	if _emacs_focused() and not (event.ctrl_pressed and not event.meta_pressed
+			and (event.keycode in [KEY_QUOTELEFT, KEY_TAB] or event.physical_keycode == KEY_QUOTELEFT)):
+		_on_key(event)
+		get_viewport().set_input_as_handled()
+		return
 	# Cmd+C / Cmd+V: clipboard in and out of the focused termling. Copy grabs
 	# kitty's current selection (drag-select while tracking, see _send_select);
 	# paste routes through kitty so bracketed paste works, and an image-only
@@ -938,6 +977,11 @@ func _input(event: InputEvent) -> void:
 	# Cmd+J opens the radial jump (hjkl between nearby termlings, Enter to go).
 	if event.keycode == KEY_J and event.meta_pressed and not event.ctrl_pressed:
 		_open_radial()
+		get_viewport().set_input_as_handled()
+		return
+	# Cmd+O opens a file picker at the focused termling's cwd (see _fs_open_quick).
+	if event.keycode == KEY_O and event.meta_pressed and not event.ctrl_pressed:
+		_fs_open_quick()
 		get_viewport().set_input_as_handled()
 		return
 	# Cmd+; opens the avy jump (like avy's C-;): type a termling's label to go there.
@@ -1027,6 +1071,8 @@ func _unhandled_input(event: InputEvent) -> void:
 		if event.pressed and event.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN]:
 			var up: bool = event.button_index == MOUSE_BUTTON_WHEEL_UP
 			var g := _group_at(wpos)
+			if g == null and not event.meta_pressed and _fs_scroll_at(wpos, -66.0 if up else 66.0):
+				return   # a folder view under the mouse scrolls instead
 			if g == null:
 				_zoom_at(event.position, 1 if up else -1)
 			elif event.meta_pressed or event.ctrl_pressed:
@@ -1087,7 +1133,11 @@ func _unhandled_input(event: InputEvent) -> void:
 				if event.double_click and _press_group != null:
 					_set_focus(_press_group.term_id)
 					_tracking_id = _press_group.term_id  # double-click: focus + follow
-					if _press_group.terminal.page:
+					if _press_group.terminal.emacs:
+						var dp: Vector2 = _press_group.terminal.pixel_at(wpos)
+						_page_input(_press_group.terminal.pane_id, "mouse",
+							{"x": roundi(dp.x), "y": roundi(dp.y), "button": 0, "clicks": 2})
+					elif _press_group.terminal.page:
 						_page_activate(_press_group)   # and raise the tab in the browser
 				# Triple-click a termling -> present it full-window (click again or Esc
 				# to leave). A click on empty ground also leaves present mode.
@@ -1158,6 +1208,8 @@ func _unhandled_input(event: InputEvent) -> void:
 		if g == null:
 			if event.meta_pressed or event.ctrl_pressed:
 				_zoom_by(pow(1.08, -event.delta.y))
+			elif absf(event.delta.y) > absf(event.delta.x) and _fs_scroll_at(_world_mouse(), event.delta.y * 18.0):
+				pass   # a folder view under the mouse scrolls instead of the board
 			else:
 				_cam.position += event.delta * 18.0 / _cam.zoom.x
 				_bd_camera_changed()
@@ -1217,6 +1269,10 @@ func _on_key(event: InputEventKey) -> void:
 	if _focused_id == -1 or not _groups.has(_focused_id):
 		return
 	var t = _groups[_focused_id].terminal
+	if t.emacs:
+		_emacs_key(t, event)
+		get_viewport().set_input_as_handled()
+		return
 	if t.page:
 		if _page_key(t, event):
 			get_viewport().set_input_as_handled()
@@ -1920,7 +1976,10 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 			for k in kids.get(cur, []):
 				queue.append(k)
 		var src := agent_pid if agent_pid != -1 else shell_pid
-		res[sess] = {"agent": agent, "busy": agent != "shell", "cwd": _cwd_of(src)}
+		# idle: a bare shell at its prompt (nothing running under it), so it's
+		# safe to type a `cd` into it.
+		var idle: bool = agent == "shell" and shell_pid != -1 and kids.get(shell_pid, []).is_empty()
+		res[sess] = {"agent": agent, "busy": agent != "shell", "idle": idle, "pid": src, "cwd": _cwd_of(src)}
 	return res
 
 
@@ -1980,6 +2039,8 @@ func _parse_ls(txt: String, sess_info: Dictionary) -> Dictionary:
 					"session": session,
 					"agent": str(si.get("agent", "shell")),
 					"busy": bool(si.get("busy", false)),
+					"idle": bool(si.get("idle", false)),
+					"pid": int(si.get("pid", -1)),
 					"attention": bool(w.get("needs_attention", false)),
 					"cwd": str(si.get("cwd", w.get("cwd", ""))),
 					"title": str(w.get("title", "")),
@@ -2004,6 +2065,13 @@ func _apply_agent_state() -> void:
 		var meta: Dictionary = _page_meta.get(id, {})
 		var title := str(meta.get("title", ""))
 		pt.set_page_title(title)
+		if pt.emacs:
+			_agents[pt.pane_id] = {
+				"session": "", "agent": "emacs", "busy": false, "attention": false,
+				"cwd": str(meta.get("cwd", "")), "title": title if title != "" else "emacs",
+				"file": str(meta.get("file", "")), "buffer": str(meta.get("buffer", "")),
+			}
+			continue
 		_agents[pt.pane_id] = {
 			"session": "", "agent": "page", "busy": false, "attention": false,
 			"cwd": "", "title": title if title != "" else "page",
@@ -2177,6 +2245,7 @@ func _reassign_zone_on_drop(g: Node2D) -> void:
 	else:
 		g.assign_zone(_bd_container_rect(sid))
 		_name_from_zone(g.term_id, sid)
+		_fs_zone_cd(g, sid)
 
 
 # A termling in a named frame/box is called by that name: "Radial menu", then
@@ -2240,13 +2309,103 @@ func _pump_commands(delta: float) -> void:
 		rf.close()
 
 
+# Place the termlings agents spawned (see "spawn_place") once kitty's window for
+# them has turned up. Entries that never match are dropped after a minute.
+func _apply_spawn_places() -> void:
+	if _spawn_place.is_empty():
+		return
+	for id in _groups:
+		var g = _groups[id]
+		var want = _spawn_place.get(g.terminal.pane_id, null)
+		if want == null:
+			continue
+		_spawn_place.erase(g.terminal.pane_id)
+		if str(want["name"]) != "":
+			_names[id] = str(want["name"])
+			g.terminal.set_custom_name(str(want["name"]))
+		_place_group(g, str(want["zone"]), want["pos"], true)
+		_pos_restored[id] = true
+	var now := Time.get_ticks_msec()
+	for pane in _spawn_place.keys():
+		if now - int(_spawn_place[pane]["t"]) > 60000:
+			_spawn_place.erase(pane)
+
+
+# Put a termling in a frame/box (by id or name) or at a world point. teleport
+# drops it there at once (a fresh spawn); otherwise its crew walk it over.
+func _place_group(g: Node2D, zone: String, pos, teleport: bool) -> String:
+	var at = null
+	if pos is Array and pos.size() == 2:
+		at = Vector2(float(pos[0]), float(pos[1]))
+	var sid := ""
+	if zone != "":
+		sid = _bd_resolve_container(zone)
+		if sid == "":
+			return "no frame %s on the board" % zone
+		var r: Rect2 = _bd_container_rect(sid)
+		if at == null or not r.has_point(at):
+			at = r.get_center() + Vector2(0, g.terminal.onscreen_size().y * 0.6)   # screen a bit above the middle, crew below
+	if at == null:
+		return "place needs a zone or a pos"
+	_follows.erase(g.term_id)
+	if teleport:
+		g.position = at
+		g.command_stop()
+	else:
+		g.command_move(at)
+	_zone_of[g.term_id] = sid
+	if sid == "":
+		g.clear_zone()
+	else:
+		g.assign_zone(_bd_container_rect(sid))
+	return ""
+
+
+# Render a world rect of the board (termlings, shapes, floor; no UI chrome) to a
+# PNG without touching the user's camera: a SubViewport sharing our 2D world,
+# with its own camera. No rect = exactly what the user's window shows.
+func _take_shot(path: String, rect, max_px: float) -> void:
+	if not (rect is Array and rect.size() == 4):
+		await RenderingServer.frame_post_draw
+		get_viewport().get_texture().get_image().save_png(path)
+		return
+	_shooting = true
+	_bd_dirty = true
+	var r := Rect2(float(rect[0]), float(rect[1]), maxf(float(rect[2]), 16.0), maxf(float(rect[3]), 16.0))
+	var z := minf(1.0, clampf(max_px, 256.0, 4096.0) / maxf(r.size.x, r.size.y))
+	var sv := SubViewport.new()
+	sv.world_2d = get_viewport().world_2d
+	sv.size = Vector2i(maxi(int(r.size.x * z), 16), maxi(int(r.size.y * z), 16))
+	sv.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	var cam := Camera2D.new()
+	cam.position = r.get_center()
+	cam.zoom = Vector2(z, z)
+	sv.add_child(cam)
+	add_child(sv)
+	cam.make_current()
+	_ground.extra = r
+	for id in _groups:
+		_groups[id].terminal.force_read = true
+	for i in 4:   # a couple of frames: termlings catch up, then the view renders
+		await RenderingServer.frame_post_draw
+	var img := sv.get_texture().get_image()
+	if img != null:
+		img.save_png(path)
+	for id in _groups:
+		_groups[id].terminal.force_read = false
+	_ground.extra = Rect2()
+	sv.queue_free()
+	_shooting = false
+	_bd_dirty = true
+
+
 # Run one control-channel command. Returns "" on success, else an error for the
 # replies file.
 func _exec_command(c: Dictionary) -> String:
 	var cmd := str(c.get("cmd", ""))
 	# "Send to Cove" in Vibefox is the user's own right-click, so its focus is
 	# theirs: camera to that termling and follow it (what cove-focus.sh does).
-	if cmd == "focus" and str(c.get("source", "")) == "vibefox":
+	if cmd == "focus" and str(c.get("source", "")) in ["vibefox", "vibemacs"]:
 		var g := _find(int(c.get("id", -1)))
 		if g == null:
 			return "no such terminal"
@@ -2295,6 +2454,30 @@ func _exec_command(c: Dictionary) -> String:
 					var nr: Rect2 = tr if tr != null else Rect2(ng.position, Vector2.ZERO)
 					bc["near_pos"] = [nr.end.x + 60.0, nr.position.y]
 			return _bd_command(bc)
+		"spawn_place":
+			# An agent launched this kitty window for a child termling (cove_mcp's
+			# spawn): put it in its frame the moment it shows up, not wherever new
+			# termlings land. The MCP only sends this for windows it just launched.
+			var pane := int(c.get("pane", -1))
+			if pane <= 0:
+				return "spawn_place needs the new window's pane id"
+			_spawn_place[pane] = {"zone": str(c.get("zone", "")), "pos": c.get("pos", null),
+				"name": str(c.get("name", "")), "t": Time.get_ticks_msec()}
+			_apply_spawn_places()
+		"place":
+			# Move a termling an agent spawned into a frame (or to a point). The MCP
+			# checks the caller spawned it; the user's own termlings never get this.
+			var g := _find(int(c.get("id", -1)))
+			if g == null:
+				return "no such terminal"
+			return _place_group(g, str(c.get("zone", "")), c.get("pos", null), bool(c.get("teleport", false)))
+		"screenshot":
+			var path := str(c.get("path", ""))
+			if not path.is_absolute_path() or not path.ends_with(".png"):
+				return "screenshot needs an absolute .png path"
+			if _shooting:
+				return "a screenshot is already rendering; try again in a moment"
+			_take_shot(path, c.get("rect", null), float(c.get("max", 1600)))
 		"dismiss":
 			_drop_note(int(c.get("id", -1)))
 		var other:
@@ -2329,7 +2512,39 @@ func _start_vibefox_bridge() -> void:
 	_child_mutex.unlock()
 
 
+func _start_vibemacs_bridge() -> void:
+	var script := ProjectSettings.globalize_path("res://cove-vibefox-bridge.py")
+	var r: Dictionary = OS.execute_with_pipe("/usr/bin/python3", [script, VIBEMACS_SOCK], false)
+	if r.is_empty() or not r.has("stdio") or int(r.get("pid", -1)) <= 0:
+		push_warning("cove: couldn't start the Vibemacs bridge — emacs critters won't take input.")
+		_vm_pipe = null
+		_vm_pid = -1
+		return
+	_vm_pipe = r["stdio"]
+	_vm_pid = int(r["pid"])
+	_child_mutex.lock()
+	_child_pids.append(_vm_pid)
+	_child_mutex.unlock()
+
+
+func _vm_send(cmd: String, args: Dictionary) -> void:
+	if _vm_pipe == null or _vm_pid == -1:
+		return
+	_vm_seq += 1
+	_vm_pipe.store_line(JSON.stringify({"id": _vm_seq, "cmd": cmd, "args": args}))
+	_vm_pipe.flush()
+
+
 func _tick_vibefox(delta: float) -> void:
+	if _vm_pid != -1 and not OS.is_process_running(_vm_pid):
+		_vm_pid = -1
+		_vm_pipe = null
+		_vm_retry = 5.0
+	if _vm_pid == -1:
+		_vm_retry -= delta
+		if _vm_retry <= 0.0:
+			_vm_retry = 5.0
+			_start_vibemacs_bridge()
 	# Respawn the bridge if it died (it only exits on error), at most every 5s.
 	if _vf_pid != -1 and not OS.is_process_running(_vf_pid):
 		_vf_pid = -1
@@ -2368,6 +2583,9 @@ func _vf_send(cmd: String, args: Dictionary) -> void:
 
 
 func _page_input(pane: int, kind: String, data: Dictionary) -> void:
+	if pane >= EMACS_PANE_BASE:
+		_vm_send("critter.input", {"id": pane, "kind": kind, "data": data})
+		return
 	_vf_send("critter.input", {"id": pane, "kind": kind, "data": data})
 
 
@@ -2399,6 +2617,9 @@ func _page_click(g: Node2D, world: Vector2, button: int) -> void:
 
 # Double-click: raise the mirrored tab in the browser.
 func _page_activate(g: Node2D) -> void:
+	if g.terminal.emacs:
+		_vm_send("critter.activate", {"id": g.terminal.pane_id})
+		return
 	_vf_send("critter.activate", {"id": g.terminal.pane_id})
 
 
@@ -2446,9 +2667,64 @@ func _page_key(t, event: InputEventKey) -> bool:
 	return true
 
 
+func _emacs_focused() -> bool:
+	return _focused_id != -1 and _groups.has(_focused_id) and _groups[_focused_id].terminal.emacs
+
+
+# Keyboard into an Emacs critter: the key's name (for non-character keys), the
+# text it types, the unshifted key (for chords) and every modifier with its
+# side. Vibemacs rebuilds the NSEvent from this (vibemacs-cove.el).
+func _emacs_key(t, event: InputEventKey) -> void:
+	if _is_modifier_key(event.keycode):
+		return
+	var name := ""
+	match event.keycode:
+		KEY_ENTER: name = "Enter"
+		KEY_KP_ENTER: name = "KpEnter"
+		KEY_TAB: name = "Tab"
+		KEY_BACKSPACE: name = "Backspace"
+		KEY_DELETE: name = "Delete"
+		KEY_INSERT: name = "Insert"
+		KEY_ESCAPE: name = "Escape"
+		KEY_UP: name = "ArrowUp"
+		KEY_DOWN: name = "ArrowDown"
+		KEY_LEFT: name = "ArrowLeft"
+		KEY_RIGHT: name = "ArrowRight"
+		KEY_HOME: name = "Home"
+		KEY_END: name = "End"
+		KEY_PAGEUP: name = "PageUp"
+		KEY_PAGEDOWN: name = "PageDown"
+		KEY_HELP: name = "Help"
+		KEY_MENU: name = "Menu"
+		KEY_SPACE: name = "Space"
+	if name == "" and event.keycode >= KEY_F1 and event.keycode <= KEY_F20:
+		name = "F%d" % (event.keycode - KEY_F1 + 1)
+	var d := {
+		"shift": event.shift_pressed, "ctrl": event.ctrl_pressed,
+		"alt": event.alt_pressed, "meta": event.meta_pressed,
+		"rshift": _mod_right.get(KEY_SHIFT, false), "rctrl": _mod_right.get(KEY_CTRL, false),
+		"ralt": _mod_right.get(KEY_ALT, false), "rmeta": _mod_right.get(KEY_META, false),
+	}
+	if name == "Space" and not (event.ctrl_pressed or event.meta_pressed or event.alt_pressed):
+		name = ""   # a plain space is text
+	if name != "":
+		d["key"] = name
+	if event.unicode != 0:
+		d["text"] = String.chr(event.unicode)
+	var kc := int(event.keycode)
+	if kc == KEY_SPACE:
+		d["code"] = " "
+	elif kc > 32 and kc < 127:
+		d["code"] = String.chr(kc).to_lower()
+	if name == "" and not d.has("text") and not d.has("code"):
+		return
+	_page_input(t.pane_id, "key", d)
+
+
 # --- state.json (world -> agents) -------------------------------------------
 
 func _write_state() -> void:
+	_bd_heading_memo = _bd_headings()
 	# newest hook event per terminal, so state.json says what each is working on
 	var note_by_id := {}
 	for n in _notes:
@@ -2479,6 +2755,10 @@ func _write_state() -> void:
 			"zone": _bd_container_name(str(_zone_of.get(id, ""))),
 			"container": _zone_of.get(id, null),   # board shape id; "" loose, null not restored yet
 		})
+		var tr = _bd_term_rect(_bd_term_key(id))
+		if tr != null:   # where it is drawn: [x, y, w, h] in world units
+			terms[-1]["rect"] = [snappedf(tr.position.x, 0.1), snappedf(tr.position.y, 0.1),
+				snappedf(tr.size.x, 0.1), snappedf(tr.size.y, 0.1)]
 		if info.has("url"):   # a page critter: which tab it mirrors
 			terms[-1]["url"] = str(info["url"])
 			terms[-1]["tab"] = int(info["tab"])
@@ -2506,11 +2786,29 @@ func _write_state() -> void:
 		"attention_queue": _attention.queue.map(func(q): return {"id": q, "session": _sessions.get(q, "")}),
 		"window": window,
 		"zones": _bd_containers(),   # the board's frames/boxes: [{id, name, type, rect}]
+		"view": _view_rect_arr(),    # the world rect the user's window shows
 	}
-	var f := FileAccess.open(DIR + "/state.json", FileAccess.WRITE)
-	if f:
-		f.store_string(JSON.stringify(st))
-		f.close()
+	_write_atomic(DIR + "/state.json", JSON.stringify(st))
+	_bd_heading_memo = null
+
+
+# Write to a temp file and rename it over the target, so readers (the MCP
+# server polls state.json every second) never see a half-written file.
+func _write_atomic(path: String, txt: String) -> void:
+	var tmp := path + ".tmp"
+	var f := FileAccess.open(tmp, FileAccess.WRITE)
+	if f == null:
+		return
+	f.store_string(txt)
+	f.close()
+	if DirAccess.rename_absolute(ProjectSettings.globalize_path(tmp), ProjectSettings.globalize_path(path)) != OK:
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(tmp))
+
+
+func _view_rect_arr() -> Array:
+	var half := get_viewport().get_visible_rect().size * 0.5 / _cam.zoom
+	var c := _cam.get_screen_center_position()
+	return [snappedf(c.x - half.x, 0.1), snappedf(c.y - half.y, 0.1), snappedf(half.x * 2.0, 0.1), snappedf(half.y * 2.0, 0.1)]
 
 
 # --- notifications (hooks -> notify.jsonl -> panel + camera) -----------------
@@ -2955,7 +3253,9 @@ func _commit_search() -> void:
 
 func _search_choose(id: int) -> void:
 	_close_search(false)
-	_jump_focus(id)   # the camera keeps tracking (or presenting) the one we jumped to
+	# Land zoomed to fit it, in or out; the camera keeps tracking (or presenting) it.
+	if _groups.has(id):
+		_jump_focus(id, true, _fit_zoom_for(_groups[id]))
 
 
 # --- preview: camera + occluder fade while stepping search hits / radial jumps
@@ -3183,7 +3483,8 @@ func _radial_key(ev: InputEventKey) -> void:
 
 func _radial_commit(id: int) -> void:
 	_close_radial(false)
-	_jump_focus(id)
+	if _groups.has(id):
+		_jump_focus(id, true, _fit_zoom_for(_groups[id]))
 
 
 func _radial_step_ring(d: int) -> void:
@@ -3544,7 +3845,8 @@ func _avy_commit(id: int) -> void:
 	if not _groups.has(id):
 		return
 	# Land zoomed to fit the chosen termling, in or out, whatever zoom you started at.
-	_jump_focus(id, true, _fit_zoom_for(_groups[id]))
+	if _groups.has(id):
+		_jump_focus(id, true, _fit_zoom_for(_groups[id]))
 
 
 func _close_avy(restore_view: bool) -> void:
@@ -3863,6 +4165,9 @@ var _bd_help: PanelContainer
 var _bd_menu: PopupMenu
 var _bd_menu_pos := Vector2.ZERO
 var _bd_ui_root: Control        # all the board chrome, scaled for Retina
+var _bd_bar: Control            # the tool bar along the bottom
+var _bd_style_panel: Control    # the style panel down the left
+var _bd_chrome_a := 1.0         # their opacity: they fade while you're zoomed in on something
 var _bd_ui_scale := 0.0
 var _bd_ui_user := 1.0          # ⌘⌥= / ⌘⌥- on top of the automatic scale (saved with the board)
 var _bd_arrange_row: Control
@@ -3877,7 +4182,11 @@ var _bd_last_input_ms := 0      # last board click/key, for _bd_owns_keyboard
 # Redraw on change, not every frame (see _bd_tick).
 var _bd_live_layer: Node2D      # arrows tied to termlings, which move on their own
 var _bd_dirty := true
-var _bd_drawn_zoom := 0.0
+var _bd_drawn_px := 0             # frame-title size the shapes were last drawn at
+var _bd_zoom_seen := 0.0
+var _bd_zoom_still := 0.0         # seconds the camera zoom has held still
+var _bd_drawn_area := Rect2()     # world rect the shapes were last drawn over (culling)
+var _bd_dz := 1.0                 # the zoom the shapes are drawn for, rounded up to a power of 2 (detail level)
 var _bd_member_sig := 0
 var _bd_overlay_was_live := true
 # Link bookmarks (see "board: link bookmarks").
@@ -3932,25 +4241,42 @@ func _bd_tick(delta: float) -> void:
 			_bd_exec(c)
 	if _bd_editor != null:
 		_bd_place_editor()
+	_bd_fade_chrome(delta)
 	_bd_hint_accum += delta
 	if _bd_hint_accum > 0.3:
 		_bd_hint_accum = 0.0
 		_bd_update_hint()
 		_bd_unfurl_poll()
 		_cal_tick()
+		_fs_tick()
 		if absf(_bd_ui_target_scale() - _bd_ui_scale) > 0.01:
 			_bd_apply_ui_scale()   # the window moved to another screen
 	# Redraw only what changed. Redrawing every shape every frame (at up to 144
 	# fps) was the Cove's biggest main-thread cost. The shapes redraw when they
-	# change, while a drag/edit is shaping them, or when the zoom (frame titles)
-	# or zone memberships (frame counts) change. Arrows tied to termlings follow
-	# them every frame on their own layer. The overlay redraws while it has
-	# anything on it.
+	# change, while a drag/edit is shaping them, or when zone memberships (frame
+	# counts) change. Frame titles and the detail level (_bd_dz) are all that
+	# depend on the zoom, so a zoom redraws once it settles, and only if one of
+	# them changed; mid-zoom
+	# the GPU scales the last drawing (a full redraw is ~40 ms on a busy board).
+	# Arrows tied to termlings follow them every frame on their own layer. The
+	# overlay redraws while it has anything on it. Only shapes near the view are
+	# drawn (it plus half a view each side), so a pan or zoom-out that leaves
+	# that area redraws too.
+	if _cam.zoom.x != _bd_zoom_seen:
+		_bd_zoom_seen = _cam.zoom.x
+		_bd_zoom_still = 0.0
+	else:
+		_bd_zoom_still += delta
+	# Zooming in past a detail level redraws at once: a coarse drawing scaled up
+	# shows (greeked text, oversized titles). Zooming out can wait for the settle.
+	var px_stale := _bd_detail_zoom() > _bd_dz or (_bd_zoom_still > 0.12 \
+		and (_bd_frame_px() != _bd_drawn_px or _bd_detail_zoom() != _bd_dz))
 	var sig := hash(_zone_of)
+	var off_area := not _bd_drawn_area.encloses(_bd_view_area(0.0))
 	if _bd_dirty or _bd_g in ["move", "handle", "box", "draw", "erase"] or _bd_edit_id != "" \
-			or _cam.zoom.x != _bd_drawn_zoom or sig != _bd_member_sig:
+			or px_stale or off_area or sig != _bd_member_sig:
 		_bd_dirty = false
-		_bd_drawn_zoom = _cam.zoom.x
+		_bd_drawn_px = _bd_frame_px()
 		_bd_member_sig = sig
 		_bd_layer.queue_redraw()
 		_bd_live_layer.queue_redraw()
@@ -4019,7 +4345,8 @@ func _bd_bounds(s: Dictionary) -> Rect2:
 
 
 func _bd_is_box(s: Dictionary) -> bool:
-	return str(s["type"]) in ["geo", "text", "note", "frame", "todo", "image", "bookmark", "calendar", "reminders"]
+	return str(s["type"]) in ["geo", "text", "note", "frame", "todo", "image", "bookmark", "calendar", "reminders",
+		"files", "file"]
 
 
 func _bd_reindex() -> void:
@@ -4183,6 +4510,9 @@ func _bd_bind_rect(key: String):
 		return null
 	if key.begins_with("term"):
 		return _bd_term_rect(key)
+	if key.begins_with("anchor:"):
+		var an = _anc_get(key)
+		return null if an == null else Rect2(an["p"], Vector2.ZERO)
 	var t = _bd_by_id.get(key, null)
 	if t == null or not _bd_is_box(t):
 		return null
@@ -4194,6 +4524,8 @@ func _bd_bind_rect(key: String):
 # gap so the head doesn't touch it.
 func _bd_clip_out(key: String, r: Rect2, toward: Vector2) -> Vector2:
 	var c := r.get_center()
+	if key.begins_with("anchor:"):
+		return c   # a character: the end sits right on it
 	var tgt = _bd_by_id.get(key, null)
 	var rot := _bd_rot(tgt) if tgt != null else 0.0
 	var d := (toward - c).rotated(-rot)
@@ -4288,6 +4620,103 @@ func _bd_term_rect(key: String):
 	return Rect2(t.global_position - sz * 0.5, sz)
 
 
+# --- board: ends pinned to text in Emacs critters ---------------------------
+# "anchor:<pane>:<id>" is a character inside Vibemacs critter <pane>. After a
+# redisplay that moves one, Vibemacs writes term-<pane>.anchors.json:
+# {seq, anchors: [{id, x, y, h, visible, edge, lines}]}, in picture pixels (the
+# character's top-left and height; or, scrolled away, the window's top/bottom
+# edge, edge "above"/"below" and how many lines off). The file is re-read every
+# frame for a moment after the critter's picture changes (Vibemacs writes it
+# right after that redisplay), else twice a second.
+var _anc_files := {}   # pane -> {"at": msec read, "seq": critter seq, "seq_at": msec, "by_id": {id: record}}
+
+
+func _anc_critter(pane: int):
+	for gid in _groups:
+		var t = _groups[gid].terminal
+		if t.emacs and t.pane_id == pane:
+			return t
+	return null
+
+
+func _anc_records(t) -> Dictionary:
+	var pane: int = t.pane_id
+	var now := Time.get_ticks_msec()
+	var f = _anc_files.get(pane, null)
+	if f == null:
+		f = {"at": -100000, "seq": -1, "seq_at": 0, "by_id": {}}
+		_anc_files[pane] = f
+	if int(f["seq"]) != t._last_seq:
+		f["seq"] = t._last_seq
+		f["seq_at"] = now
+	var age: int = now - int(f["at"])
+	if age < 500 and (now - int(f["seq_at"]) > 300 or age < 16):
+		return f["by_id"]
+	f["at"] = now
+	var path := DIR + "/term-%d.anchors.json" % pane
+	if not FileAccess.file_exists(path):
+		f["by_id"] = {}
+		return f["by_id"]
+	var j = JSON.parse_string(FileAccess.get_file_as_string(path))
+	if typeof(j) == TYPE_DICTIONARY and typeof(j.get("anchors", null)) == TYPE_ARRAY:
+		var by_id := {}
+		for a in j["anchors"]:
+			if typeof(a) == TYPE_DICTIONARY:
+				by_id[str(a.get("id", ""))] = a
+		f["by_id"] = by_id
+	return f["by_id"]
+
+
+# Where anchor KEY is: {p (world), visible, above, lines}, or null if it's gone
+# (deleted, its critter off the board, or its buffer not shown there).
+func _anc_get(key: String):
+	var parts := key.split(":", true, 2)
+	if parts.size() < 3:
+		return null
+	var t = _anc_critter(int(parts[1]))
+	if t == null or t.native_size().x <= 0:
+		return null
+	var a = _anc_records(t).get(parts[2], null)
+	if a == null:
+		return null
+	var px := Vector2(float(a.get("x", 0)), float(a.get("y", 0)) + float(a.get("h", 0)) * 0.5)
+	return {"p": t.world_at(px), "visible": bool(a.get("visible", false)),
+		"above": str(a.get("edge", "")) == "above", "lines": int(a.get("lines", 0))}
+
+
+func _anc_bound(s: Dictionary) -> bool:
+	return str(s.get("bind_a", "")).begins_with("anchor:") or str(s.get("bind_b", "")).begins_with("anchor:")
+
+
+# An arrow whose anchored end has lost its text isn't drawn (or hit).
+func _anc_gone(s: Dictionary) -> bool:
+	if str(s["type"]) != "arrow":
+		return false
+	for k in ["bind_a", "bind_b"]:
+		var key := str(s.get(k, ""))
+		if key.begins_with("anchor:") and _anc_get(key) == null:
+			return true
+	return false
+
+
+# "↑ 340 lines" by an end docked at the critter's edge, on the critter's side.
+func _anc_draw_label(ci: CanvasItem, key: String, at: Vector2, c: Color) -> void:
+	if not key.begins_with("anchor:"):
+		return
+	var an = _anc_get(key)
+	if an == null or an["visible"]:
+		return
+	var n: int = an["lines"]
+	var txt := "%s %d line%s" % ["↑" if an["above"] else "↓", n, "" if n == 1 else "s"]
+	var f := ThemeDB.fallback_font
+	var fs := 14
+	var sz := f.get_string_size(txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fs) + Vector2(10, 4)
+	var r := Rect2(at + Vector2(8.0, 4.0 if an["above"] else -4.0 - sz.y), sz)
+	ci.draw_rect(r, Color(0.155, 0.14, 0.13, 0.92 * _bd_alpha))
+	ci.draw_string(f, r.position + Vector2(5, 2 + f.get_ascent(fs)), txt,
+		HORIZONTAL_ALIGNMENT_LEFT, -1, fs, c)
+
+
 # The thing an arrow end dropped at p should stick to: a termling (they're
 # drawn on top), else the topmost box, preferring anything over a frame.
 func _bd_bind_at(p: Vector2, exclude: String) -> String:
@@ -4344,7 +4773,7 @@ func _bd_hit_solid(s: Dictionary, p: Vector2, tol: float) -> bool:
 					and Geometry2D.is_point_in_polygon(p, poly):
 				return true
 			return _bd_dist_poly(p, poly, true) <= tol + _bd_sw(s) * 0.5
-		"note", "text", "todo", "image", "bookmark", "calendar", "reminders":
+		"note", "text", "todo", "image", "bookmark", "calendar", "reminders", "files", "file":
 			return _bd_rect(s).grow(tol * 0.5).has_point(p)
 		"frame":
 			if _bd_frame_label_rect(s).has_point(p):
@@ -4565,6 +4994,22 @@ func _bd_select_down(p: Vector2, ev: InputEventMouseButton) -> void:
 		if _cal_click(_bd_by_id[id], p, ev):
 			_bd_g = "none"
 			return
+	# Folder views: header buttons and entries (a folder frame's list too; its
+	# empty ground still marquees). A file card opens on a double-click.
+	if not ev.shift_pressed:
+		var fv := id if id != "" and str(_bd_by_id[id]["type"]) == "files" else ""
+		if fv == "" and (id == "" or str(_bd_by_id[id]["type"]) == "frame"):
+			var under := _fs_view_at(p)
+			if under != "" and str(_bd_by_id[under]["type"]) == "frame":
+				fv = under
+		if fv != "" and _fs_click(_bd_by_id[fv], p, ev):
+			if _bd_g != "fsdrag":
+				_bd_g = "none"
+			return
+	if id != "" and str(_bd_by_id[id]["type"]) == "file" and ev.double_click:
+		OS.shell_open(str(_bd_by_id[id].get("path", "")))
+		_bd_g = "none"
+		return
 	# A todo list's checkboxes and "+ add item" row work on a single click.
 	if id != "" and str(_bd_by_id[id]["type"]) == "todo" and not ev.double_click:
 		var part := _bd_todo_part_at(_bd_by_id[id], p)
@@ -4631,6 +5076,8 @@ func _bd_pointer_move(p: Vector2, ev: InputEventMouseMotion) -> void:
 		"handle":
 			_bd_do_handle(p, ev)
 			_cal_follow(_bd_sel)
+		"fsdrag":
+			_fs_drag_move(p)
 		"box":
 			_bd_do_box(p, ev)
 		"draw":
@@ -4659,7 +5106,17 @@ func _bd_pointer_up(p: Vector2, _ev: InputEventMouseButton) -> void:
 				_bd_sel = _bd_with_groups([_bd_press_id])
 		"move":
 			_bd_move_ids = []
-			_bd_commit()
+			# A file card let go over a termling types its path there and goes back.
+			var fc = _bd_by_id.get(_bd_sel[0], null) if _bd_sel.size() == 1 else null
+			var tg := _group_at(p) if fc != null and str(fc["type"]) == "file" else null
+			if tg != null and _bd_pre != "":
+				_fs_paste(tg.term_id, str(fc.get("path", "")))
+				_bd_restore(_bd_pre)
+				_bd_pre = ""
+			else:
+				_bd_commit()
+		"fsdrag":
+			_fs_drag_up(p)
 		"handle":
 			if _bd_new_id != "" and not _bd_moved:
 				# A click with the arrow/line tool makes nothing.
@@ -4985,7 +5442,7 @@ func _bd_do_box(p: Vector2, ev: InputEventWithModifiers) -> void:
 
 func _bd_edit_at(id: String, p: Vector2) -> void:
 	var s: Dictionary = _bd_by_id[id]
-	if str(s["type"]) in ["calendar", "reminders"]:
+	if str(s["type"]) in ["calendar", "reminders", "files", "file"]:
 		return
 	if str(s["type"]) != "todo":
 		_bd_start_edit(id)
@@ -5016,7 +5473,7 @@ func _bd_edit_text(s: Dictionary, part: int) -> String:
 func _bd_start_edit(id: String, part := -1) -> void:
 	_bd_stop_edit()
 	var s = _bd_by_id.get(id, null)
-	if s == null or bool(s.get("locked", false)) or str(s["type"]) in ["bookmark", "calendar"]:
+	if s == null or bool(s.get("locked", false)) or str(s["type"]) in ["bookmark", "calendar", "files", "file"]:
 		return
 	var type := str(s["type"])
 	if type == "reminders" and part != -4:
@@ -5262,25 +5719,68 @@ func _bd_todo_part_at(s: Dictionary, p: Vector2) -> Dictionary:
 func _bd_draw() -> void:
 	if _cam == null:
 		return
+	_bd_drawn_area = _bd_view_area(0.5)
+	_bd_dz = _bd_detail_zoom()
+	var pad := 48.0 + _bd_frame_px() * 2.0   # strokes, shadows, frame titles above
 	for s in _bd_shapes:   # frames first: they're backdrops for what's in them
-		if str(s["type"]) == "frame":
+		if str(s["type"]) == "frame" and _bd_drawn_area.intersects(_bd_bounds(s).grow(pad)):
 			_bd_draw_shape(_bd_layer, s)
 	for s in _bd_shapes:
-		if str(s["type"]) != "frame" and not _bd_is_live(s) and _bd_shown(s):
+		if str(s["type"]) != "frame" and not _bd_is_live(s) and _bd_shown(s) \
+				and _bd_drawn_area.intersects(_bd_bounds(s).grow(pad)):
 			_bd_draw_shape(_bd_layer, s)
+
+
+# Zoomed out, detail below a pixel or so is skipped: sketchy wobble, hatching,
+# unreadable text (drawn as grey bars). Rounded up to a power of sqrt(2), so
+# the level (and the redraw it needs) only changes every half-doubling, and never
+# skips more than the true zoom would.
+func _bd_detail_zoom() -> float:
+	if _shooting:
+		return 8.0   # a screenshot has its own camera, maybe much closer in: full detail
+	return pow(2.0, ceilf(2.0 * log(maxf(_cam.zoom.x, 0.001)) / log(2.0)) * 0.5)
+
+
+# Text too small to read at the detail zoom: its lines as faint bars instead.
+const BD_GREEK_PX := 4.5
+func _bd_greek(ci: CanvasItem, pos: Vector2, text: String, fs: int, max_w: float, col: Color) -> bool:
+	if fs * _bd_dz >= BD_GREEK_PX:
+		return false
+	var c := Color(col.r, col.g, col.b, col.a * 0.35)
+	var y := pos.y
+	for line in text.split("\n"):
+		var w := float(line.strip_edges().length()) * fs * 0.5
+		if max_w > 0.0:
+			w = minf(w, max_w)
+		if w > 0.0:
+			ci.draw_rect(Rect2(pos.x, y + fs * 0.25, w, fs * 0.55), c)
+		y += fs * 1.2
+	return true
+
+
+# The world rect the user's camera shows, grown by `margin` views each side,
+# plus the rect of any board screenshot being rendered.
+func _bd_view_area(margin: float) -> Rect2:
+	var size := get_viewport().get_visible_rect().size / _cam.zoom
+	var r := Rect2(_cam.get_screen_center_position() - size * 0.5, size).grow_individual(
+		size.x * margin, size.y * margin, size.x * margin, size.y * margin)
+	if _shooting and _ground.extra.has_area():
+		r = r.merge(_ground.extra)
+	return r
 
 
 # An arrow with an end on a termling: it moves whenever the termling wanders.
 func _bd_is_live(s: Dictionary) -> bool:
 	return str(s["type"]) == "arrow" and (str(s.get("bind_a", "")).begins_with("term") \
-		or str(s.get("bind_b", "")).begins_with("term"))
+		or str(s.get("bind_b", "")).begins_with("term") or _anc_bound(s))
 
 
 func _bd_draw_live() -> void:
 	if _cam == null:
 		return
+	var area := _bd_view_area(0.1)
 	for s in _bd_shapes:
-		if _bd_is_live(s) and _bd_shown(s):
+		if _bd_is_live(s) and _bd_shown(s) and area.intersects(_bd_bounds(s).grow(48.0)):
 			_bd_draw_shape(_bd_live_layer, s)
 
 
@@ -5300,13 +5800,18 @@ func _bd_draw_shape(ci: CanvasItem, s: Dictionary) -> void:
 			_cal_draw(ci, s)
 		"reminders":
 			_cal_draw_rem(ci, s)
+		"files":
+			_fs_draw(ci, s)
+		"file":
+			_fs_draw_file(ci, s)
 		"text":
 			if str(s["id"]) != _bd_edit_id:
 				var fs := _bd_fs(s)
 				var f := _bd_font_of(s)
 				var width := -1.0 if bool(s.get("autosize", true)) else float(s["w"]) - 8.0
-				ci.draw_multiline_string(f, Vector2(float(s["x"]) + 4.0, float(s["y"]) + 2.0 + f.get_ascent(fs)),
-					str(s["text"]), HORIZONTAL_ALIGNMENT_LEFT, width, fs, -1, _bd_col(s))
+				if not _bd_greek(ci, Vector2(float(s["x"]) + 4.0, float(s["y"]) + 2.0), str(s["text"]), fs, width, _bd_col(s)):
+					ci.draw_multiline_string(f, Vector2(float(s["x"]) + 4.0, float(s["y"]) + 2.0 + f.get_ascent(fs)),
+						str(s["text"]), HORIZONTAL_ALIGNMENT_LEFT, width, fs, -1, _bd_col(s))
 		"note":
 			var r := _bd_rect(s)
 			ci.draw_rect(Rect2(r.position + Vector2(3, 5), r.size), Color(0, 0, 0, 0.28 * _bd_alpha))
@@ -5373,6 +5878,11 @@ func _bd_label(ci: CanvasItem, s: Dictionary, t: String, r: Rect2, col: Color) -
 	var fs := _bd_fs(s)
 	var f := _bd_font_of(s)
 	var width := maxf(r.size.x - BD_PAD * 2.0, 10.0)
+	if fs * _bd_dz < BD_GREEK_PX:
+		var n := t.count("\n") + 1
+		var bw := minf(width, float(t.length()) / n * fs * 0.5)
+		_bd_greek(ci, Vector2(r.get_center().x - bw * 0.5, r.get_center().y - n * fs * 0.6), t, fs, width, col)
+		return
 	var th := f.get_multiline_string_size(t, HORIZONTAL_ALIGNMENT_CENTER, width, fs).y
 	var pos := Vector2(r.position.x + BD_PAD, r.get_center().y - th * 0.5 + f.get_ascent(fs))
 	ci.draw_multiline_string(f, pos, t, HORIZONTAL_ALIGNMENT_CENTER, width, fs, -1, col)
@@ -5408,6 +5918,8 @@ func _bd_draw_frame(ci: CanvasItem, s: Dictionary) -> void:
 		label += "  · %d" % n
 	ci.draw_string(_bd_font("sans"), Vector2(r.position.x + 4.0, r.position.y - px * 0.45), label,
 		HORIZONTAL_ALIGNMENT_LEFT, -1, px, Color(c.r, c.g, c.b, 0.9 * _bd_alpha))
+	if str(s.get("path", "")) != "":
+		_fs_draw(ci, s)
 
 
 func _bd_draw_todo(ci: CanvasItem, s: Dictionary) -> void:
@@ -5471,14 +5983,17 @@ func _bd_draw_arrow(ci: CanvasItem, s: Dictionary) -> void:
 			_bd_head(ci, pts[pts.size() - 1], pts[pts.size() - 2], c, w)
 		if bool(s.get("head_a", false)):
 			_bd_head(ci, pts[0], pts[1], c, w)
+		_anc_draw_label(ci, str(s.get("bind_a", "")), pts[0], c)
+		_anc_draw_label(ci, str(s.get("bind_b", "")), pts[pts.size() - 1], c)
 	var t := str(s.get("text", ""))
 	if t != "" and str(s["id"]) != _bd_edit_id:
 		var lr := _bd_arrow_label_rect(s)
 		ci.draw_rect(lr, Color(0.155, 0.14, 0.13, 0.92 * _bd_alpha))   # ground colour: the label cuts the shaft
 		var f := _bd_font_of(s)
 		var fs := _bd_fs(s)
-		ci.draw_multiline_string(f, lr.position + Vector2(6, 2 + f.get_ascent(fs)), t,
-			HORIZONTAL_ALIGNMENT_LEFT, -1, fs, -1, c)
+		if not _bd_greek(ci, lr.position + Vector2(6, 2), t, fs, lr.size.x - 12.0, c):
+			ci.draw_multiline_string(f, lr.position + Vector2(6, 2 + f.get_ascent(fs)), t,
+				HORIZONTAL_ALIGNMENT_LEFT, -1, fs, -1, c)
 
 
 func _bd_head(ci: CanvasItem, tip: Vector2, from: Vector2, c: Color, w: float) -> void:
@@ -5520,6 +6035,8 @@ func _bd_draw_overlay() -> void:
 			var hrad := (3.5 if h["kind"] == "bend" else 5.0) / z
 			o.draw_circle(h["pos"], hrad, Color(1, 1, 1))
 			o.draw_arc(h["pos"], hrad, 0.0, TAU, 20, BD_SEL, lw, true)
+	if _bd_g == "fsdrag" and _bd_moved:
+		_fs_draw_ghost(o)
 	if _bd_g == "marquee" and _bd_moved:
 		o.draw_rect(_bd_marquee, Color(BD_SEL, 0.08))
 		o.draw_rect(_bd_marquee, BD_SEL, false, lw)
@@ -5540,6 +6057,8 @@ func _bd_draw_overlay() -> void:
 func _bd_key(ev: InputEventKey) -> bool:
 	if _bd_edit_id != "":
 		return false
+	if not ev.echo and _fs_key(ev):
+		return true
 	_bd_last_input_ms = Time.get_ticks_msec()
 	var k := ev.keycode
 	var cmd := ev.meta_pressed or ev.ctrl_pressed
@@ -5742,6 +6261,43 @@ func _bd_unfocus_termling() -> void:
 	for oid in _groups:
 		_groups[oid].terminal.set_focused(false)
 	_bd_update_hint()
+
+
+# The tool bar and style panel fade out while you're zoomed in on something (a
+# focused termling or page filling most of the window, a presented one, or a frame
+# filling it), so they don't cover it. They come back while the board is in use
+# or when the pointer goes near them.
+func _bd_fade_chrome(delta: float) -> void:
+	if _bd_bar == null:
+		return
+	var want := 0.0 if _bd_zoomed_in_on_content() else 1.0
+	if _bd_owns_keyboard() or not _bd_sel.is_empty():
+		want = 1.0
+	var m := get_viewport().get_mouse_position()
+	var near := 40.0 * maxf(_bd_ui_scale, 1.0)
+	for c in [_bd_bar, _bd_style_panel]:
+		if c.get_global_rect().grow(near).has_point(m):
+			want = 1.0
+	_bd_chrome_a = move_toward(_bd_chrome_a, want, delta * 4.0)
+	for c in [_bd_bar, _bd_style_panel, _bd_hint]:
+		c.modulate.a = _bd_chrome_a
+		c.visible = _bd_chrome_a > 0.02   # hidden, it can't eat clicks meant for what's under it
+
+
+func _bd_zoomed_in_on_content() -> bool:
+	if _present_id != -1:
+		return true
+	var vp := get_viewport().get_visible_rect().size
+	if _focused_id != -1 and _groups.has(_focused_id):
+		var on: Vector2 = _groups[_focused_id].terminal.onscreen_size() * _cam.zoom.x
+		if on.x >= vp.x * 0.6 or on.y >= vp.y * 0.6:
+			return true
+	var view := _bd_view_area(0.0)
+	for s in _bd_shapes:
+		if str(s["type"]) == "frame" and _bd_shown(s) \
+				and _bd_rect(s).intersection(view).get_area() >= view.get_area() * 0.8:
+			return true
+	return false
 
 
 func _bd_owns_keyboard() -> bool:
@@ -6135,15 +6691,13 @@ func _bd_container_label(id: String) -> String:
 	var r := _bd_bounds(s)
 	var heading := ""
 	var best_d := INF
-	for t in _bd_shapes:
-		if str(t["id"]) == id or not str(t["type"]) in ["text", "note"]:
+	for h in (_bd_heading_memo if _bd_heading_memo != null else _bd_headings()):
+		if h["id"] == id:
 			continue
-		var txt := str(t.get("text", "")).strip_edges().get_slice("\n", 0)
-		if txt == "":
-			continue
-		if grp != "" and str(t.get("group", "")) == grp:
+		var txt: String = h["text"]
+		if grp != "" and h["group"] == grp:
 			return txt
-		var b := _bd_bounds(t)
+		var b: Rect2 = h["bounds"]
 		if b.position.x < r.end.x and b.end.x > r.position.x \
 				and b.end.y >= r.position.y - 80.0 and b.position.y <= r.position.y + 80.0:
 			var d := absf(b.end.y - r.position.y)
@@ -6151,6 +6705,20 @@ func _bd_container_label(id: String) -> String:
 				best_d = d
 				heading = txt
 	return heading
+
+
+# The board's text/note shapes as candidate container headings. _write_state
+# names every zone five times a second, so it builds this once per write.
+var _bd_heading_memo = null
+func _bd_headings() -> Array:
+	var out := []
+	for t in _bd_shapes:
+		if not str(t["type"]) in ["text", "note"]:
+			continue
+		var txt := str(t.get("text", "")).strip_edges().get_slice("\n", 0)
+		if txt != "":
+			out.append({"id": str(t["id"]), "text": txt, "group": str(t.get("group", "")), "bounds": _bd_bounds(t)})
+	return out
 
 
 # A container by shape id or by name (see _bd_container_label).
@@ -6235,10 +6803,7 @@ func _bd_save_now() -> void:
 					s["bind_" + e] = _bd_term_key(id)
 	var txt := JSON.stringify({"version": 1, "next": _bd_next, "ui_scale": _bd_ui_user, "shapes": _bd_shapes})
 	for path in [BOARD_SAVE, BOARD_MIRROR]:
-		var f := FileAccess.open(path, FileAccess.WRITE)
-		if f:
-			f.store_string(txt)
-			f.close()
+		_write_atomic(path, txt)
 
 
 func _bd_load() -> bool:
@@ -6430,7 +6995,7 @@ func _bd_ref_key(v) -> String:
 	if v == null:
 		return ""
 	var r := str(v)
-	return r if r.begins_with("term") else _bd_lookup(r)
+	return r if r.begins_with("term") or r.begins_with("anchor:") else _bd_lookup(r)
 
 
 func _bd_todo_find(items: Array, ref) -> int:
@@ -6517,6 +7082,7 @@ func _bd_build_ui() -> void:
 	bar.grow_horizontal = Control.GROW_DIRECTION_BOTH
 	bar.grow_vertical = Control.GROW_DIRECTION_BEGIN
 	ui.add_child(bar)
+	_bd_bar = bar
 	var hb := HBoxContainer.new()
 	hb.add_theme_constant_override("separation", 2)
 	bar.add_child(hb)
@@ -6561,6 +7127,7 @@ func _bd_build_ui() -> void:
 	sp.offset_right = 14
 	sp.grow_vertical = Control.GROW_DIRECTION_BOTH
 	ui.add_child(sp)
+	_bd_style_panel = sp
 	var vb := VBoxContainer.new()
 	vb.add_theme_constant_override("separation", 6)
 	sp.add_child(vb)
@@ -6726,6 +7293,7 @@ func _bd_help_input(ev: InputEvent) -> void:
 
 func _bd_context_menu(p: Vector2, screen: Vector2) -> void:
 	_bd_stop_edit()
+	_fs_menu_term = _focused_id
 	_bd_unfocus_termling()
 	var id := _bd_hit(p, true)
 	if id != "" and not _bd_sel.has(id):
@@ -6760,6 +7328,7 @@ func _bd_context_menu(p: Vector2, screen: Vector2) -> void:
 			m.add_item("Refresh", 42)
 			m.add_item("Connect Google Calendar", 43)
 			m.add_separator()
+	_fs_menu_items(m)
 	m.add_item("Calendar", 40)
 	m.add_item("Reminders", 41)
 	m.add_separator()
@@ -6830,6 +7399,8 @@ func _bd_menu_pick(id: int) -> void:
 			_cal_refetch_at = Time.get_ticks_msec()
 		43:
 			_cal_google_auth()
+		50, 51, 52, 53, 54, 55, 56, 58, 59, 60, 61:
+			_fs_menu_pick(id)
 	_bd_ui_refresh()
 
 
@@ -7279,7 +7850,7 @@ func _bd_is_url(t: String) -> bool:
 	if t.length() < 10 or t.contains(" ") or t.contains("\n") or t.contains("\t"):
 		return false
 	var lo := t.to_lower()
-	return lo.begins_with("https://") or lo.begins_with("http://")
+	return lo.begins_with("https://") or lo.begins_with("http://") or lo.begins_with("vibemacs://")
 
 
 func _bd_add_bookmark(url: String, at: Vector2) -> String:
@@ -7574,7 +8145,10 @@ func _bd_seed(s: Dictionary) -> int:
 # seeded wobble (so it holds still between frames), in two passes like a pen
 # going over its own line. Ends stay put so arrowheads still meet their tips.
 func _bd_sketch(ci: CanvasItem, path: PackedVector2Array, col: Color, w: float, seed: int) -> void:
-	var step := maxf(10.0, w * 5.0)
+	if maxf(1.2, w * 0.6) * _bd_dz < 1.0:   # the wobble would be under a pixel
+		ci.draw_polyline(path, col, w, true)
+		return
+	var step := maxf(maxf(10.0, w * 5.0), 6.0 / _bd_dz)
 	var rs := PackedVector2Array([path[0]])
 	for i in range(path.size() - 1):
 		var a := path[i]
@@ -7601,6 +8175,9 @@ func _bd_sketch(ci: CanvasItem, path: PackedVector2Array, col: Color, w: float, 
 func _bd_hatch(ci: CanvasItem, poly: PackedVector2Array, r: Rect2, c: Color, w: float) -> void:
 	var gap := 8.0 + w * 2.0
 	var col := Color(c.r, c.g, c.b, 0.55 * c.a)
+	if gap * _bd_dz < 4.0:   # lines too dense to tell apart: a tint instead
+		ci.draw_colored_polygon(poly, Color(c.r, c.g, c.b, 0.2 * c.a))
+		return
 	var x := -r.size.y
 	while x < r.size.x:
 		var a := Vector2(r.position.x + x, r.end.y)
@@ -8459,11 +9036,11 @@ func _cal_draw_rem(ci: CanvasItem, s: Dictionary) -> void:
 # --- pins: annotations that live on a day ---
 
 func _bd_shown(s: Dictionary) -> bool:
-	return not bool(s.get("hidden", false))
+	return not bool(s.get("hidden", false)) and not _anc_gone(s)
 
 
 func _cal_pinnable(s: Dictionary) -> bool:
-	return not (str(s["type"]) in ["calendar", "reminders", "frame"])
+	return not (str(s["type"]) in ["calendar", "reminders", "frame", "files"])
 
 
 # The shape's geometry in the calendar's own (unrotated) frame.
@@ -8691,3 +9268,1369 @@ func _cal_list_pick(id: int) -> void:
 	w["hidden_cals"] = hide
 	_bd_commit()
 	sub.set_item_checked(idx, not hide.has(str(meta[1])))
+
+
+# --- files: folder views ----------------------------------------------------------
+# A "files" board widget and folder frames (a frame with a "path") show a real
+# folder, as a tree or as icons. Shape fields: path, mode ("tree" | "icons"),
+# open (expanded dirs in the tree), sel (selected path), scroll, changed (only
+# files git reports changed, or modified lately outside a repo), touched (only
+# files the termling's agent - claude, codex or opencode - has read or edited,
+# from its own transcript: see cove_files.py touched), dots (show
+# hidden files), follow (false stops a widget tied to a termling by an arrow from
+# following its cwd). Listings are read here with DirAccess, one folder at a
+# time; mcp/cove_files.py scans the changes in the background.
+#
+# Drag an entry onto a termling to type its path; onto open board to leave a
+# "file" card. Dropping a termling into a folder frame cds its shell there (only
+# a shell with nothing running). Cmd+O opens a picker at the focused termling's
+# cwd: Enter types the path into it, Cmd+Enter cds it, Shift+Enter starts a new
+# terminal in that folder, Esc goes back.
+
+const FS_HELPER := "res://mcp/cove_files.py"
+const FS_W := 540.0
+const FS_H := 440.0
+const FS_HEAD := 40.0
+const FS_BAR := 28.0            # a folder frame's own header strip
+const FS_ROW := 22.0
+const FS_TILE := Vector2(92, 88)
+const FS_MAX := 400             # entries listed per folder
+const FS_RELIST_MS := 2000
+const FS_CHANGES_MS := 5000
+const FS_FILE_W := 250.0
+const FS_FILE_H := 48.0
+const FS_FOLDER_COL := Color(0.42, 0.62, 0.92)
+const FS_ST_COL := {"M": Color(0.92, 0.72, 0.32), "A": Color(0.45, 0.8, 0.5), "??": Color(0.45, 0.8, 0.5),
+	"D": Color(0.92, 0.45, 0.45), "R": Color(0.7, 0.55, 0.95), "recent": Color(0.36, 0.62, 1.0),
+	"edit": Color(0.92, 0.72, 0.32), "read": Color(0.45, 0.68, 0.95)}
+const FS_ST_NAME := {"M": "modified", "A": "added", "??": "new", "D": "deleted", "R": "renamed", "recent": "edited",
+	"edit": "edited", "read": "read"}
+
+var _fs_cache := {}      # dir -> {entries, more, mtime, checked, used}
+var _fs_changes := {}    # root -> {files, dirs, top, at}
+var _fs_fetch := {}      # out path -> {root, t}
+var _fs_thumbs := {}     # image path -> Texture2D (or null: couldn't load)
+var _fs_thumb_budget := 0
+var _fs_drag := {}       # {id, path, dir, toggle} while an entry is pressed/dragged
+var _fs_active := ""     # the folder frame whose contents were last clicked (it gets the keys)
+var _fs_quick := ""      # the Cmd+O picker's shape id
+var _fs_quick_term := -1 # ...and the termling it opened from
+var _fs_menu_term := -1  # the termling focused when the board menu opened
+var _fs_menu_id := ""    # the view the board menu is about
+var _fs_touched := {}    # term id -> {files: {path: {op, t, n}}, at, agent}: what its agent read/edited
+var _fs_tfetch := {}     # out path -> {term, t}
+var _fs_tmap := {}       # view id -> {at, files, dirs}: the merged touched map a view shows
+var _fs_quick_cam := {}  # camera state before the Cmd+O picker: {present, tracking, zoom, pos}
+
+
+func _fs_is_view(s: Dictionary) -> bool:
+	var t := str(s["type"])
+	return t == "files" or (t == "frame" and str(s.get("path", "")) != "")
+
+
+# The tree shows only some paths (all folders open, none to toggle).
+func _fs_pruned(s: Dictionary) -> bool:
+	return bool(s.get("changed", false)) or bool(s.get("touched", false))
+
+
+func _fs_home() -> String:
+	return OS.get_environment("HOME")
+
+
+func _fs_abbrev(p: String) -> String:
+	var h := _fs_home()
+	if h != "" and (p == h or p.begins_with(h + "/")):
+		return "~" + p.substr(h.length())
+	return p
+
+
+func _fs_parent(p: String) -> String:
+	var d := p.get_base_dir()
+	return d if d != "" else "/"
+
+
+func _fs_quote(p: String) -> String:
+	return "'" + p.replace("'", "'\\''") + "'"
+
+
+func _fs_touch() -> void:
+	_bd_dirty = true
+	_bd_save_in = 0.4
+
+
+func _fs_age(mtime: float) -> String:
+	var d := Time.get_unix_time_from_system() - mtime
+	if mtime <= 0.0:
+		return ""
+	if d < 60.0:
+		return "now"
+	if d < 3600.0:
+		return "%dm" % int(d / 60.0)
+	if d < 86400.0:
+		return "%dh" % int(d / 3600.0)
+	return "%dd" % int(d / 86400.0)
+
+
+# --- listing ---
+
+func _fs_list(dir: String, dots: bool) -> Dictionary:
+	var c = _fs_cache.get(dir, null)
+	var now := Time.get_ticks_msec()
+	if c == null:
+		var entries := []
+		var more := 0
+		var ok := false
+		var da := DirAccess.open(dir)
+		if da != null:
+			ok = true
+			da.include_hidden = true
+			da.list_dir_begin()
+			var n := da.get_next()
+			while n != "":
+				if n != "." and n != "..":
+					if entries.size() < FS_MAX * 2:
+						entries.append({"name": n, "path": dir.path_join(n), "dir": da.current_is_dir(),
+							"ext": n.get_extension().to_lower()})
+					else:
+						more += 1
+				n = da.get_next()
+			da.list_dir_end()
+		entries.sort_custom(func(a, b):
+			if bool(a["dir"]) != bool(b["dir"]):
+				return bool(a["dir"])
+			return str(a["name"]).naturalnocasecmp_to(str(b["name"])) < 0)
+		c = {"entries": entries, "more": more, "ok": ok, "mtime": FileAccess.get_modified_time(dir),
+			"checked": now, "used": now}
+		_fs_cache[dir] = c
+	c["used"] = now
+	var out := []
+	var more: int = c["more"]
+	for e in c["entries"]:
+		if not dots and str(e["name"]).begins_with("."):
+			continue
+		if out.size() >= FS_MAX:
+			more += 1
+			continue
+		out.append(e)
+	return {"entries": out, "more": more, "ok": c["ok"]}
+
+
+func _fs_path(s: Dictionary) -> String:
+	var p := str(s.get("path", ""))
+	return p if p != "" else _fs_home()
+
+
+func _fs_mode(s: Dictionary) -> String:
+	return str(s.get("mode", "icons" if str(s["type"]) == "frame" else "tree"))
+
+
+# The termlings whose agents a "touched" view shows: the one it's tied to (arrow
+# or Cmd+O), else every agent working in or under its folder.
+func _fs_touch_terms(s: Dictionary) -> Array:
+	if str(s["id"]) == _fs_quick and _groups.has(_fs_quick_term):
+		return [_fs_quick_term]
+	var key := _fs_follow_key(s, true)
+	if key != "":
+		var id := _bd_term_id(key)
+		return [id] if id != -1 else []
+	var root := _fs_path(s)
+	var out := []
+	for id in _groups:
+		var pane: int = _groups[id].terminal.pane_id
+		var info: Dictionary = _agents.get(pane, {})
+		var cwd := str(info.get("cwd", ""))
+		if str(info.get("agent", "shell")) == "shell" or cwd == "":
+			continue
+		if cwd == root or cwd.begins_with(root + "/") or root.begins_with(cwd + "/"):
+			out.append(id)
+	return out
+
+
+func _fs_is_agent(id: int) -> bool:
+	if not _groups.has(id):
+		return false
+	var pane: int = _groups[id].terminal.pane_id
+	return str(_agents.get(pane, {}).get("agent", "shell")) != "shell"
+
+
+# Everything a touched view's agents read or edited: path -> {st: "edit"|"read",
+# mtime (last touch), who}; plus dirs -> count, for the tree's folder rows.
+func _fs_touch_map(s: Dictionary) -> Dictionary:
+	var sid := str(s["id"])
+	var now := Time.get_ticks_msec()
+	var c = _fs_tmap.get(sid, null)
+	if c != null and now - int(c["at"]) < 300:
+		return c
+	var files := {}
+	var terms := _fs_touch_terms(s)
+	for id in terms:
+		var td = _fs_touched.get(id, null)
+		if td == null:
+			continue
+		var who := _fs_term_label(id) if terms.size() > 1 else ""
+		for p: String in td["files"]:
+			var e: Dictionary = td["files"][p]
+			var t := float(e.get("t", 0.0))
+			var old = files.get(p, null)
+			if old == null or t > float(old["mtime"]):
+				files[p] = {"st": "edit" if str(e.get("op", "")) == "edit" else "read", "mtime": t, "who": who,
+					"n": int(e.get("n", 1))}
+			elif str(e.get("op", "")) == "edit":
+				old["st"] = "edit"
+	var dirs := {}
+	for p: String in files:
+		var q := _fs_parent(p)
+		var guard := 0
+		while q != "/" and guard < 64:
+			dirs[q] = maxf(float(dirs.get(q, 0.0)), float(files[p]["mtime"]))
+			q = _fs_parent(q)
+			guard += 1
+	c = {"at": now, "files": files, "dirs": dirs, "loaded": terms.any(func(i): return _fs_touched.has(i) and not _fs_touched[i].has("pending"))}
+	_fs_tmap[sid] = c
+	return c
+
+
+func _fs_status(root: String, path: String, s = null) -> Dictionary:
+	if s != null and bool(s.get("touched", false)):
+		var tm := _fs_touch_map(s)
+		var tf = tm["files"].get(path, null)
+		if tf != null:
+			return tf
+		var n := 0
+		for p: String in tm["files"]:
+			if p.begins_with(path + "/"):
+				n += 1
+		return {"st": "tdir", "n": n} if n > 0 else {}
+	var ch = _fs_changes.get(root, null)
+	if ch == null:
+		return {}
+	var f = ch["files"].get(path, null)
+	if f != null:
+		return f
+	var n = ch["dirs"].get(path, null)
+	return {"st": "dir", "n": n} if n != null else {}
+
+
+# The rows of the tree: expanded folders nest; "changed" shows only the paths
+# to changed files, all open.
+func _fs_rows(s: Dictionary) -> Array:
+	var root := _fs_path(s)
+	var rows := []
+	if bool(s.get("touched", false)):
+		var tm := _fs_touch_map(s)
+		var tree := {}
+		for p: String in tm["files"]:
+			var parts: PackedStringArray
+			if p.begins_with(root + "/"):
+				parts = p.substr(root.length() + 1).split("/", false)
+			else:   # outside the folder: under its own (abbreviated) parent
+				parts = PackedStringArray([_fs_abbrev(_fs_parent(p)), p.get_file()])
+			var node := tree
+			for i in parts.size():
+				var k := parts[i]
+				if not node.has(k):
+					node[k] = {}
+				node = node[k]
+		_fs_rows_from(tree, root, 0, rows, tm)
+		return rows
+	if bool(s.get("changed", false)):
+		var ch = _fs_changes.get(root, null)
+		if ch == null:
+			return rows
+		var tree := {}
+		for p: String in ch["files"]:
+			if not p.begins_with(root + "/"):
+				continue
+			var parts := p.substr(root.length() + 1).split("/", false)
+			var node := tree
+			for i in parts.size():
+				var k := parts[i]
+				if not node.has(k):
+					node[k] = {}
+				node = node[k]
+		_fs_rows_from(tree, root, 0, rows)
+		return rows
+	var open: Array = s.get("open", [])
+	_fs_rows_walk(root, 0, open, bool(s.get("dots", false)), rows)
+	return rows
+
+
+func _fs_rows_from(node: Dictionary, base: String, depth: int, rows: Array, tm = null) -> void:
+	var keys := node.keys()
+	if tm != null:   # touched: most recently touched first, folders by their newest file
+		var when := func(k) -> float:
+			var p := _fs_key_path(base, str(k))
+			return float(tm["files"][p]["mtime"]) if tm["files"].has(p) else float(tm["dirs"].get(p, 0.0))
+		keys.sort_custom(func(a, b): return when.call(a) > when.call(b))
+	else:
+		keys.sort_custom(func(a, b):
+			var ad: bool = not node[a].is_empty()
+			var bd: bool = not node[b].is_empty()
+			if ad != bd:
+				return ad
+			return str(a).naturalnocasecmp_to(str(b)) < 0)
+	for k in keys:
+		var p := _fs_key_path(base, str(k))
+		var kids: Dictionary = node[k]
+		rows.append({"name": str(k), "path": p, "dir": not kids.is_empty(), "depth": depth, "open": true,
+			"ext": str(k).get_extension().to_lower()})
+		if not kids.is_empty() and rows.size() < 2000:
+			_fs_rows_from(kids, p, depth + 1, rows, tm)
+
+
+# A pruned-tree key under base; an outside-the-folder group is keyed by its
+# abbreviated absolute path ("~/.claude/...") and stands for that directory.
+func _fs_key_path(base: String, k: String) -> String:
+	if k.begins_with("~/"):
+		return _fs_home() + k.substr(1)
+	if k.begins_with("/"):
+		return k
+	return base.path_join(k)
+
+
+func _fs_rows_walk(dir: String, depth: int, open: Array, dots: bool, rows: Array) -> void:
+	var L := _fs_list(dir, dots)
+	if not bool(L["ok"]) and depth == 0:
+		return
+	for e in L["entries"]:
+		if rows.size() >= 2000:
+			return
+		var isopen: bool = bool(e["dir"]) and open.has(str(e["path"]))
+		rows.append({"name": e["name"], "path": e["path"], "dir": e["dir"], "depth": depth, "open": isopen,
+			"ext": e["ext"]})
+		if isopen and depth < 12:
+			_fs_rows_walk(str(e["path"]), depth + 1, open, dots, rows)
+	if int(L["more"]) > 0:
+		rows.append({"name": "+%d more" % int(L["more"]), "path": "", "dir": false, "depth": depth,
+			"open": false, "ext": "", "more": true})
+
+
+# The icon grid: the folder's entries, or with "changed" every changed file
+# under it, newest first.
+func _fs_tiles(s: Dictionary) -> Array:
+	var root := _fs_path(s)
+	if bool(s.get("touched", false)):
+		var tm := _fs_touch_map(s)
+		var tl := []
+		for p: String in tm["files"]:
+			tl.append({"name": p.get_file(), "path": p, "dir": false, "ext": p.get_extension().to_lower(),
+				"mtime": float(tm["files"][p]["mtime"])})
+		tl.sort_custom(func(a, b): return float(a["mtime"]) > float(b["mtime"]))
+		return tl.slice(0, FS_MAX)
+	if bool(s.get("changed", false)):
+		var ch = _fs_changes.get(root, null)
+		if ch == null:
+			return []
+		var out := []
+		for p: String in ch["files"]:
+			if p.begins_with(root + "/"):
+				out.append({"name": p.get_file(), "path": p, "dir": DirAccess.dir_exists_absolute(p),
+					"ext": p.get_extension().to_lower(), "mtime": float(ch["files"][p].get("mtime", 0.0))})
+		out.sort_custom(func(a, b): return float(a["mtime"]) > float(b["mtime"]))
+		return out.slice(0, FS_MAX)
+	return _fs_list(root, bool(s.get("dots", false)))["entries"]
+
+
+# --- layout + hit testing ---
+
+func _fs_layout(s: Dictionary) -> Dictionary:
+	var r := _bd_rect(s)
+	var frame := str(s["type"]) == "frame"
+	var head: Rect2
+	var body: Rect2
+	if frame:
+		head = Rect2(r.position + Vector2(8, 8), Vector2(maxf(r.size.x - 16.0, 10.0), FS_BAR))
+		body = Rect2(r.position.x + 8.0, head.end.y + 6.0, r.size.x - 16.0, maxf(r.end.y - head.end.y - 14.0, 10.0))
+		if _fs_mode(s) == "tree":
+			body.size.x = minf(280.0, r.size.x * 0.45)   # the rest of the frame stays open ground
+	else:
+		head = Rect2(r.position, Vector2(r.size.x, FS_HEAD))
+		body = Rect2(r.position.x + 6.0, head.end.y + 4.0, r.size.x - 12.0, maxf(r.size.y - FS_HEAD - 10.0, 10.0))
+	var h := head.size.y - (12.0 if frame else 16.0)
+	var y := head.position.y + (head.size.y - h) * 0.5
+	var x := head.end.x - (4.0 if frame else 10.0)
+	var specs := [["up", "↑", 28.0], ["touched", "touched", 68.0], ["changed", "changed", 70.0],
+		["icons", "icons", 50.0], ["tree", "tree", 44.0]]
+	if not frame and _fs_follow_key(s, true) != "":
+		specs.append(["follow", "follow", 58.0])
+	var buttons := []
+	for sp in specs:
+		x -= float(sp[2])
+		buttons.append([sp[0], sp[1], Rect2(x, y, float(sp[2]), h)])
+		x -= 4.0
+	return {"head": head, "body": body, "buttons": buttons, "frame": frame, "title_w": maxf(x - head.position.x - 12.0, 20.0)}
+
+
+func _fs_cols(body: Rect2) -> int:
+	return maxi(1, int(body.size.x / FS_TILE.x))
+
+
+func _fs_content_h(s: Dictionary, L: Dictionary) -> float:
+	if _fs_mode(s) == "tree":
+		return _fs_rows(s).size() * FS_ROW
+	var n := _fs_tiles(s).size()
+	return ceili(float(n) / _fs_cols(L["body"])) * FS_TILE.y
+
+
+func _fs_clamp_scroll(s: Dictionary, L: Dictionary) -> void:
+	var mx := maxf(_fs_content_h(s, L) - (L["body"] as Rect2).size.y, 0.0)
+	s["scroll"] = clampf(float(s.get("scroll", 0.0)), 0.0, mx)
+
+
+# Items as [item, rect] in world space (scrolled), in order.
+func _fs_items(s: Dictionary, L: Dictionary) -> Array:
+	var body: Rect2 = L["body"]
+	var sc := float(s.get("scroll", 0.0))
+	var out := []
+	if _fs_mode(s) == "tree":
+		var rows := _fs_rows(s)
+		for i in rows.size():
+			out.append([rows[i], Rect2(body.position.x, body.position.y + i * FS_ROW - sc, body.size.x, FS_ROW)])
+	else:
+		var tiles := _fs_tiles(s)
+		var cols := _fs_cols(body)
+		var tw := body.size.x / cols
+		for i in tiles.size():
+			out.append([tiles[i], Rect2(body.position.x + (i % cols) * tw, body.position.y + floori(i / float(cols)) * FS_TILE.y - sc,
+				tw, FS_TILE.y)])
+	return out
+
+
+func _fs_item_at(s: Dictionary, L: Dictionary, p: Vector2) -> Dictionary:
+	var body: Rect2 = L["body"]
+	if not body.has_point(p):
+		return {}
+	for it in _fs_items(s, L):
+		if (it[1] as Rect2).has_point(p) and str(it[0]["path"]) != "":
+			return it[0]
+	return {}
+
+
+# The topmost folder view whose contents are under p: a files widget, or a
+# folder frame's header/list (a frame's empty ground stays the board's).
+func _fs_view_at(p: Vector2) -> String:
+	for i in range(_bd_shapes.size() - 1, -1, -1):
+		var s: Dictionary = _bd_shapes[i]
+		if not _fs_is_view(s) or not _bd_shown(s):
+			continue
+		var lp := _bd_local(s, p)
+		if str(s["type"]) == "files":
+			if _bd_rect(s).has_point(lp):
+				return str(s["id"])
+			continue
+		var L := _fs_layout(s)
+		if (L["head"] as Rect2).has_point(lp) or not _fs_item_at(s, L, lp).is_empty():
+			return str(s["id"])
+	return ""
+
+
+# --- following a termling ---
+
+# The termling a widget follows: one an arrow ties it to. any=true ignores the
+# follow switch (the header shows the button either way).
+func _fs_follow_key(s: Dictionary, any := false) -> String:
+	if str(s["type"]) != "files" or (not any and not bool(s.get("follow", true))):
+		return ""
+	var sid := str(s["id"])
+	for a in _bd_shapes:
+		if str(a["type"]) != "arrow":
+			continue
+		var ka := str(a.get("bind_a", ""))
+		var kb := str(a.get("bind_b", ""))
+		if ka == sid and kb.begins_with("term"):
+			return kb
+		if kb == sid and ka.begins_with("term"):
+			return ka
+	return ""
+
+
+func _fs_term_cwd(id: int) -> String:
+	if not _groups.has(id):
+		return ""
+	var pane: int = _groups[id].terminal.pane_id
+	return str(_agents.get(pane, {}).get("cwd", ""))
+
+
+# --- ticking: follow, changes, relisting ---
+
+func _fs_tick() -> void:
+	var now := Time.get_ticks_msec()
+	var roots := {}
+	var want_terms := {}
+	for s in _bd_shapes.duplicate():
+		if str(s["type"]) == "files" and bool(s.get("transient", false)) and str(s["id"]) != _fs_quick:
+			_bd_remove([str(s["id"])])   # a picker left over from before a reload
+			continue
+		if not _fs_is_view(s) or not _bd_shown(s):
+			continue
+		var key := _fs_follow_key(s)
+		if key != "":
+			var cwd := _fs_term_cwd(_bd_term_id(key))
+			if cwd != "" and cwd != str(s.get("followed", "")):
+				s["followed"] = cwd
+				if cwd != str(s.get("path", "")):
+					s["path"] = cwd
+					s["scroll"] = 0.0
+					s["sel"] = ""
+				_fs_touch()
+		roots[_fs_path(s)] = true
+		if bool(s.get("touched", false)):
+			for id in _fs_touch_terms(s):
+				want_terms[id] = true
+	_fs_tick_touched(want_terms, now)
+	# Changed files for every folder on show, a few seconds apart.
+	var busy := {}
+	for out in _fs_fetch.keys():
+		busy[str(_fs_fetch[out]["root"])] = true
+	for root in roots:
+		var ch = _fs_changes.get(root, null)
+		if busy.has(root) or (ch != null and now - int(ch["at"]) < FS_CHANGES_MS):
+			continue
+		var dir := DIR + "/files"
+		DirAccess.make_dir_recursive_absolute(dir)
+		var out := dir + "/changes-%d-%d.json" % [now, roots.keys().find(root)]
+		if _create_process("/usr/bin/python3", [ProjectSettings.globalize_path(FS_HELPER), "changes", out, root]) != -1:
+			_fs_fetch[out] = {"root": root, "t": now}
+		if ch == null:
+			_fs_changes[root] = {"files": {}, "dirs": {}, "top": "", "at": now}
+		else:
+			ch["at"] = now
+	for out in _fs_fetch.keys():
+		var root := str(_fs_fetch[out]["root"])
+		if FileAccess.file_exists(out):
+			var d = _cal_read_json(out)
+			_fs_fetch.erase(out)
+			if typeof(d) == TYPE_DICTIONARY and bool(d.get("ok", false)):
+				_fs_set_changes(root, d)
+		elif now - int(_fs_fetch[out]["t"]) > 20000:
+			_fs_fetch.erase(out)
+	# A folder whose entries changed is read again; ones nobody shows are dropped.
+	for dir in _fs_cache.keys():
+		var c: Dictionary = _fs_cache[dir]
+		if now - int(c["used"]) > 30000:
+			_fs_cache.erase(dir)
+		elif now - int(c["checked"]) > FS_RELIST_MS:
+			c["checked"] = now
+			if FileAccess.get_modified_time(dir) != int(c["mtime"]):
+				_fs_cache.erase(dir)
+				_bd_dirty = true
+
+
+# Each agent a touched view shows re-reads its transcript every few seconds.
+func _fs_tick_touched(want: Dictionary, now: int) -> void:
+	var busy := {}
+	for out in _fs_tfetch.keys():
+		var id := int(_fs_tfetch[out]["term"])
+		if FileAccess.file_exists(out):
+			var d = _cal_read_json(out)
+			_fs_tfetch.erase(out)
+			if typeof(d) == TYPE_DICTIONARY and bool(d.get("ok", false)):
+				var files: Dictionary = d.get("files", {})
+				var old = _fs_touched.get(id, null)
+				var sig := hash(files)
+				_fs_touched[id] = {"files": files, "at": now, "agent": str(d.get("agent", "")), "sig": sig}
+				if old == null or int(old.get("sig", 0)) != sig:
+					_fs_tmap.clear()
+					_bd_dirty = true
+					_fs_quick_pick_first()
+		elif now - int(_fs_tfetch[out]["t"]) > 20000:
+			_fs_tfetch.erase(out)
+		else:
+			busy[id] = true
+	for id in want:
+		if busy.has(id) or not _groups.has(id):
+			continue
+		var td = _fs_touched.get(id, null)
+		if td != null and now - int(td["at"]) < 3000:
+			continue
+		var info: Dictionary = _agents.get(_groups[id].terminal.pane_id, {})
+		var agent := str(info.get("agent", "shell"))
+		var pid := int(info.get("pid", -1))
+		if agent == "shell" or pid <= 0:
+			continue
+		var dir := DIR + "/files"
+		DirAccess.make_dir_recursive_absolute(dir)
+		var out := dir + "/touched-%d-%d.json" % [id, now]
+		if _create_process("/usr/bin/python3", [ProjectSettings.globalize_path(FS_HELPER), "touched", out, agent,
+				str(pid), str(info.get("cwd", ""))]) != -1:
+			_fs_tfetch[out] = {"term": id, "t": now}
+		if td == null:
+			_fs_touched[id] = {"files": {}, "at": now, "agent": agent, "sig": 0, "pending": true}
+		else:
+			td["at"] = now
+
+
+# The picker lands on the newest thing its agent touched once that's known.
+func _fs_quick_pick_first() -> void:
+	var s = _bd_by_id.get(_fs_quick, null)
+	if s == null or str(s.get("sel", "")) != "":
+		return
+	var items := _fs_items(s, _fs_layout(s))
+	for it in items:
+		if not bool(it[0]["dir"]) and str(it[0]["path"]) != "":
+			s["sel"] = it[0]["path"]
+			return
+
+
+func _fs_set_changes(root: String, d: Dictionary) -> void:
+	var files: Dictionary = d.get("files", {})
+	var dirs := {}
+	for p: String in files:
+		var q := _fs_parent(p)
+		var guard := 0
+		while q.length() >= root.length() and guard < 64:
+			dirs[q] = int(dirs.get(q, 0)) + 1
+			if q == root or q == "/":
+				break
+			q = _fs_parent(q)
+			guard += 1
+	var old = _fs_changes.get(root, null)
+	var sig := hash(files.keys())
+	if old == null or int(old.get("sig", 0)) != sig:
+		_bd_dirty = true
+	_fs_changes[root] = {"files": files, "dirs": dirs, "top": str(d.get("top", "")),
+		"at": Time.get_ticks_msec(), "sig": sig}
+
+
+# --- creating ---
+
+func _fs_add_widget(at: Vector2, path: String, follow_term := -1) -> Dictionary:
+	_bd_begin()
+	var s := _bd_new("files")
+	_bd_set_rect(s, Rect2(at - Vector2(FS_W, FS_H) * 0.5, Vector2(FS_W, FS_H)))
+	s["path"] = path
+	s["mode"] = "tree"
+	s["open"] = []
+	s["scroll"] = 0.0
+	_bd_add(s)
+	if follow_term != -1 and _groups.has(follow_term):
+		var a := _bd_new("arrow")
+		var tr = _bd_term_rect(_bd_term_key(follow_term))
+		a["a"] = _bd_a(tr.get_center() if tr != null else at)
+		a["b"] = _bd_a(_bd_rect(s).get_center())
+		a["bind_a"] = _bd_term_key(follow_term)
+		a["bind_b"] = str(s["id"])
+		a["bend"] = 0.0
+		a["head_a"] = false
+		a["head_b"] = false
+		a["dash"] = "dotted"
+		_bd_add(a)
+		s["followed"] = path
+	_bd_sel = [str(s["id"])]
+	_bd_commit()
+	return s
+
+
+# Beside a termling, on its right (board shapes sit under termlings).
+func _fs_beside(id: int, size: Vector2) -> Vector2:
+	var tr = _bd_term_rect(_bd_term_key(id)) if _groups.has(id) else null
+	if tr == null:
+		return _cam.position
+	var r: Rect2 = tr
+	return Vector2(r.end.x + 40.0 + size.x * 0.5, r.get_center().y)
+
+
+func _fs_add_file_card(path: String, at: Vector2) -> void:
+	_bd_begin()
+	var s := _bd_new("file")
+	s["path"] = path
+	_bd_set_rect(s, Rect2(at - Vector2(FS_FILE_W, FS_FILE_H) * 0.5, Vector2(FS_FILE_W, FS_FILE_H)))
+	_bd_add(s)
+	_bd_sel = [str(s["id"])]
+	_bd_commit()
+
+
+# A new terminal whose shell starts in dir, landing at `at` (and in the frame
+# there, if any: see _add_group).
+func _fs_spawn_in(dir: String, at: Vector2) -> void:
+	if kitten_exe == "" or dir == "":
+		return
+	_land_queue.append(at)
+	var land := ProjectSettings.globalize_path("res://cove-handoff-land.sh")
+	_create_process(kitten_exe, ["@", "--to", kitty_socket, "launch", "--type=os-window", "--keep-focus",
+		"--cwd", dir, land, "shell"], false)
+
+
+# Type `cd dir` into a termling's shell, only when nothing is running in it.
+func _fs_cd(id: int, dir: String) -> bool:
+	if not _groups.has(id):
+		return false
+	var pane: int = _groups[id].terminal.pane_id
+	var info: Dictionary = _agents.get(pane, {})
+	if pane == 0 or str(info.get("agent", "shell")) != "shell" or not bool(info.get("idle", false)):
+		return false
+	if str(info.get("cwd", "")) == dir:
+		return true
+	_pty(pane, ("cd " + _fs_quote(dir) + "\r").to_utf8_buffer())
+	return true
+
+
+func _fs_paste(id: int, path: String) -> void:
+	if _groups.has(id) and _groups[id].terminal.pane_id != 0:
+		_pty(_groups[id].terminal.pane_id, (_fs_quote(path) + " ").to_utf8_buffer())
+
+
+# A termling dropped into a folder frame moves its shell there.
+func _fs_zone_cd(g: Node2D, sid: String) -> void:
+	var f = _bd_by_id.get(sid, null)
+	if f == null or str(f.get("path", "")) == "":
+		return
+	_fs_cd(g.term_id, str(f["path"]))
+
+
+# --- acting on entries ---
+
+func _fs_go(s: Dictionary, dir: String) -> void:
+	s["path"] = dir
+	s["scroll"] = 0.0
+	s["sel"] = ""
+	s["follow"] = false if _fs_follow_key(s, true) != "" and dir != str(s.get("followed", "")) else s.get("follow", true)
+	_fs_touch()
+
+
+func _fs_toggle_open(s: Dictionary, dir: String) -> void:
+	var open: Array = s.get("open", []).duplicate()
+	if open.has(dir):
+		open.erase(dir)
+	else:
+		open.append(dir)
+	s["open"] = open
+	_fs_touch()
+
+
+# Enter / double-click.
+func _fs_activate(s: Dictionary, it: Dictionary, mods := {}) -> void:
+	var path := str(it.get("path", ""))
+	if path == "":
+		return
+	var quick := str(s["id"]) == _fs_quick
+	if bool(mods.get("shift", false)):
+		var dir := path if bool(it["dir"]) else _fs_parent(path)
+		_fs_spawn_in(dir, _fs_beside(_fs_quick_term, Vector2(200, 200)) if quick else _bd_rect(s).get_center() + Vector2(_bd_rect(s).size.x * 0.5 + 360.0, 0))
+		if quick:
+			_fs_close_quick()
+		return
+	if quick and bool(mods.get("cmd", false)):
+		var id := _fs_quick_term
+		_fs_cd(id, path if bool(it["dir"]) else _fs_parent(path))
+		_fs_close_quick()
+		return
+	if bool(it["dir"]):
+		if _fs_mode(s) == "tree" and not _fs_pruned(s):
+			_fs_toggle_open(s, path)
+		else:
+			_fs_go(s, path)
+		return
+	if quick:
+		var id := _fs_quick_term
+		_fs_close_quick()
+		_fs_paste(id, path)
+		return
+	OS.shell_open(path)
+
+
+func _fs_button(s: Dictionary, b: String) -> void:
+	match b:
+		"up":
+			var up := _fs_parent(_fs_path(s))
+			if str(s["type"]) == "frame" or up != _fs_path(s):
+				_fs_go(s, up)
+		"tree", "icons":
+			s["mode"] = b
+			s["scroll"] = 0.0
+		"changed":
+			s["changed"] = not bool(s.get("changed", false))
+			s["touched"] = false
+			s["scroll"] = 0.0
+		"touched":
+			s["touched"] = not bool(s.get("touched", false))
+			s["changed"] = false
+			s["scroll"] = 0.0
+		"follow":
+			s["follow"] = not bool(s.get("follow", true))
+			if bool(s["follow"]):
+				s["followed"] = ""   # pick the termling's cwd up again at once
+	_fs_touch()
+
+
+# A press in a folder view. True when it hit a control or an entry (the board
+# then leaves it alone); false lets it fall through to select/move/marquee.
+func _fs_click(s: Dictionary, p: Vector2, ev: InputEventMouseButton) -> bool:
+	p = _bd_local(s, p)
+	var L := _fs_layout(s)
+	for b in L["buttons"]:
+		if (b[2] as Rect2).has_point(p):
+			_fs_button(s, str(b[0]))
+			_bd_sel = [str(s["id"])]
+			_fs_active = str(s["id"])
+			return true
+	var it := _fs_item_at(s, L, p)
+	if it.is_empty():
+		if str(s["type"]) == "frame" and (L["head"] as Rect2).has_point(p):
+			_bd_sel = [str(s["id"])]
+			_fs_active = str(s["id"])
+			return true
+		return false
+	_bd_sel = [str(s["id"])]
+	_fs_active = str(s["id"])
+	s["sel"] = it["path"]
+	_fs_touch()
+	var tree_dir := _fs_mode(s) == "tree" and bool(it["dir"]) and not _fs_pruned(s)
+	if ev.double_click:
+		# A tree folder already opened/closed on the first click.
+		if not tree_dir or ev.shift_pressed:
+			_fs_activate(s, it, {"shift": ev.shift_pressed, "cmd": ev.meta_pressed})
+		return true
+	# A click on a tree folder opens/closes it on release; a drag carries the entry.
+	_fs_drag = {"id": str(s["id"]), "path": it["path"], "dir": it["dir"], "toggle": tree_dir}
+	_bd_g = "fsdrag"
+	return true
+
+
+func _fs_drag_move(p: Vector2) -> void:
+	var g := _group_at(p)
+	_bd_bind_hint = _bd_term_key(g.term_id) if g != null else ""
+
+
+func _fs_drag_up(p: Vector2) -> void:
+	var d := _fs_drag
+	_fs_drag = {}
+	var s = _bd_by_id.get(str(d.get("id", "")), null)
+	if s == null:
+		return
+	if not _bd_moved:
+		if bool(d.get("toggle", false)):
+			_fs_toggle_open(s, str(d["path"]))
+		return
+	var g := _group_at(p)
+	if g != null:
+		_fs_paste(g.term_id, str(d["path"]))
+		return
+	var over := _fs_view_at(p)
+	if over != "" or _bd_rect(s).has_point(_bd_local(s, p)):
+		return   # dropped back on a folder view: nothing (files are never moved from the board)
+	_fs_add_file_card(str(d["path"]), p)
+
+
+func _fs_scroll_at(p: Vector2, dy: float) -> bool:
+	var id := _fs_view_at(p)
+	if id == "":
+		return false
+	var s: Dictionary = _bd_by_id[id]
+	var L := _fs_layout(s)
+	var before := float(s.get("scroll", 0.0))
+	s["scroll"] = before + dy
+	_fs_clamp_scroll(s, L)
+	if float(s["scroll"]) == before and _fs_content_h(s, L) <= (L["body"] as Rect2).size.y:
+		return str(s["type"]) == "files"   # nothing to scroll: a widget still swallows it
+	_bd_dirty = true
+	return true
+
+
+# --- keys ---
+
+func _fs_kbd_target():
+	if _bd_sel.size() != 1:
+		return null
+	var s = _bd_by_id.get(_bd_sel[0], null)
+	if s == null or not _fs_is_view(s):
+		return null
+	if str(s["type"]) == "frame" and _fs_active != str(s["id"]):
+		return null
+	return s
+
+
+func _fs_key(ev: InputEventKey) -> bool:
+	var s = _fs_kbd_target()
+	if s == null:
+		return false
+	var k := ev.keycode
+	var cmd := ev.meta_pressed or ev.ctrl_pressed
+	if cmd and not (k in [KEY_ENTER, KEY_KP_ENTER]):
+		return false
+	var L := _fs_layout(s)
+	var items := _fs_items(s, L).filter(func(x): return str(x[0]["path"]) != "")
+	var idx := -1
+	for i in items.size():
+		if str(items[i][0]["path"]) == str(s.get("sel", "")):
+			idx = i
+			break
+	var tree := _fs_mode(s) == "tree"
+	var step := 1 if tree else _fs_cols(L["body"])
+	var cur: Dictionary = items[idx][0] if idx != -1 else {}
+	var mv := 0
+	match k:
+		KEY_ESCAPE:
+			if str(s["id"]) == _fs_quick:
+				_fs_close_quick()
+				return true
+			return false
+		KEY_J, KEY_DOWN:
+			mv = step
+		KEY_K, KEY_UP:
+			mv = -step
+		KEY_L, KEY_RIGHT:
+			if tree:
+				if not cur.is_empty() and bool(cur["dir"]) and not bool(cur["open"]):
+					_fs_toggle_open(s, str(cur["path"]))
+				elif not cur.is_empty() and bool(cur["dir"]):
+					mv = 1
+			else:
+				mv = 1
+		KEY_H, KEY_LEFT:
+			if tree:
+				if not cur.is_empty() and bool(cur["dir"]) and bool(cur["open"]) and not _fs_pruned(s):
+					_fs_toggle_open(s, str(cur["path"]))
+				elif not cur.is_empty() and _fs_parent(str(cur["path"])) != _fs_path(s):
+					s["sel"] = _fs_parent(str(cur["path"]))
+					_fs_touch()
+				else:
+					_fs_button(s, "up")
+			else:
+				mv = -1
+		KEY_ENTER, KEY_KP_ENTER:
+			if not cur.is_empty():
+				_fs_activate(s, cur, {"shift": ev.shift_pressed, "cmd": cmd})
+			elif str(s["id"]) == _fs_quick and cmd:
+				var id := _fs_quick_term
+				_fs_cd(id, _fs_path(s))
+				_fs_close_quick()
+		KEY_BACKSPACE:
+			_fs_button(s, "up")
+		KEY_T:
+			_fs_button(s, "icons" if tree else "tree")
+		KEY_C:
+			_fs_button(s, "changed")
+		KEY_PERIOD:
+			s["dots"] = not bool(s.get("dots", false))
+			_fs_touch()
+		_:
+			return false
+	if mv != 0 and not items.is_empty():
+		var ni := clampi(idx + mv, 0, items.size() - 1) if idx != -1 else 0
+		s["sel"] = items[ni][0]["path"]
+		var r: Rect2 = items[ni][1]
+		var body: Rect2 = L["body"]
+		if r.position.y < body.position.y:
+			s["scroll"] = float(s.get("scroll", 0.0)) - (body.position.y - r.position.y)
+		elif r.end.y > body.end.y:
+			s["scroll"] = float(s.get("scroll", 0.0)) + (r.end.y - body.end.y)
+		_fs_clamp_scroll(s, L)
+		_fs_touch()
+	return true
+
+
+# --- Cmd+O: a picker at the focused termling's cwd ---
+
+func _fs_open_quick() -> void:
+	if _fs_quick != "" and _bd_by_id.has(_fs_quick):
+		_fs_close_quick()
+		return
+	var origin := _focused_id if _groups.has(_focused_id) else -1
+	var root := _fs_term_cwd(origin) if origin != -1 else ""
+	if root == "":
+		root = _fs_home()
+	var at := _fs_beside(origin, Vector2(FS_W, FS_H)) if origin != -1 else _cam.position
+	var s := _bd_new("files")
+	_bd_set_rect(s, Rect2(at - Vector2(FS_W, FS_H) * 0.5, Vector2(FS_W, FS_H)))
+	s["path"] = root
+	s["mode"] = "tree"
+	s["open"] = []
+	s["scroll"] = 0.0
+	s["transient"] = true
+	# On an agent's termling it opens on what that agent has been reading and
+	# editing (newest first); on a shell, on its folder.
+	s["touched"] = _fs_is_agent(origin)
+	_bd_add(s)   # not an undo step: it's a picker, gone again on Enter or Esc
+	_fs_quick = str(s["id"])
+	_fs_quick_term = origin
+	_bd_unfocus_termling()
+	_bd_sel = [_fs_quick]
+	if not bool(s["touched"]):
+		var items := _fs_items(s, _fs_layout(s))
+		if not items.is_empty():
+			s["sel"] = items[0][0]["path"]
+	else:
+		_fs_quick_pick_first()
+	# Frame the termling and the picker together. Present mode and tracking own
+	# the camera, so they're set aside (and put back when the picker closes).
+	_fs_quick_cam = {"present": _present_id, "tracking": _tracking_id, "zoom": _cam.zoom.x,
+		"prev_zoom": _present_prev_zoom}
+	var box := _bd_rect(s)
+	var tr = _bd_term_rect(_bd_term_key(origin)) if origin != -1 else null
+	if tr != null:
+		box = box.merge(tr)
+	_present_id = -1
+	_present_leaving = false
+	_tracking_id = -1
+	_zoom_goal = 0.0
+	_bd_cam_goal = null
+	var vp := get_viewport().get_visible_rect().size
+	var z := clampf(minf(vp.x / (box.size.x + 160.0), vp.y / (box.size.y + 160.0)), MIN_ZOOM, MAX_ZOOM)
+	_fly_to_point(box.get_center(), z)
+	_bd_ui_refresh()
+
+
+func _fs_close_quick() -> void:
+	var id := _fs_quick
+	_fs_quick = ""
+	if _bd_by_id.has(id):
+		_bd_remove([id])
+		_bd_sel = _bd_sel.filter(func(x): return x != id)
+		_bd_dirty = true
+	var t := _fs_quick_term
+	_fs_quick_term = -1
+	var cam := _fs_quick_cam
+	_fs_quick_cam = {}
+	if _groups.has(t):
+		# Back to how it was looking at the termling: presented, followed, or just focused.
+		if int(cam.get("present", -1)) == t:
+			_toggle_present(_groups[t])
+			_present_prev_zoom = float(cam.get("prev_zoom", _present_prev_zoom))
+		else:
+			_jump_focus(t, int(cam.get("tracking", -1)) == t, float(cam.get("zoom", 0.0)))
+	_bd_ui_refresh()
+
+
+# --- menu ---
+
+func _fs_menu_items(m: PopupMenu) -> void:
+	_fs_menu_id = ""
+	if _bd_sel.size() == 1:
+		var s: Dictionary = _bd_by_id[_bd_sel[0]]
+		var t := str(s["type"])
+		if _fs_is_view(s):
+			_fs_menu_id = str(s["id"])
+			m.add_item("Icons" if _fs_mode(s) == "tree" else "Tree", 52)
+			m.add_check_item("Changed files only", 53)
+			m.set_item_checked(m.get_item_index(53), bool(s.get("changed", false)))
+			m.add_check_item("Show hidden files", 54)
+			m.set_item_checked(m.get_item_index(54), bool(s.get("dots", false)))
+			m.add_item("New terminal here", 55)
+			m.add_item("Open in Finder", 56)
+			if t == "frame":
+				m.add_item("Unlink folder", 59)
+			m.add_separator()
+		elif t == "frame":
+			_fs_menu_id = str(s["id"])
+			m.add_item("Link to folder…", 58)
+			m.add_separator()
+		elif t == "file":
+			_fs_menu_id = str(s["id"])
+			m.add_item("Open", 60)
+			m.add_item("Show in Finder", 61)
+			m.add_separator()
+	m.add_item("Files", 50)
+	if _groups.has(_fs_menu_term):
+		m.add_item("Files for %s" % _fs_term_label(_fs_menu_term), 51)
+
+
+func _fs_term_label(id: int) -> String:
+	var t = _groups[id].terminal
+	var n := str(t.custom_name)
+	if n == "":
+		n = _fs_abbrev(_fs_term_cwd(id)).get_file()
+	return n if n != "" else "this terminal"
+
+
+func _fs_menu_pick(id: int) -> void:
+	var s = _bd_by_id.get(_fs_menu_id, null)
+	match id:
+		50:
+			var root := _fs_term_cwd(_fs_menu_term) if _groups.has(_fs_menu_term) else ""
+			_fs_add_widget(_bd_menu_pos, root if root != "" else _fs_home())
+		51:
+			if _groups.has(_fs_menu_term):
+				var w := _fs_add_widget(_bd_menu_pos, _fs_term_cwd(_fs_menu_term), _fs_menu_term)
+				w["touched"] = _fs_is_agent(_fs_menu_term)
+		52:
+			if s != null:
+				_fs_button(s, "tree" if _fs_mode(s) == "icons" else "icons")
+		53:
+			if s != null:
+				_fs_button(s, "changed")
+		54:
+			if s != null:
+				s["dots"] = not bool(s.get("dots", false))
+				_fs_touch()
+		55:
+			if s != null:
+				var r := _bd_rect(s)
+				var at := r.get_center() if str(s["type"]) == "frame" else Vector2(r.end.x + 360.0, r.get_center().y)
+				_fs_spawn_in(_fs_path(s), at)
+		56:
+			if s != null:
+				OS.shell_open(_fs_path(s))
+		58:
+			if s != null and DisplayServer.has_feature(DisplayServer.FEATURE_NATIVE_DIALOG_FILE):
+				var fid := str(s["id"])
+				DisplayServer.file_dialog_show("Link frame to folder", _fs_home(), "", false,
+					DisplayServer.FILE_DIALOG_MODE_OPEN_DIR, PackedStringArray(),
+					func(ok: bool, paths: PackedStringArray, _f: int): _fs_link(fid, paths[0] if ok and not paths.is_empty() else ""))
+		59:
+			if s != null:
+				_bd_begin()
+				s.erase("path")
+				_bd_commit()
+		60:
+			if s != null:
+				OS.shell_open(str(s.get("path", "")))
+		61:
+			if s != null:
+				_create_process("/usr/bin/open", ["-R", str(s.get("path", ""))], false)
+
+
+func _fs_link(fid: String, dir: String) -> void:
+	var s = _bd_by_id.get(fid, null)
+	if s == null or dir == "":
+		return
+	_bd_begin()
+	s["path"] = dir.trim_suffix("/") if dir != "/" else dir
+	s["mode"] = "icons"
+	s["scroll"] = 0.0
+	if str(s.get("text", "")) == "":
+		s["text"] = dir.trim_suffix("/").get_file()
+	_bd_commit()
+
+
+# --- drawing ---
+
+func _fs_ext_col(ext: String) -> Color:
+	if ext == "":
+		return Color(0.5, 0.52, 0.58)
+	return Color.from_hsv(float(hash(ext) % 360) / 360.0, 0.45, 0.8)
+
+
+func _fs_thumb(path: String):
+	if _fs_thumbs.has(path):
+		return _fs_thumbs[path]
+	if _fs_thumb_budget <= 0:
+		_bd_dirty = true   # more next frame
+		return null
+	_fs_thumb_budget -= 1
+	var tex = null
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f != null and f.get_length() < 12 * 1024 * 1024:
+		f.close()
+		var img := Image.load_from_file(path)
+		if img != null and not img.is_empty():
+			var m := maxf(img.get_width(), img.get_height())
+			if m > 192.0:
+				img.resize(maxi(1, int(img.get_width() * 192.0 / m)), maxi(1, int(img.get_height() * 192.0 / m)))
+			tex = ImageTexture.create_from_image(img)
+	_fs_thumbs[path] = tex
+	return tex
+
+
+func _fs_glyph(ci: CanvasItem, r: Rect2, it: Dictionary, a: float) -> void:
+	if bool(it.get("dir", false)):
+		var tab := Rect2(r.position + Vector2(0, 0), Vector2(r.size.x * 0.42, r.size.y * 0.2))
+		var body := Rect2(r.position + Vector2(0, r.size.y * 0.14), Vector2(r.size.x, r.size.y * 0.86))
+		ci.draw_rect(tab, Color(FS_FOLDER_COL.darkened(0.2), a))
+		ci.draw_rect(body, Color(FS_FOLDER_COL, a))
+		return
+	var ext := str(it.get("ext", ""))
+	var page := Rect2(r.position + Vector2(r.size.x * 0.12, 0), Vector2(r.size.x * 0.76, r.size.y))
+	ci.draw_rect(page, Color(0.86, 0.87, 0.9, a))
+	var fold := minf(page.size.x, page.size.y) * 0.28
+	ci.draw_colored_polygon(PackedVector2Array([Vector2(page.end.x - fold, page.position.y), page.position + Vector2(page.size.x, 0),
+		Vector2(page.end.x, page.position.y + fold)]), Color(0.6, 0.62, 0.66, a))
+	if ext != "" and r.size.y >= 24.0:
+		var f := _cal_font(true)
+		var px := 9 if r.size.y < 40.0 else 10
+		var lbl := ext.substr(0, 4).to_upper()
+		var chip := Rect2(page.position.x - 2.0, page.end.y - px * 1.8, page.size.x + 4.0, px * 1.5)
+		ci.draw_rect(chip, Color(_fs_ext_col(ext), a))
+		ci.draw_string(f, Vector2(chip.position.x, chip.get_center().y + f.get_ascent(px) * 0.38), lbl,
+			HORIZONTAL_ALIGNMENT_CENTER, chip.size.x, px, Color(1, 1, 1, a))
+
+
+func _fs_draw(ci: CanvasItem, s: Dictionary) -> void:
+	_fs_thumb_budget = 6
+	var a := _bd_alpha
+	var L := _fs_layout(s)
+	var r := _bd_rect(s)
+	var frame: bool = L["frame"]
+	if not frame:
+		_cal_draw_card(ci, r)
+	var f := _cal_font()
+	var bold := _cal_font(true)
+	var head: Rect2 = L["head"]
+	if frame:
+		ci.draw_style_box(_cal_box(Color(0.13, 0.13, 0.15, 0.85 * a), true, 6.0), head)
+	var root := _fs_path(s)
+	var title := _fs_abbrev(root)
+	if bool(s.get("changed", false)):
+		title += "  · changed"
+	elif bool(s.get("touched", false)):
+		var tt := _fs_touch_terms(s)
+		title += "  · touched by %s" % (_fs_term_label(tt[0]) if tt.size() == 1 else "%d agents" % tt.size())
+	var tpx := 13 if frame else 14
+	ci.draw_string(bold, Vector2(head.position.x + 10.0, head.get_center().y + bold.get_ascent(tpx) * 0.38),
+		title, HORIZONTAL_ALIGNMENT_LEFT, L["title_w"], tpx, Color(BD_BM_TEXT, a))
+	var mode := _fs_mode(s)
+	for b in L["buttons"]:
+		var br: Rect2 = b[2]
+		var on := false
+		match str(b[0]):
+			"tree", "icons":
+				on = str(b[0]) == mode
+			"changed":
+				on = bool(s.get("changed", false))
+			"touched":
+				on = bool(s.get("touched", false))
+			"follow":
+				on = bool(s.get("follow", true))
+		ci.draw_style_box(_cal_box(Color(1, 1, 1, (0.14 if on else 0.05) * a), true, 5.0), br)
+		ci.draw_string(f, Vector2(br.position.x, br.get_center().y + f.get_ascent(12) * 0.36), str(b[1]),
+			HORIZONTAL_ALIGNMENT_CENTER, br.size.x, 14 if str(b[1]).length() == 1 else 11,
+			Color(BD_BM_TEXT if on else BD_BM_TEXT2, a))
+	if not frame:
+		ci.draw_line(Vector2(r.position.x, head.end.y), Vector2(r.end.x, head.end.y), Color(BD_BM_DIVIDER, a), 1.0)
+	var body: Rect2 = L["body"]
+	if frame and mode == "tree":
+		ci.draw_style_box(_cal_box(Color(0.1, 0.1, 0.12, 0.7 * a), true, 6.0), body)
+	_fs_clamp_scroll(s, L)
+	var items := _fs_items(s, L)
+	var sel := str(s.get("sel", ""))
+	var focused := _bd_sel.has(str(s["id"]))
+	if items.is_empty():
+		var msg := "no changed files" if bool(s.get("changed", false)) else "empty folder"
+		if not _fs_pruned(s) and not bool(_fs_list(root, true)["ok"]):
+			msg = "can't read this folder"
+		if bool(s.get("changed", false)) and not _fs_changes.get(root, {}).has("sig"):
+			msg = "looking for changes…"
+		if bool(s.get("touched", false)):
+			if _fs_touch_terms(s).is_empty():
+				msg = "no agent here (claude, codex or opencode)"
+			elif not bool(_fs_touch_map(s)["loaded"]):
+				msg = "reading the agent's transcript…"
+			else:
+				msg = "it hasn't opened any files yet"
+		ci.draw_string(f, Vector2(body.position.x + 10.0, body.position.y + 22.0), msg,
+			HORIZONTAL_ALIGNMENT_LEFT, body.size.x - 20.0, 12, Color(CAL_DIM, a))
+		return
+	for it in items:
+		var ir: Rect2 = it[1]
+		if ir.position.y < body.position.y - 0.5 or ir.end.y > body.end.y + 0.5:
+			continue
+		var e: Dictionary = it[0]
+		var st := _fs_status(root, str(e["path"]), s) if str(e["path"]) != "" else {}
+		var is_sel := str(e["path"]) == sel and sel != ""
+		if mode == "tree":
+			_fs_draw_row(ci, s, e, ir, st, is_sel, focused, a)
+		else:
+			_fs_draw_tile(ci, s, e, ir, st, is_sel, focused, a)
+	# A scroll thumb when it overflows.
+	var ch := _fs_content_h(s, L)
+	if ch > body.size.y + 1.0:
+		var frac := body.size.y / ch
+		var th := maxf(body.size.y * frac, 16.0)
+		var ty := body.position.y + (body.size.y - th) * float(s.get("scroll", 0.0)) / maxf(ch - body.size.y, 1.0)
+		ci.draw_style_box(_cal_box(Color(1, 1, 1, 0.18 * a), true, 2.0), Rect2(body.end.x - 4.0, ty, 3.0, th))
+
+
+func _fs_draw_row(ci: CanvasItem, s: Dictionary, e: Dictionary, ir: Rect2, st: Dictionary, is_sel: bool,
+		focused: bool, a: float) -> void:
+	var f := _cal_font()
+	if is_sel:
+		ci.draw_style_box(_cal_box(Color(BD_SEL, (0.3 if focused else 0.14) * a), true, 4.0), ir)
+	var x := ir.position.x + 6.0 + int(e["depth"]) * 14.0
+	var cy := ir.get_center().y
+	if bool(e.get("more", false)):
+		ci.draw_string(f, Vector2(x + 16.0, cy + 4.0), str(e["name"]), HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color(CAL_DIM, a))
+		return
+	if bool(e["dir"]):
+		ci.draw_string(f, Vector2(x, cy + 4.0), "▾" if bool(e["open"]) else "▸", HORIZONTAL_ALIGNMENT_LEFT, -1, 11,
+			Color(CAL_DIM, a))
+	_fs_glyph(ci, Rect2(x + 13.0, cy - 6.0, 14.0, 12.0), e, a)
+	var right := ""
+	var rcol := CAL_DIM
+	if str(st.get("st", "")) == "dir":
+		right = "%d changed" % int(st["n"])
+		rcol = FS_ST_COL["M"]
+	elif str(st.get("st", "")) == "tdir":
+		right = ""   # a touched folder: its files carry the detail
+	elif not st.is_empty():
+		var code := str(st["st"])
+		right = "%s %s" % [FS_ST_NAME.get(code, code), _fs_age(float(st.get("mtime", 0.0)))]
+		if str(st.get("who", "")) != "":
+			right += " · " + str(st["who"])
+		rcol = FS_ST_COL.get(code, CAL_DIM)
+	var rw := f.get_string_size(right, HORIZONTAL_ALIGNMENT_LEFT, -1, 10).x if right != "" else 0.0
+	var tx := x + 33.0
+	var name_col: Color = BD_BM_TEXT if not st.has("st") or str(st["st"]) in ["dir", "tdir"] else FS_ST_COL.get(str(st["st"]), BD_BM_TEXT)
+	ci.draw_string(f, Vector2(tx, cy + 4.5), str(e["name"]), HORIZONTAL_ALIGNMENT_LEFT,
+		maxf(ir.end.x - tx - rw - 14.0, 10.0), 12, Color(name_col, a))
+	if right != "":
+		ci.draw_string(f, Vector2(ir.end.x - rw - 8.0, cy + 4.0), right, HORIZONTAL_ALIGNMENT_LEFT, -1, 10, Color(rcol, a))
+
+
+func _fs_draw_tile(ci: CanvasItem, s: Dictionary, e: Dictionary, ir: Rect2, st: Dictionary, is_sel: bool,
+		focused: bool, a: float) -> void:
+	var f := _cal_font()
+	var cell := ir.grow(-3.0)
+	if is_sel:
+		ci.draw_style_box(_cal_box(Color(BD_SEL, (0.3 if focused else 0.14) * a), true, 6.0), cell)
+	var icon := Rect2(cell.get_center().x - 22.0, cell.position.y + 6.0, 44.0, 44.0)
+	var drawn := false
+	if not bool(e["dir"]) and str(e["ext"]) in ["png", "jpg", "jpeg", "webp", "bmp", "svg", "tga"]:
+		var tex = _fs_thumb(str(e["path"]))
+		if tex != null:
+			var ts: Vector2 = tex.get_size()
+			var k := minf(icon.size.x / ts.x, icon.size.y / ts.y)
+			var sz := ts * k
+			ci.draw_texture_rect(tex, Rect2(icon.get_center() - sz * 0.5, sz), false, Color(1, 1, 1, a))
+			drawn = true
+	if not drawn:
+		_fs_glyph(ci, icon.grow_individual(-2.0, -4.0, -2.0, -2.0), e, a)
+	if not st.is_empty():
+		var code := str(st["st"])
+		var dot: Color = FS_ST_COL["M"] if code in ["dir", "tdir"] else FS_ST_COL.get(code, CAL_DIM)
+		ci.draw_circle(Vector2(icon.end.x + 2.0, icon.position.y + 4.0), 4.5, Color(dot, a))
+	var name := str(e["name"])
+	var ny := icon.end.y + 4.0 + f.get_ascent(11)
+	if e.has("mtime") and not st.is_empty() and not str(st["st"]) in ["dir", "tdir"]:   # changed view: name, then what + when
+		ci.draw_string(f, Vector2(cell.position.x + 2.0, ny), name, HORIZONTAL_ALIGNMENT_CENTER, cell.size.x - 4.0, 11,
+			Color(BD_BM_TEXT, a))
+		var code := str(st["st"])
+		ci.draw_string(f, Vector2(cell.position.x + 2.0, ny + 13.0), "%s %s" % [FS_ST_NAME.get(code, code),
+			_fs_age(float(st.get("mtime", 0.0)))], HORIZONTAL_ALIGNMENT_CENTER, cell.size.x - 4.0, 10,
+			Color(FS_ST_COL.get(code, CAL_DIM), a))
+		return
+	ci.draw_multiline_string(f, Vector2(cell.position.x + 2.0, ny), name, HORIZONTAL_ALIGNMENT_CENTER,
+		cell.size.x - 4.0, 11, 2, Color(BD_BM_TEXT, a))
+
+
+func _fs_draw_file(ci: CanvasItem, s: Dictionary) -> void:
+	var r := _bd_rect(s)
+	var a := _bd_alpha
+	_cal_draw_card(ci, r)
+	var path := str(s.get("path", ""))
+	var it := {"dir": DirAccess.dir_exists_absolute(path), "ext": path.get_extension().to_lower()}
+	var gh := minf(r.size.y - 16.0, 30.0)
+	_fs_glyph(ci, Rect2(r.position.x + 10.0, r.get_center().y - gh * 0.5, gh * 0.9, gh), it, a)
+	var bold := _cal_font(true)
+	var f := _cal_font()
+	var tx := r.position.x + 18.0 + gh
+	var tw := r.end.x - tx - 10.0
+	var gone: bool = not it["dir"] and not FileAccess.file_exists(path)
+	ci.draw_string(bold, Vector2(tx, r.position.y + r.size.y * 0.45), path.get_file(), HORIZONTAL_ALIGNMENT_LEFT,
+		tw, 13, Color(CAL_DIM if gone else BD_BM_TEXT, a))
+	ci.draw_string(f, Vector2(tx, r.position.y + r.size.y * 0.78), "missing" if gone else _fs_abbrev(_fs_parent(path)),
+		HORIZONTAL_ALIGNMENT_LEFT, tw, 10, Color(Color(0.95, 0.6, 0.45) if gone else CAL_DIM, a))
+
+
+func _fs_draw_ghost(o: CanvasItem) -> void:
+	if _fs_drag.is_empty():
+		return
+	var p := get_global_mouse_position()
+	var z := _cam.zoom.x
+	var f := _cal_font(true)
+	var px := int(13.0 / z)
+	var name := str(_fs_drag["path"]).get_file()
+	var w := f.get_string_size(name, HORIZONTAL_ALIGNMENT_LEFT, -1, px).x + 20.0 / z
+	var r := Rect2(p + Vector2(14, 10) / z, Vector2(w, px * 1.8))
+	o.draw_style_box(_cal_box(Color(0.15, 0.16, 0.19, 0.95), true, 5.0), r)
+	o.draw_string(f, Vector2(r.position.x + 10.0 / z, r.get_center().y + f.get_ascent(px) * 0.38), name,
+		HORIZONTAL_ALIGNMENT_LEFT, -1, px, BD_BM_TEXT)

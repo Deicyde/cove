@@ -17,6 +17,13 @@
 # nested child of that session. The login shell re-sets anything user-defined.
 for v in $(env | sed -n 's/^\(CLAUDE[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
 sess="cove-$$"
+# An agent spawning a child termling (cove_mcp's spawn) picks the name up front,
+# so it knows the child's identity before the window even exists. It must still
+# be cove-<digits>: that's how the Cove recognises abduco sessions.
+case "${COVE_SPAWN_SESSION:-}" in
+cove-[0-9]*) sess="$COVE_SPAWN_SESSION" ;;
+esac
+unset COVE_SPAWN_SESSION
 # The stable identity of this termling: survives kitty restarts (unlike
 # $KITTY_WINDOW_ID), and is what the cove MCP tools and board ownership key on.
 export COVE_SESSION="$sess"

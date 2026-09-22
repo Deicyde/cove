@@ -6,6 +6,7 @@ extends Node2D
 const TILE := 256.0        # texture size; one checker cell is TILE/2
 
 var camera: Camera2D
+var extra := Rect2()   # also cover this world rect (a board screenshot off to the side)
 var step := 128.0
 var _floor: Texture2D
 
@@ -23,18 +24,33 @@ func _ready() -> void:
 	_floor = ImageTexture.create_from_image(img)
 
 
+var _drawn := Rect2()     # world rect last painted: the view plus half a view each side
+
+
+# Repaint only when the view leaves what was painted, or shrinks a lot (the grid
+# lines would get dense). The margin also covers a camera that moves after this
+# runs in the frame (flights are stepped deferred).
 func _process(_delta: float) -> void:
-	queue_redraw()
+	if camera == null:
+		return
+	var view := _view()
+	if not _drawn.encloses(view) or view.size.x * 3.0 < _drawn.size.x:
+		queue_redraw()
+
+
+func _view() -> Rect2:
+	var half := get_viewport_rect().size * 0.5 / camera.zoom
+	var r := Rect2(camera.get_screen_center_position() - half, half * 2.0)
+	return r.merge(extra) if extra.has_area() else r
 
 
 func _draw() -> void:
 	if camera == null:
 		return
-	var vp := get_viewport_rect().size
-	var half := vp * 0.5 / camera.zoom
-	var c := camera.get_screen_center_position()
-	var tl := c - half
-	var br := c + half
+	var v := _view()
+	_drawn = v.grow_individual(v.size.x * 0.5, v.size.y * 0.5, v.size.x * 0.5, v.size.y * 0.5)
+	var tl := _drawn.position
+	var br := _drawn.end
 
 	if _floor:
 		var start := Vector2(floorf(tl.x / TILE) * TILE, floorf(tl.y / TILE) * TILE)

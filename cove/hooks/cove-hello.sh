@@ -10,7 +10,7 @@ SESS="${COVE_SESSION:-unknown}"
 
 MSG="You're running inside a Cove termling (session ${SESS}): your terminal is one of
 several on the user's board. The user arranges the board and decides focus; you
-never move termlings or change focus. The 'cove' MCP tools, for when they help:
+never move the user's termlings or change focus. The 'cove' MCP tools, for when they help:
 - status(state, summary): needs_you / blocked / done badges your termling and
   queues you for the user's attention; working clears it. (The Stop/Notification
   hooks already ping when you finish or wait for input.)
@@ -19,6 +19,9 @@ never move termlings or change focus. The 'cove' MCP tools, for when they help:
 - add_note / update_note / link / delete_notes: your own notes, todo lists and
   arrows on the board, placed next to you.
 - whoami, list_terminals, board, find: look around (read-only).
+- spawn / send / read / wait / kill / place, add_frame, screenshot: orchestrate
+  child agents as termlings you own (see the cove and iterate-pr skills).
+  If you were spawned by another agent (whoami 'parent'), report() to it.
 Nothing is required at startup."
 
 jq -cn --arg m "$MSG" \

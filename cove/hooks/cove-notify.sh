@@ -29,6 +29,14 @@ printf '{"ts":%s,"pane":%s,"session":%s,"event":%s,"cwd":%s,"project":%s,"reason
   "$(jq -cn --arg v "$REASON" '$v')" \
   >> "$DIR/notify.jsonl" 2>/dev/null
 
+# A per-session log nobody consumes (Godot takes notify.jsonl whole): an agent
+# that spawned this one waits on it to learn when its child's turn ended.
+if [ -n "${COVE_SESSION:-}" ]; then
+  mkdir -p "$DIR/events" 2>/dev/null
+  printf '{"ts":%s,"event":%s}\n' "$TS" "$(jq -cn --arg v "$EVENT" '$v')" \
+    >> "$DIR/events/${COVE_SESSION}.jsonl" 2>/dev/null
+fi
+
 # The clickable macOS banner is posted by notify-stop.sh (Cove-aware), so this
 # hook only feeds the on-stage panel + camera to avoid a duplicate notification.
 

@@ -150,13 +150,20 @@ func end_drag_move() -> void:
 
 func _pick_target() -> void:
 	if _zone != null:
-		# Confined to a zone: pick anywhere inside it (inset so termlings don't sit
-		# on the border or under the label).
+		# Confined to a zone: pick a ground point that keeps the whole termling
+		# inside it (the screen rides above its crew), clear of the border. A zone
+		# too small for that just gets the middle.
 		var z: Rect2 = _zone
-		var inset := 90.0
-		var w := maxf(0.0, z.size.x - inset * 2.0)
-		var h := maxf(0.0, z.size.y - inset * 2.0)
-		_target = z.position + Vector2(inset, inset) + Vector2(randf() * w, randf() * h)
+		var sz: Vector2 = terminal.onscreen_size() if terminal else Vector2.ZERO
+		var lift := sz.y * 0.85   # ground point -> screen centre, when standing
+		if terminal and _state != "lifted" and _state != "falling":
+			lift = maxf(0.0, position.y - terminal.global_position.y)
+		var lo := z.position + Vector2(sz.x * 0.5 + 60.0, lift + sz.y * 0.5 + 30.0)
+		var hi := z.end - Vector2(sz.x * 0.5 + 60.0, 50.0)
+		var t := Vector2(randf(), randf())
+		_target = Vector2(
+			lerpf(lo.x, hi.x, t.x) if hi.x > lo.x else z.get_center().x,
+			lerpf(lo.y, hi.y, t.y) if hi.y > lo.y else clampf(lo.y, z.position.y, z.end.y))
 		return
 	var c := _home if _home_set else position
 	var ang := randf() * TAU
