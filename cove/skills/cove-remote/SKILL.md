@@ -137,6 +137,37 @@ seconds, and the same mtime) at most every 10s when a byte really crosses the
 pty: program output or typed input, not pings, acks or reconnects. A host's
 idle checker reads it to decide when to hibernate.
 
+## The AWS devbox (aws-dev)
+
+`aws-dev` is a Linux box on AWS (Ubuntu, 8 vCPU / 64 GB for now, a 1 TB
+`/data`), built from `~/Documents/code/aws-devbox` (Terraform; its README and
+PLAN.md say how and why). Use it for Verus PR reviews, feature work and
+Verus/cvc5 builds, the same way as the pro:
+
+```
+spawn(name: "review #123 @ aws", host: "aws-dev",
+      cwd: "/Users/kirancodes/Documents/code/<repo>", command: "claude", prompt: "...")
+```
+
+- **Pro or AWS?** Either works; if the user names one, use it. AWS doesn't
+  depend on the pro being awake or on the home network, and it has the most
+  disk. The pro is faster for single builds while the box is at 8 vCPU.
+- **It hibernates** after 45 min without real activity (load, pty bytes,
+  ssh typing). An agent idle at its prompt doesn't count, and survives
+  hibernation intact. `spawn`/`attach`/`ls`/`kill` wake it (about 40 s); a
+  termling left open shows `asleep, type to wake`. For a long unattended job
+  that is quiet on the pty, `ssh aws-dev sudo touch /etc/devbox/keep-awake`
+  (remove it after).
+- **Getting code there.** No Syncthing. Paths match the Macs
+  (`/Users/kirancodes` is a symlink into `/data/home`), so `git clone`/`git
+  fetch` into the same path, or rsync as in mbp-offload §2. Builds share
+  sccache on `/data`.
+- **Rebuilt cove-remote?** Run `cove/remote/install-linux.sh aws-dev` from the
+  main kitty checkout (it installs at the running checkout's path).
+- It's replaceable: when the AWS credits end, `terraform destroy` and remove
+  the `aws-dev` line from `~/.config/cove-remote/hosts`; nothing else in the
+  Cove depends on it.
+
 ## Upgrading live clients
 
 `kill -USR2 <client_pid>` (pids in `/tmp/cove/remote/*.json`) re-execs the
