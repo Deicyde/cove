@@ -152,7 +152,7 @@ var _search_list: VBoxContainer
 var _search_hint: Label
 var _search_open := false
 var _search_rows := []        # [{id, why, source}] currently displayed, best-first
-# Page critters: Vibefox mirrors a browser tab into term-<1000000+tab>.rgba (header
+# Page critters: Vibefox mirrors a browser tab into term-<pane>.rgba (header
 # flag 0x10000). They are external to kitty -- the ls poll never sees them and must
 # never drop them -- and their input goes to the browser's control socket through
 # cove-vibefox-bridge.py (one JSON line per event; replies are dropped).
@@ -2103,7 +2103,7 @@ func _apply_agent_state() -> void:
 		_agents[pt.pane_id] = {
 			"session": "", "agent": "page", "busy": false, "attention": false,
 			"cwd": "", "title": title if title != "" else "page",
-			"url": str(meta.get("url", "")), "tab": int(meta.get("tab", pt.pane_id - PAGE_PANE_BASE)),
+			"url": str(meta.get("url", "")), "tab": int(meta.get("tab", -1)),
 		}
 	# recompute attention set: kitty needs_attention OR a pending note
 	_attn_ids.clear()
@@ -2515,7 +2515,12 @@ func _exec_command(c: Dictionary) -> String:
 
 # --- page critters (Vibefox tabs on the board) -------------------------------
 
-const PAGE_PANE_BASE := 1000000   # Vibefox pane id = 1000000 + tab id
+# A pane id at or above this is an external critter (a browser tab, an editor
+# panel), not a kitty pane. It is only ever a threshold: a pane no longer encodes
+# a tab id, since Vibefox now persists and reuses panes across its restarts so a
+# restored mirror keeps its place on the board. The term-<pane>.json sidecar is
+# the only authority for which tab a critter is.
+const PAGE_PANE_BASE := 1000000
 const PAGE_WHEEL_PX := 40         # critter pixels per wheel notch line
 const PAGE_RESIZE_STEP := 1.15    # frame growth per Cmd+wheel notch
 const PAGE_MIN_W := 240           # critter frame width bounds (px) we ask Vibefox for
@@ -2527,7 +2532,11 @@ const PAGE_MAX_W := 2400
 # the frame: a missing browser just means the lines go nowhere.
 func _start_vibefox_bridge() -> void:
 	var script := ProjectSettings.globalize_path("res://cove-vibefox-bridge.py")
-	var r: Dictionary = OS.execute_with_pipe("/usr/bin/python3", [script, VIBEFOX_SOCK], false)
+	# The third argument is a hello line sent on every (re)connect: it tells a
+	# freshly restarted Vibefox the Cove is here, so restored mirrors hide from the
+	# tab strip at once instead of lingering until the first click or keystroke.
+	var r: Dictionary = OS.execute_with_pipe("/usr/bin/python3",
+		[script, VIBEFOX_SOCK, '{"id":0,"cmd":"critter.list","args":{}}'], false)
 	if r.is_empty() or not r.has("stdio") or int(r.get("pid", -1)) <= 0:
 		push_warning("cove: couldn't start cove-vibefox-bridge.py — page critters won't take input.")
 		_vf_pipe = null
@@ -2851,7 +2860,8 @@ func _write_state() -> void:
 				snappedf(tr.size.x, 0.1), snappedf(tr.size.y, 0.1)]
 		if info.has("url"):   # a page critter: which tab it mirrors
 			terms[-1]["url"] = str(info["url"])
-			terms[-1]["tab"] = int(info["tab"])
+			if int(info.get("tab", -1)) >= 0:
+				terms[-1]["tab"] = int(info["tab"])
 		if info.has("panel"):   # a Godot editor panel: which panel of which scene
 			terms[-1]["panel"] = str(info["panel"])
 			terms[-1]["scene"] = str(info["scene"])

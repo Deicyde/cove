@@ -14,6 +14,9 @@ import threading
 import time
 
 SOCK = sys.argv[1] if len(sys.argv) > 1 else "/tmp/vibefox/control.sock"
+# Optional: a line sent on every successful (re)connect, so the far side learns
+# the Cove is here without waiting for the user to touch a critter.
+HELLO = (sys.argv[2].strip() + "\n").encode() if len(sys.argv) > 2 and sys.argv[2].strip() else b""
 # Named after whose socket this bridge serves (/tmp/vibefox/control.sock ->
 # /tmp/cove-vibefox.log), so a second bridge to another app doesn't interleave
 # its traffic into this one's log and make it useless for diagnosis.
@@ -70,6 +73,12 @@ def _connect():
         return None
     _sock = s
     threading.Thread(target=_drain, args=(s,), daemon=True).start()
+    if HELLO:
+        try:
+            s.sendall(HELLO)
+            log("-->", HELLO.decode().strip() + "   (hello on connect)")
+        except OSError:
+            pass
     return s
 
 
