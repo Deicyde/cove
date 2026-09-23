@@ -93,6 +93,7 @@ typedef struct {
     index_type xstart, ynum, xnum, cursor_x, text_len;
     bool is_active;
     bool is_dirty;
+    bool predict;  // cove-remote's predicted echo (OSC 7766): underlined, not reverse video
     struct {
         CPUCell *cpu_cells;
         GPUCell *gpu_cells;
@@ -332,6 +333,7 @@ void screen_rescale_images(Screen *self);
 void screen_report_size(Screen *, unsigned which, unsigned modifier);
 void screen_manipulate_title_stack(Screen *, unsigned int op, unsigned int which);
 bool screen_is_overlay_active(Screen *self);
+void screen_set_predict_text(Screen *self, PyObject *mv);
 void screen_update_overlay_text(Screen *self, const char *utf8_text);
 void screen_set_key_encoding_flags(Screen *self, uint32_t val, uint32_t how);
 void screen_push_key_encoding_flags(Screen *self, uint32_t val);

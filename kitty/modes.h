@@ -84,6 +84,8 @@
 
 // Pending updates mode
 #define PENDING_UPDATE (2026 << 5)
+// Not a settable mode: DECRQM on it tells cove-remote that OSC 7766 works
+#define COVE_PREDICT_OVERLAY (7766 << 5)
 
 // Notification of color preference change
 #define COLOR_PREFERENCE_NOTIFICATION (2031 << 5)

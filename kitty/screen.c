@@ -3187,6 +3187,7 @@ report_mode_status(Screen *self, unsigned int which, bool private) {
         case MOUSE_UTF8_MODE: ans = self->modes.mouse_tracking_protocol == UTF8_PROTOCOL ? 1 : 2; break;
         case MOUSE_SGR_PIXEL_MODE: ans = self->modes.mouse_tracking_protocol == SGR_PIXEL_PROTOCOL ? 1 : 2; break;
         case PENDING_UPDATE: ans = self->paused_rendering.expires_at ? 1 : 2; break;
+        case COVE_PREDICT_OVERLAY: ans = 3; break;  // permanently set: OSC 7766 is understood
     }
     int sz = snprintf(buf, sizeof(buf) - 1, "%s%u;%u$y", (private ? "?" : ""), which, ans);
     if (sz > 0) write_escape_code_to_child(self, ESC_CSI, buf);
@@ -4645,6 +4646,7 @@ deactivate_overlay_line(Screen *self) {
 void
 screen_update_overlay_text(Screen *self, const char *utf8_text) {
     if (screen_is_overlay_active(self)) deactivate_overlay_line(self);
+    self->overlay_line.predict = false;
     if (!utf8_text || !utf8_text[0]) return;
     PyObject *text = PyUnicode_FromString(utf8_text);
     if (!text) return;
@@ -4670,6 +4672,24 @@ screen_update_overlay_text(Screen *self, const char *utf8_text) {
     }
 }
 
+// OSC 7766 ; text ST -- cove-remote's predictive local echo. The text is drawn
+// at the cursor through the IME pre-edit overlay, so it never touches the
+// screen or scrollback; an empty text clears it.
+void
+screen_set_predict_text(Screen *self, PyObject *mv) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(mv, &view, PyBUF_SIMPLE) != 0) { PyErr_Clear(); return; }
+    char *text = PyMem_Malloc(view.len + 1);
+    if (text) {
+        memcpy(text, view.buf, view.len);
+        text[view.len] = 0;
+        screen_update_overlay_text(self, text);
+        self->overlay_line.predict = text[0] != 0;
+        PyMem_Free(text);
+    }
+    PyBuffer_Release(&view);
+}
+
 static void
 screen_draw_overlay_line(Screen *self) {
     if (!self->overlay_line.overlay_text) return;
@@ -4690,7 +4710,10 @@ screen_draw_overlay_line(Screen *self) {
     self->modes.mIRM = false;
     Cursor *orig_cursor = self->cursor;
     self->cursor = &(self->overlay_line.original_line.cursor);
-    self->cursor->sgr.reverse ^= true;
+    const bool predict = self->overlay_line.predict;
+    const unsigned orig_decoration = self->cursor->sgr.decoration;
+    if (predict) self->cursor->sgr.decoration = 1;  // underline
+    else self->cursor->sgr.reverse ^= true;
     self->cursor->x = xstart;
     self->cursor->y = self->overlay_line.ynum;
     self->overlay_line.xnum = 0;
@@ -4742,7 +4765,8 @@ screen_draw_overlay_line(Screen *self) {
         self->overlay_line.xnum += len;
     }
     self->overlay_line.cursor_x = self->cursor->x;
-    self->cursor->sgr.reverse ^= true;
+    if (predict) self->cursor->sgr.decoration = orig_decoration;
+    else self->cursor->sgr.reverse ^= true;
     self->cursor = orig_cursor;
     self->modes.mDECAWM = orig_line_wrap_mode;
     self->modes.mDECTCEM = orig_cursor_enable_mode;
