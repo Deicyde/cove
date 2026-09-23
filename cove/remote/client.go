@@ -62,6 +62,8 @@ type client struct {
 	route     string        // the ssh destination in use
 	ssh       *exec.Cmd     // the current link, killed to force a reconnect
 	wake      chan struct{} // skip the reconnect backoff
+	waking    bool          // the host's wake command is running
+	wokeAt    time.Time     // when it last ran
 
 	exitCode chan int
 }
@@ -372,8 +374,11 @@ func (c *client) ticker() {
 		c.pred.expire()
 		c.connMu.Lock()
 		down := !c.connected && c.everUp && time.Since(c.downSince) > 1500*time.Millisecond
+		waking := c.waking
 		c.connMu.Unlock()
-		if down {
+		if waking {
+			c.pred.status = "⟳ waking " + c.host
+		} else if down {
 			c.pred.status = "⟳ " + c.host
 		} else {
 			c.pred.status = ""
@@ -434,6 +439,43 @@ func routes(host string) []string {
 }
 
 func (c *client) connectOnce() error {
+	err := c.tryRoutes()
+	var ue unreachableError
+	if err != nil && !c.wasUp && errors.As(err, &ue) && c.wakeHost() {
+		err = c.tryRoutes()
+	}
+	return err
+}
+
+// wakeHost runs the host's wake command (from ~/.config/cove-remote/hosts),
+// at most once a minute, and says whether it's worth retrying now.
+func (c *client) wakeHost() bool {
+	if wakeCommand(c.host) == "" || time.Since(c.wokeAt) < time.Minute {
+		return false
+	}
+	c.connMu.Lock()
+	c.waking = true
+	first := !c.everUp
+	c.connMu.Unlock()
+	c.writeMeta()
+	if first {
+		c.outMu.Lock()
+		fmt.Fprintf(os.Stdout, "\x1b[2m[cove-remote: waking %s]\x1b[0m\r\n", c.host)
+		c.outMu.Unlock()
+	}
+	c.logln("%s unreachable, running its wake command", c.host)
+	began := time.Now()
+	err := runWake(c.host, c.logf)
+	c.logln("wake finished after %v: %v", time.Since(began).Round(time.Second), err)
+	c.connMu.Lock()
+	c.waking = false
+	c.connMu.Unlock()
+	c.wokeAt = time.Now()
+	c.writeMeta()
+	return err == nil
+}
+
+func (c *client) tryRoutes() error {
 	var err error
 	rs := routes(c.host)
 	for i, dest := range rs {
@@ -475,9 +517,14 @@ func (c *client) connectVia(dest string, timeout int) error {
 	c.connMu.Lock()
 	c.ssh = cmd
 	c.connMu.Unlock()
+	var exited chan error // set once something is already waiting on ssh
 	defer func() {
 		cmd.Process.Kill()
-		cmd.Wait()
+		if exited != nil {
+			<-exited
+		} else {
+			cmd.Wait()
+		}
 		c.connMu.Lock()
 		if c.ssh == cmd {
 			c.ssh = nil
@@ -526,6 +573,18 @@ func (c *client) connectVia(dest string, timeout int) error {
 
 	r := bufio.NewReaderSize(stdout, 256<<10)
 	if err := waitMarker(r); err != nil {
+		// ssh closed its stdout, so it's exiting: see whether it never got
+		// as far as the host.
+		exited = make(chan error, 1)
+		go func() { exited <- cmd.Wait() }()
+		select {
+		case werr := <-exited:
+			exited <- werr // for the deferred cleanup
+			if sshFailed(werr) {
+				return unreachableError{dest, err}
+			}
+		case <-time.After(2 * time.Second):
+		}
 		return err
 	}
 	fw := &frameWriter{w: stdin}
@@ -690,6 +749,9 @@ func (c *client) writeMeta() {
 	}
 	if !c.connected && c.everUp {
 		m["down_since"] = c.downSince.Unix()
+	}
+	if c.waking {
+		m["waking"] = true
 	}
 	c.connMu.Unlock()
 	c.outMu.Lock()

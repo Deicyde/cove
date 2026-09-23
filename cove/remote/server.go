@@ -185,12 +185,7 @@ func runServe(arg string) error {
 		"pid": d.cmd.Process.Pid, "daemon": os.Getpid(), "created": time.Now().Unix()})
 	os.WriteFile(filepath.Join(d.dir, "info.json"), info, 0o600)
 	if os.Getenv("COVE_REMOTE_NO_CAFFEINATE") == "" {
-		// Keep the machine awake while the session lives (the point of running
-		// something remotely is that it keeps going).
-		cf := exec.Command("/usr/bin/caffeinate", "-ims", "-w", fmt.Sprint(os.Getpid()))
-		if cf.Start() == nil {
-			go cf.Wait()
-		}
+		keepAwake(os.Getpid())
 	}
 	go d.readPty()
 	go d.watchMeta()
@@ -224,8 +219,13 @@ var lastDetach = time.Now()
 
 func (d *daemon) startChild(h hello) error {
 	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/zsh"
+	for _, sh := range []string{"/bin/zsh", "/bin/bash", "/bin/sh"} {
+		if shell != "" {
+			break
+		}
+		if _, err := os.Stat(sh); err == nil {
+			shell = sh
+		}
 	}
 	var argv []string
 	if strings.TrimSpace(h.Cmd) == "" {
@@ -268,12 +268,13 @@ func (d *daemon) childEnv(h hello) []string {
 		env[k] = v
 	}
 	// xterm-kitty needs kitty's terminfo, which the pro doesn't have installed;
-	// the kitty checkout next to this binary does.
+	// the kitty checkout next to this binary does (macOS ncurses looks in 78/,
+	// Linux in x/).
 	if exe, err := os.Executable(); err == nil {
 		ti := filepath.Join(filepath.Dir(exe), "..", "..", "terminfo")
-		if _, err := os.Stat(filepath.Join(ti, "78", "xterm-kitty")); err == nil {
-			env["TERMINFO_DIRS"] = ti + ":/usr/share/terminfo"
-		} else if env["TERM"] == "xterm-kitty" {
+		if hasKittyTerminfo(ti) {
+			env["TERMINFO_DIRS"] = ti + ":" + terminfoSys
+		} else if env["TERM"] == "xterm-kitty" && !hasKittyTerminfo(filepath.Join(os.Getenv("HOME"), ".terminfo"), "/usr/share/terminfo", "/lib/terminfo", "/usr/lib/terminfo") {
 			env["TERM"] = "xterm-256color"
 		}
 	}
@@ -292,6 +293,17 @@ func (d *daemon) childEnv(h hello) []string {
 		out = append(out, k+"="+v)
 	}
 	return out
+}
+
+func hasKittyTerminfo(dirs ...string) bool {
+	for _, dir := range dirs {
+		for _, sub := range []string{"78", "x"} {
+			if _, err := os.Stat(filepath.Join(dir, sub, "xterm-kitty")); err == nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (d *daemon) readPty() {
@@ -513,7 +525,7 @@ func (d *daemon) watchMeta() {
 			cwdPid, cwd, cwdAt = m.Pid, cwdOf(m.Pid), time.Now()
 		}
 		m.Cwd = cwd
-		if t, err := unix.IoctlGetTermios(int(d.ptmx.Fd()), unix.TIOCGETA); err == nil {
+		if t, err := unix.IoctlGetTermios(int(d.ptmx.Fd()), ttyGetReq); err == nil {
 			m.Echo = t.Lflag&unix.ECHO != 0 && t.Lflag&unix.ICANON != 0
 		}
 		b, _ := json.Marshal(m)

@@ -1,8 +1,8 @@
 ---
 name: cove-remote
-description: Run a live terminal, shell or Claude agent on another Mac (the MacBook Pro, kirans-macbook-pro) as a Cove termling that feels local. It has native kitty scrollback, CLI apps work, typing is predicted locally, it survives dropped links and this laptop sleeping, and it reattaches. Use when asked to run something on the pro/MBP, offload a build or agent, work "remotely" in a termling, or to list, reattach or kill remote sessions. Replaces the tmux route in mbp-offload.
+description: Run a live terminal, shell or Claude agent on another machine (the MacBook Pro, kirans-macbook-pro, or a Linux box such as aws-dev) as a Cove termling that feels local. It has native kitty scrollback, CLI apps work, typing is predicted locally, it survives dropped links and this laptop sleeping, and it reattaches. Use when asked to run something on the pro/MBP or a Linux devbox, offload a build or agent, work "remotely" in a termling, or to list, reattach or kill remote sessions. Replaces the tmux route in mbp-offload.
 ---
-# cove-remote: termlings that run on another Mac
+# cove-remote: termlings that run on another machine
 
 `cove/bin/cove-remote` (Go source in `cove/remote/`) works like Eternal
 Terminal plus mosh, built for the Cove:
@@ -34,7 +34,15 @@ Terminal plus mosh, built for the Cove:
   for the real agent/cwd and shows `name @ host` on the nameplate.
 - **Transport.** `ssh -tt host cove-remote bridge` (the `-tt` makes sshd set
   TCP_NODELAY, so keystrokes aren't Nagle-delayed). It uses the usual key auth
-  and needs no new ports. The remote binary is the same path, via Syncthing.
+  and needs no new ports. The remote binary is the same path: via Syncthing
+  on the pro, installed by `cove/remote/install-linux.sh HOST` on Linux.
+- **Linux remotes.** The server side (`bridge`, `serve`, `ls`, `kill`) also
+  runs on Linux: a static `GOOS=linux` build that reads `/proc` instead of
+  sysctl/proc_pidinfo. The Mac is always the client. `install-linux.sh`
+  builds `cove/bin/cove-remote-linux-<arch>` for the host's arch, installs it
+  at this checkout's `bin/cove-remote` path there (the box needs that path to
+  resolve, e.g. a `/Users/kirancodes` symlink) and puts kitty's terminfo in
+  `~/.terminfo`. Rerun it after changing the Go source.
 
 ## Starting one
 
@@ -64,8 +72,9 @@ cove/bin/cove-remote attach kirans-macbook-pro -- 'make -j8 2>&1 | tee build.log
   `--session NAME` (names from `ls`) to reattach a session from another
   termling. A fresh viewer gets the last 1 MB of output replayed
   (`--replay BYTES`), then full-screen apps are nudged to redraw.
-- The remote holds a `caffeinate -ims` for the session's life, so the pro
-  stays awake (set `COVE_REMOTE_NO_CAFFEINATE=1` in the remote env to skip).
+- On a Mac the remote holds a `caffeinate -ims` for the session's life, so
+  the pro stays awake (set `COVE_REMOTE_NO_CAFFEINATE=1` in the remote env to
+  skip). Linux gets nothing: the devbox's idle-stop counts live sessions.
 
 ## Lifetimes
 
@@ -94,6 +103,24 @@ kirans-macbook-pro  Kirans-MacBook-Pro.local  kirans-macbook-pro
 
 ssh runs with `AddressFamily=inet` (a `.local` name's IPv6 link-local address
 can hang for 30 s). The meta file's `route` says which one is in use.
+
+## Waking a stopped host
+
+`~/.config/cove-remote/hosts` holds per-host settings, one per line, re-read
+on every use. `wake` is a shell command that `attach`, `ls` and `kill` run
+when ssh can't reach the host at all (ssh's exit 255), then retry:
+
+```
+# host   setting  value
+aws-dev  wake     ~/Documents/code/aws-devbox/bin/aws-dev-wake
+```
+
+It should start the machine and return once `ssh HOST true` works (non-zero
+means it couldn't); it gets `COVE_REMOTE_HOST`, has 10 minutes, and its
+output goes to the client log (stderr for `ls`/`kill`). `attach` runs it at
+most once a minute, shows `[cove-remote: waking HOST]` on first connect and
+`⟳ waking HOST` at the cursor, and puts `"waking": true` in the meta file.
+Routes stay in the `routes` file.
 
 ## Upgrading live clients
 

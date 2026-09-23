@@ -1,4 +1,4 @@
-// cove-remote: live terminals on another Mac that feel local.
+// cove-remote: live terminals on another machine (a Mac or Linux) that feel local.
 //
 //	cove-remote attach HOST [-- command]   run in a termling (local)
 //	cove-remote ls HOST                    list the sessions on HOST
@@ -43,10 +43,19 @@ func main() {
 		for _, a := range os.Args[3:] {
 			rest += " " + shellQuote(a)
 		}
-		cmd := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", os.Args[2],
-			shellQuote(self)+" local-"+os.Args[1]+rest)
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-		err = cmd.Run()
+		run := func() error {
+			cmd := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", os.Args[2],
+				shellQuote(self)+" local-"+os.Args[1]+rest)
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+			return cmd.Run()
+		}
+		err = run()
+		if sshFailed(err) && wakeCommand(os.Args[2]) != "" {
+			fmt.Fprintf(os.Stderr, "cove-remote: waking %s\n", os.Args[2])
+			if err = runWake(os.Args[2], os.Stderr); err == nil {
+				err = run()
+			}
+		}
 	case "local-ls":
 		err = localLs()
 	case "local-kill":

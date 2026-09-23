@@ -1,69 +1,15 @@
 package main
 
-// Process-tree inspection straight from the kernel. The pro's lsof can hang
-// for minutes and ps is slow, so the session daemon asks sysctl and
-// proc_pidinfo instead.
-
-/*
-#include <libproc.h>
-#include <sys/proc_info.h>
-*/
-import "C"
-
-import (
-	"bytes"
-	"strings"
-	"unsafe"
-
-	"golang.org/x/sys/unix"
-)
-
-// argv returns a process's command line, or its short name if that's hidden.
-func argv(pid int, comm string) string {
-	raw, err := unix.SysctlRaw("kern.procargs2", pid)
-	if err != nil || len(raw) < 4 {
-		return comm
-	}
-	argc := int(*(*int32)(unsafe.Pointer(&raw[0])))
-	rest := raw[4:]
-	// skip the exec path and its NUL padding
-	i := bytes.IndexByte(rest, 0)
-	if i < 0 {
-		return comm
-	}
-	rest = rest[i:]
-	for len(rest) > 0 && rest[0] == 0 {
-		rest = rest[1:]
-	}
-	args := make([]string, 0, argc)
-	for len(args) < argc && len(rest) > 0 {
-		j := bytes.IndexByte(rest, 0)
-		if j < 0 {
-			j = len(rest)
-		}
-		args = append(args, string(rest[:j]))
-		if j == len(rest) {
-			break
-		}
-		rest = rest[j+1:]
-	}
-	return strings.Join(args, " ")
-}
+import "strings"
 
 // scanTree mirrors Cove.gd's _scan_sessions: the agent is the first
-// claude/codex/opencode below the session's shell.
+// claude/codex/opencode below the session's shell. The process table and
+// command lines come from the kernel (procs_darwin.go, procs_linux.go).
 func scanTree(root int) meta {
 	m := meta{Agent: "shell", Pid: root}
-	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
-	if err != nil {
+	kids, comm, ok := procTable()
+	if !ok {
 		return m
-	}
-	kids := map[int][]int{}
-	comm := map[int]string{}
-	for _, p := range procs {
-		pid, ppid := int(p.Proc.P_pid), int(p.Eproc.Ppid)
-		kids[ppid] = append(kids[ppid], pid)
-		comm[pid] = unix.ByteSliceToString(p.Proc.P_comm[:])
 	}
 	queue := append([]int(nil), kids[root]...)
 	agentPid := -1
@@ -89,13 +35,4 @@ func scanTree(root int) meta {
 	// one), so a bare prompt is "no children".
 	m.Idle = m.Agent == "shell" && len(kids[root]) == 0
 	return m
-}
-
-func cwdOf(pid int) string {
-	var vpi C.struct_proc_vnodepathinfo
-	n := C.proc_pidinfo(C.int(pid), C.PROC_PIDVNODEPATHINFO, 0, unsafe.Pointer(&vpi), C.int(unsafe.Sizeof(vpi)))
-	if n <= 0 {
-		return ""
-	}
-	return C.GoString(&vpi.pvi_cdir.vip_path[0])
 }
