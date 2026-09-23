@@ -27,6 +27,15 @@ unset COVE_SPAWN_SESSION
 # The stable identity of this termling: survives kitty restarts (unlike
 # $KITTY_WINDOW_ID), and is what the cove MCP tools and board ownership key on.
 export COVE_SESSION="$sess"
+# Edit prompts (Claude Code's ctrl+g, git commit messages, ...) in the running
+# Vibemacs rather than VS Code, which is what Claude Code picks when neither
+# VISUAL nor EDITOR is set. emacsclient waits for the buffer to be finished
+# (C-x #); ALTERNATE_EDITOR starts Vibemacs when no server is up.
+VIBEMACS_CLIENT=/Applications/Vibemacs.app/Contents/MacOS/bin/emacsclient
+if [ -x "$VIBEMACS_CLIENT" ]; then
+	export EDITOR="$VIBEMACS_CLIENT" VISUAL="$VIBEMACS_CLIENT"
+	export ALTERNATE_EDITOR=/Applications/Vibemacs.app/Contents/MacOS/Vibemacs
+fi
 # cove/bin/abduco (build-abduco.sh) stays on the main screen, so kitty keeps
 # scrollback; stock abduco flips to the alt screen and the wheel does nothing.
 ABDUCO="$(dirname "$0")/bin/abduco"
