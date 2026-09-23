@@ -60,6 +60,7 @@ var _tex: ImageTexture
 var _size := Vector2i.ZERO
 var _last_seq := -1
 var _file: FileAccess      # kept open: kitty rewrites the frame in place (mmap)
+var _renamed_frames := false  # ...but a page critter's are published by rename (see poll)
 # Zero-copy path: two importers/textures (double-buffered), swapped per frame.
 var _importers: Array = []          # [CoveIOSurface, CoveIOSurface]
 var _rd_tex: Array = [null, null]   # [Texture2DRD, Texture2DRD]
@@ -84,6 +85,14 @@ func poll() -> void:
 	# Cove's biggest main-thread cost at idle. One handle stays open instead.
 	# Seeking far away first drops stdio's read buffer; a seek straight back to 0
 	# would reuse it and read a stale header.
+	#
+	# Page critters are the exception: Vibefox publishes each frame by rename
+	# (write .tmp, move it into place), so every frame is a NEW inode and a handle
+	# we hold stays bound to the old, unlinked one -- the sprite freezes on the
+	# frame that was current when we opened it, while its input goes on working.
+	# There are only ever a handful of them, so they pay the reopen.
+	if _renamed_frames:
+		_file = null
 	if _file == null:
 		if not FileAccess.file_exists(frame_path):
 			return
@@ -102,6 +111,7 @@ func poll() -> void:
 	var flags := int(head.decode_u32(20))
 	var was_page := page
 	page = (flags & (FLAG_PAGE | FLAG_EMACS)) != 0
+	_renamed_frames = (flags & FLAG_PAGE) != 0
 	emacs = (flags & FLAG_EMACS) != 0
 	if emacs:
 		emacs_scale = maxf(1.0, float(head.decode_u32(60)) / 100.0)
