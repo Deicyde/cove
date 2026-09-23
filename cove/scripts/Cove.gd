@@ -57,6 +57,7 @@ var _move_grab := Vector2.ZERO # cursor->ground offset so the grabbed point stay
 # Drag-select on the focused terminal: text selection instead of lifting it.
 var _selecting := false        # this press should select, not lift
 var _sel_started := false      # the selection has actually begun (dragged past the deadzone)
+var _sel_shift := false        # Shift was held at the press: kitty selects even under mouse tracking
 var _hold_armed := false       # a select-press held still for HOLD_MS lifts the termling instead
 var _press_ms := 0
 const HOLD_MS := 250
@@ -89,6 +90,7 @@ var _input_tries := 0
 
 # cross-Mac termling handoff (native OS drag over Universal Control)
 var _drag: RefCounted = null   # CoveDrag extension
+var _app: RefCounted = null    # CoveApp extension: owns Cmd+H (see _poll_hide_key)
 var _inflight_id := -1         # term_id currently being dragged out (dimmed), or -1
 var _self_drop := false        # the in-flight drag was dropped back onto this Cove
 var _ghost: Label = null       # landing ghost shown while an inbound drag hovers
@@ -203,7 +205,15 @@ var _fly_off := Vector2.ZERO   # target's on-screen offset from centre at take-o
 const FLY_TIME := 0.45         # seconds per camera flight
 var _track_lock := 0.0         # 0->1 ramp from easing onto the tracked termling to gluing to it
 var _track_of := -1            # which termling that ramp belongs to
-const SEARCH_HINT := "↵ jump  ·  ⇥ ✨ ask AI  ·  esc"
+const SEARCH_HINT := "↵ jump  ·  ⇥ ✨ ask AI  ·  \"new …\" makes a termling  ·  esc"
+const QUICK_HINT := "↵ new termling (✨ picks its box, folder, agent)  ·  esc"
+var _quick := {}           # token -> {q, id, t, res}: a "new …" from Cmd+F on its way
+var _quick_claim := ""     # token whose termling is the next fresh spawn
+var _quick_poll := 0.0
+var _quick_ask := {}       # term id -> {token, q, ask, options}: waiting for you to point at its box
+var _target_id := -1       # the termling targeting mode is placing (-1 = off)
+var _target_hint: Label
+var _target_mark: Node2D   # outlines the box under the pointer
 const SEARCH_DIM := 0.2       # alpha for termlings occluding the previewed one
 
 # radial jump (Cmd+J): hop the preview between termlings by direction
@@ -262,6 +272,9 @@ func _ready() -> void:
 	else:
 		push_warning("cove: CoveInput extension not loaded — input falls back to `kitten @ send` (slow). Check cove.gdextension / rebuild gdext.")
 	_setup_handoff()
+	if ClassDB.class_exists("CoveApp"):
+		_app = ClassDB.instantiate("CoveApp")
+		_app.call("watch_hide_key")
 	_start_vibefox_bridge()
 	_start_vibemacs_bridge()
 	_start_godot_bridge()
@@ -289,14 +302,32 @@ func _notification(what: int) -> void:
 		_app_focused = what == NOTIFICATION_APPLICATION_FOCUS_IN
 	elif what == NOTIFICATION_WM_CLOSE_REQUEST:
 		if _emacs_focused():
-			var ev := InputEventKey.new()
-			ev.keycode = KEY_Q
-			ev.physical_keycode = KEY_Q
-			ev.meta_pressed = true
-			ev.pressed = true
-			_emacs_key(_groups[_focused_id].terminal, ev)
+			_emacs_cmd_key(KEY_Q)
 		else:
 			get_tree().quit()
+
+
+# Cmd+H never reaches _input either: AppKit hides the app first. CoveApp swallows
+# it natively and counts presses; an Emacs critter gets it as M-h, anything else
+# hides the Cove as before.
+func _poll_hide_key() -> void:
+	if _app == null:
+		return
+	for i in int(_app.call("take_hide_press")):
+		if _emacs_focused():
+			_emacs_cmd_key(KEY_H)
+		else:
+			_app.call("hide")
+
+
+# Send Cmd+<key> (Emacs' meta) to the focused Emacs critter.
+func _emacs_cmd_key(key: Key) -> void:
+	var ev := InputEventKey.new()
+	ev.keycode = key
+	ev.physical_keycode = key
+	ev.meta_pressed = true
+	ev.pressed = true
+	_emacs_key(_groups[_focused_id].terminal, ev)
 
 
 func _exit_tree() -> void:
@@ -347,6 +378,7 @@ func _process(delta: float) -> void:
 	# inside _ready, before the world/camera exist. Wait until setup is done.
 	if _world == null or _cam == null:
 		return
+	_poll_hide_key()
 	_rescan_accum += delta
 	if _rescan_accum > 0.4:
 		_rescan_accum = 0.0
@@ -366,6 +398,9 @@ func _process(delta: float) -> void:
 	_pump_notify()
 	_pump_events(delta)
 	_poll_search(delta)
+	_poll_quick(delta)
+	if _target_id != -1 and not _groups.has(_target_id):
+		_end_target(false)
 	_bd_tick(delta)
 	_state_accum += delta
 	if _state_accum > 0.2:
@@ -471,6 +506,12 @@ func _reconcile() -> void:
 
 func _add_group(id: int) -> void:
 	var g := CarryGroup.new()
+	# A Cmd+N (or Cmd+F "new …") termling lands at the camera, even when kitty
+	# reused a window id that still has a saved spot from an earlier run.
+	var follow := _spawn_follow and id < PAGE_PANE_BASE and not _pending_place.has(id) \
+		and _land_queue.is_empty()
+	if follow:
+		_saved.get("pos", {}).erase(id)
 	if _pending_place.has(id):
 		# Adopted from the desktop: appear right where it was dropped.
 		g.position = _pending_place[id]
@@ -500,6 +541,9 @@ func _add_group(id: int) -> void:
 			_spawn_follow = false
 			g.position = center
 			_fit_pending[id] = true
+			if _quick_claim != "" and _quick.has(_quick_claim):
+				_quick[_quick_claim]["id"] = id   # the "new …" from Cmd+F
+			_quick_claim = ""
 	_world.add_child(g)
 	g.setup(id, "%s/term-%d.rgba" % [DIR, id], _bounds)
 	if _names.has(id):
@@ -531,6 +575,7 @@ func _remove_group(id: int) -> void:
 		_groups.erase(id)
 	_page_meta.erase(id)
 	_zone_of.erase(id)
+	_quick_ask.erase(id)
 	_attention.remove(id)
 	_drop_note(id)   # a dead termling's "needs you" can't be attended, so it goes
 	if _focused_id == id:
@@ -607,13 +652,14 @@ func _build_handoff_payload(g: Node2D) -> String:
 		"sid": sid,
 		"cwd": cwd,
 		"name": _handoff_name(id),
+		"emacs": g.terminal.emacs,   # a Vibemacs frame: only ever drops onto the desktop
 	})
 
 
 func _try_begin_handoff() -> void:
 	if _drag == null or _inflight_id != -1 or _drag.call("is_dragging"):
 		return
-	if _press_group == null or _press_group.terminal.page:
+	if _press_group == null or (_press_group.terminal.page and not _press_group.terminal.emacs):
 		return   # a page critter lives in this Mac's browser; it can't be handed off
 	var g := _press_group
 	var id: int = g.term_id
@@ -651,6 +697,15 @@ func _poll_handoff() -> void:
 	if not ended.is_empty():
 		if _self_drop:
 			_cancel_inflight()   # dropped back onto this Cove: it just stays
+		elif _inflight_emacs():
+			if not bool(ended.get("inside_self", false)) and not bool(ended.get("accepted", false)) \
+					and ended.has("sx"):
+				_vm_send("critter.detach", {"id": _groups[_inflight_id].terminal.pane_id,
+					"sx": float(ended.get("sx", 0.0)), "sy": float(ended.get("sy", 0.0))},
+					_vm_sock_for(_groups[_inflight_id].terminal.pane_id))
+				print("cove: emacs critter %d left the cove for the desktop" % _inflight_id)
+			else:
+				_cancel_inflight()
 		elif bool(ended.get("accepted", false)):
 			_close_origin(_inflight_id)
 		elif not bool(ended.get("inside_self", false)) and ended.has("sx"):
@@ -679,6 +734,8 @@ func _land_handoff(drop: Dictionary) -> void:
 		return
 	# Our own in-flight termling dropped back onto this same Cove: don't clone
 	# it, just keep it here (_poll_handoff sees _self_drop and cancels).
+	if bool(data.get("emacs", false)) and not _groups.has(int(data.get("term_id", -1))):
+		return   # another Mac's Emacs frame: it can't live here
 	var tid := int(data.get("term_id", -1))
 	if _inflight_id != -1 and tid == _inflight_id and _groups.has(tid):
 		_self_drop = true
@@ -702,6 +759,10 @@ func _land_handoff(drop: Dictionary) -> void:
 	args.append_array([land, agent, sid])
 	_create_process(kitten_exe, args, false)
 	print("cove: landed %s termling (sid=%s) in %s" % [agent, sid if sid != "" else "-", cwd])
+
+
+func _inflight_emacs() -> bool:
+	return _inflight_id != -1 and _groups.has(_inflight_id) and _groups[_inflight_id].terminal.emacs
 
 
 func _cancel_inflight() -> void:
@@ -808,6 +869,8 @@ func _set_focus(id: int, dismiss := true) -> void:
 func _dismiss_note(id: int) -> void:
 	_drop_note(id)
 	_attention.on_focus(id)
+	if _quick_ask.has(id) and _target_id == -1:
+		_begin_target(id)   # a "new …" waiting to be told where it goes
 
 
 # Forget a termling's note (the panel row and its Cmd+' stop). Returns whether
@@ -881,6 +944,9 @@ func _order_by_proximity(from_id: int) -> Array:
 # Catch the spawn chord early (macOS can swallow Cmd-chords before they reach
 # _unhandled_input). Accept Cmd+N or Ctrl+N.
 func _input(event: InputEvent) -> void:
+	if _target_id != -1 and _target_input(event):
+		get_viewport().set_input_as_handled()
+		return
 	if event is InputEventKey and event.keycode in [KEY_META, KEY_ALT, KEY_CTRL, KEY_SHIFT]:
 		_mod_right[event.keycode] = event.pressed and event.location == KEY_LOCATION_RIGHT
 	if not (event is InputEventKey and event.pressed and not event.echo):
@@ -899,7 +965,11 @@ func _input(event: InputEvent) -> void:
 			KEY_TAB:
 				_run_semantic_search(); get_viewport().set_input_as_handled()
 			KEY_ENTER, KEY_KP_ENTER:
-				_commit_search(); get_viewport().set_input_as_handled()
+				if event.shift_pressed:
+					_quick_spawn(_search_edit.text)   # Shift+Enter: a new termling, whatever it says
+				else:
+					_commit_search()
+				get_viewport().set_input_as_handled()
 		return
 	# The radial jump owns the keyboard while it's up (nothing types into a terminal),
 	# but never steals keys from a board label being edited.
@@ -1058,7 +1128,30 @@ func _send_select(g: Node2D, world: Vector2, phase: int) -> void:
 		return
 	var ch: Dictionary = t.cell_and_half(world)
 	var cell: Vector2i = ch["cell"]
+	# An app tracking the mouse (Claude Code's fullscreen TUI, vim, htop) gets the
+	# drag itself, as in real kitty: it repaints constantly, and kitty drops a
+	# selection the moment a selected line is redrawn, so there's nothing left to
+	# copy on release. Claude selects and copies on its own. Shift+drag still
+	# makes a kitty selection.
+	if t.mouse_mode != 0 and not _sel_shift:
+		_pty(pane, _drag_bytes(t, cell, phase))
+		return
 	_sock.call("send_mouse", pane, phase, cell.x, cell.y, ch["left"])
+
+
+# One left-button mouse report for a drag: press (phase 0), motion with the
+# button held (1), release (2). SGR when the app asked for it, X10 otherwise
+# (which can't say which button was released).
+func _drag_bytes(t, cell: Vector2i, phase: int) -> PackedByteArray:
+	var col := cell.x + 1   # 1-based
+	var row := cell.y + 1
+	var btn: int = [0, 32, 0][phase]
+	if t.mouse_proto == 2 or t.mouse_proto == 4:   # SGR / SGR-pixel
+		return ("%s[<%d;%d;%d%s" % [char(27), btn, col, row, "m" if phase == 2 else "M"]).to_utf8_buffer()
+	if phase == 2:
+		btn = 3
+	return PackedByteArray([27, 91, 77,
+		mini(btn + 32, 255), mini(col + 32, 255), mini(row + 32, 255)])
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -1132,6 +1225,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				_press_pos = event.position
 				_press_world = wpos
 				_sel_started = false
+				_sel_shift = event.shift_pressed
 				# Drag semantics on a termling: on the focused (or tracked) one a drag
 				# selects its text, but press-and-hold still for HOLD_MS lifts it so the
 				# drag moves it instead. A drag on any other termling moves it straight
@@ -1974,11 +2068,16 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 		# and (unlike the attach client) it is the parent of the shell subtree.
 		if not c.contains("abduco") or not kids.has(pid):
 			continue
+		# The program itself must be abduco: reload-kitty.sh launches kitty with
+		# `abduco -A <first session>` in its argv, and kitty has children too.
+		if not c.split(" ", false, 1)[0].ends_with("abduco"):
+			continue
 		var sess := _session_token(c)
 		if sess == "":
 			continue
 		var agent := "shell"
 		var agent_pid := -1
+		var remote_link := false
 		var direct: Array = kids.get(pid, [])
 		var shell_pid: int = direct[0] if direct.size() > 0 else -1
 		var queue: Array = direct.duplicate()
@@ -1987,6 +2086,11 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 			guard += 1
 			var cur: int = queue.pop_front()
 			var lc: String = str(cmd.get(cur, "")).to_lower()
+			if lc.contains("cove-remote attach"):
+				# The shell/agent runs on another Mac (cove-remote): its argv may
+				# name `claude`, but what really runs there is in its meta file.
+				remote_link = true
+				continue
 			if lc.contains("opencode"):
 				agent = "opencode"; agent_pid = cur
 			elif lc.contains("codex") and agent == "shell":
@@ -2000,7 +2104,30 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 		# safe to type a `cd` into it.
 		var idle: bool = agent == "shell" and shell_pid != -1 and kids.get(shell_pid, []).is_empty()
 		res[sess] = {"agent": agent, "busy": agent != "shell", "idle": idle, "pid": src, "cwd": _cwd_of(src)}
+		if remote_link:
+			_apply_remote_link(res[sess], sess)
 	return res
+
+
+# A cove-remote termling: `cove-remote attach` writes what the remote session
+# is running (agent, cwd, whether the link is up) to remote/<session>.json.
+func _apply_remote_link(info: Dictionary, sess: String) -> void:
+	var f := FileAccess.open(DIR + "/remote/" + sess + ".json", FileAccess.READ)
+	if f == null:
+		return
+	var m = JSON.parse_string(f.get_as_text())
+	f.close()
+	if typeof(m) != TYPE_DICTIONARY:
+		return
+	info["agent"] = str(m.get("agent", "shell")) if str(m.get("agent", "")) != "" else "shell"
+	info["busy"] = bool(m.get("busy", false))
+	info["idle"] = bool(m.get("idle", false))
+	info["cwd"] = str(m.get("cwd", ""))
+	info["remote_host"] = str(m.get("host", ""))
+	info["remote_up"] = bool(m.get("connected", false))
+	# a host with a wake command that's gone to sleep: typing wakes it
+	info["remote_state"] = "waking" if bool(m.get("waking", false)) else (
+		"asleep, type to wake" if bool(m.get("asleep", false)) else "")
 
 
 # The session name is the argv token like `cove-12345` on an abduco command line.
@@ -2065,6 +2192,10 @@ func _parse_ls(txt: String, sess_info: Dictionary) -> Dictionary:
 					"cwd": str(si.get("cwd", w.get("cwd", ""))),
 					"title": str(w.get("title", "")),
 				}
+				if si.has("remote_host"):
+					res[pane]["remote_host"] = si["remote_host"]
+					res[pane]["remote_up"] = si["remote_up"]
+					res[pane]["remote_state"] = si.get("remote_state", "")
 	return res
 
 
@@ -2118,6 +2249,8 @@ func _apply_agent_state() -> void:
 		# A shadow pane opened by cove-remote-auto.sh titles itself "◈ <name> @ <peer>";
 		# recognise it and give the termling the remote treatment.
 		_apply_remote_marker(g, str(info.get("title", "")))
+		g.terminal.set_remote_link(str(info.get("remote_host", "")), bool(info.get("remote_up", true)),
+			str(info.get("remote_state", "")))
 		if info.get("attention", false):
 			_attn_ids[id] = true
 			# kitty raising the flag (a bell, an agent waiting) is a ping too
@@ -2564,7 +2697,43 @@ func _start_vibemacs_bridge() -> void:
 	_child_mutex.unlock()
 
 
-func _vm_send(cmd: String, args: Dictionary) -> void:
+var _vm_extra := {}   # a named Vibemacs instance's socket -> {pipe, pid}
+
+
+# The socket that owns Emacs critter PANE: named in its sidecar by named
+# instances, else the main instance's.
+func _vm_sock_for(pane: int) -> String:
+	var meta: Dictionary = _page_meta.get(pane, {})
+	if not meta.has("socket"):
+		var f := FileAccess.open("%s/term-%d.json" % [DIR, pane], FileAccess.READ)
+		if f != null:
+			var d = JSON.parse_string(f.get_as_text())
+			if typeof(d) == TYPE_DICTIONARY:
+				meta = d
+				_page_meta[pane] = d
+	var sock := str(meta.get("socket", ""))
+	if sock.begins_with("/tmp/vibemacs/") or sock.begins_with("/private/tmp/vibemacs/"):
+		return sock
+	return VIBEMACS_SOCK
+
+
+func _vm_send(cmd: String, args: Dictionary, sock := VIBEMACS_SOCK) -> void:
+	if sock != VIBEMACS_SOCK and sock.trim_prefix("/private") != VIBEMACS_SOCK:
+		var b: Dictionary = _vm_extra.get(sock, {})
+		if b.is_empty() or not OS.is_process_running(int(b["pid"])):
+			var script := ProjectSettings.globalize_path("res://cove-vibefox-bridge.py")
+			var r: Dictionary = OS.execute_with_pipe("/usr/bin/python3", [script, sock], false)
+			if r.is_empty() or not r.has("stdio") or int(r.get("pid", -1)) <= 0:
+				return
+			b = {"pipe": r["stdio"], "pid": int(r["pid"])}
+			_vm_extra[sock] = b
+			_child_mutex.lock()
+			_child_pids.append(int(r["pid"]))
+			_child_mutex.unlock()
+		_vm_seq += 1
+		b["pipe"].store_line(JSON.stringify({"id": _vm_seq, "cmd": cmd, "args": args}))
+		b["pipe"].flush()
+		return
 	if _vm_pipe == null or _vm_pid == -1:
 		return
 	_vm_seq += 1
@@ -2680,7 +2849,7 @@ func _page_input(pane: int, kind: String, data: Dictionary) -> void:
 		_gd_send("critter.input", {"id": pane, "kind": kind, "data": _godot_data(data)})
 		return
 	if pane >= EMACS_PANE_BASE:
-		_vm_send("critter.input", {"id": pane, "kind": kind, "data": data})
+		_vm_send("critter.input", {"id": pane, "kind": kind, "data": data}, _vm_sock_for(pane))
 		return
 	_vf_send("critter.input", {"id": pane, "kind": kind, "data": data})
 
@@ -2717,7 +2886,7 @@ func _page_activate(g: Node2D) -> void:
 		_gd_send("critter.activate", {"id": g.terminal.pane_id})
 		return
 	if g.terminal.emacs:
-		_vm_send("critter.activate", {"id": g.terminal.pane_id})
+		_vm_send("critter.activate", {"id": g.terminal.pane_id}, _vm_sock_for(g.terminal.pane_id))
 		return
 	_vf_send("critter.activate", {"id": g.terminal.pane_id})
 
@@ -2858,6 +3027,9 @@ func _write_state() -> void:
 		if tr != null:   # where it is drawn: [x, y, w, h] in world units
 			terms[-1]["rect"] = [snappedf(tr.position.x, 0.1), snappedf(tr.position.y, 0.1),
 				snappedf(tr.size.x, 0.1), snappedf(tr.size.y, 0.1)]
+		if info.has("remote_host"):   # runs on another Mac via cove-remote
+			terms[-1]["host"] = str(info["remote_host"])
+			terms[-1]["link_up"] = bool(info["remote_up"])
 		if info.has("url"):   # a page critter: which tab it mirrors
 			terms[-1]["url"] = str(info["url"])
 			if int(info.get("tab", -1)) >= 0:
@@ -3055,6 +3227,7 @@ func _build_ui() -> void:
 	_build_rename_dialog()
 	_bd_build_ui()
 	_build_search_dialog()
+	_build_target()
 	_build_radial()
 	_build_avy()
 	_scale_ui_layers()
@@ -3282,6 +3455,9 @@ func _on_search_text(text: String) -> void:
 	_search_awaiting = ""   # typing supersedes any pending semantic reply
 	_clear_preview()        # a fresh query stops previewing (camera stays put)
 	_search_hint.text = SEARCH_HINT
+	if _is_quick_query(text):
+		_render_quick(text)
+		return
 	var q := text.strip_edges().to_lower()
 	var words := q.split(" ", false)
 	var scored := []
@@ -3351,6 +3527,9 @@ func _move_search_sel(d: int) -> void:
 
 
 func _commit_search() -> void:
+	if _is_quick_query(_search_edit.text):
+		_quick_spawn(_search_edit.text)
+		return
 	# Enter jumps to the highlighted hit; with nothing to jump to, ask the AI.
 	if _search_rows.is_empty():
 		_run_semantic_search()
@@ -3363,6 +3542,272 @@ func _search_choose(id: int) -> void:
 	# Land zoomed to fit it, in or out; the camera keeps tracking (or presenting) it.
 	if _groups.has(id):
 		_jump_focus(id, true, _fit_zoom_for(_groups[id]))
+
+
+# --- "new …": spawn a termling from the search bar ------------------------------
+# "new claude part of cove for the zoom lag" spawns a termling at once (framed and
+# followed, like Cmd+N) while cove_quick.py asks a fast model what it's for: its
+# name, its box (an existing one, or a new titled box with an arrow from the
+# project box it hangs off), its folder and its agent (claude by default; codex,
+# opencode or a plain shell when asked). The termling is the user's own.
+
+func _is_quick_query(text: String) -> bool:
+	var q := text.strip_edges().to_lower()
+	return q == "new" or q == "+" or q.begins_with("new ") or q.begins_with("+") or q.begins_with("spawn ")
+
+
+func _render_quick(text: String) -> void:
+	_search_rows = []
+	while _search_list.get_child_count() > 0:
+		var ch := _search_list.get_child(0)
+		_search_list.remove_child(ch)
+		ch.queue_free()
+	var b := Button.new()
+	b.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	b.focus_mode = Control.FOCUS_NONE
+	b.add_theme_font_size_override("font_size", 13)
+	var rest := text.strip_edges().trim_prefix("+").trim_prefix("new").trim_prefix("spawn").strip_edges()
+	b.text = "▸ + new termling" + ("   —   " + rest if rest != "" else "")
+	b.pressed.connect(func(): _quick_spawn(_search_edit.text))
+	_search_list.add_child(b)
+	_search_hint.text = QUICK_HINT
+
+
+func _quick_spawn(text: String) -> void:
+	var q := text.strip_edges()
+	_close_search(false)
+	var token := "%d" % Time.get_ticks_usec()
+	_quick[token] = {"q": q, "id": -1, "t": Time.get_ticks_msec(), "res": null}
+	_quick_claim = token
+	_spawn_follow = true   # appears in view, framed and followed, like Cmd+N
+	_spawn_terminal()
+	_create_process("/usr/bin/python3", [ProjectSettings.globalize_path("res://mcp/cove_quick.py"), token, q])
+
+
+func _poll_quick(delta: float) -> void:
+	if _quick.is_empty():
+		return
+	_quick_poll += delta
+	if _quick_poll < 0.1:
+		return
+	_quick_poll = 0.0
+	var now := Time.get_ticks_msec()
+	for token in _quick.keys():
+		var qk: Dictionary = _quick[token]
+		var path := "%s/quick-%s.json" % [DIR, token]
+		if qk["res"] == null and FileAccess.file_exists(path):
+			var res = JSON.parse_string(FileAccess.get_file_as_string(path))
+			if typeof(res) == TYPE_DICTIONARY:
+				qk["res"] = res
+				DirAccess.remove_absolute(path)
+		var id: int = qk["id"]
+		if qk["res"] != null and id != -1 and _groups.has(id):
+			_quick.erase(token)
+			if qk["res"].has("ask"):
+				_quick_await_place(_groups[id], str(token), qk)
+			else:
+				_quick_apply(_groups[id], qk["res"])
+		elif now - int(qk["t"]) > 30000:
+			_quick.erase(token)   # never came back: it stays a plain shell
+			DirAccess.remove_absolute(path)
+
+
+func _quick_apply(g: Node2D, res: Dictionary) -> void:
+	var nm := str(res.get("name", ""))
+	if nm != "":
+		_names[g.term_id] = nm
+		g.terminal.set_custom_name(nm)
+	var zone := str(res.get("zone", ""))
+	var nf = res.get("new_frame", null)
+	if typeof(nf) == TYPE_DICTIONARY:
+		zone = _quick_box(nf)
+	if zone != "":
+		_place_group(g, zone, null, true)
+	var line := str(res.get("line", ""))
+	if line != "":
+		_pty(g.terminal.pane_id, (line + "\r").to_utf8_buffer())
+
+
+# A topic box the way the user draws them by hand: a sketchy rectangle with its
+# title as a grouped text above the top-left corner, and an arrow in from the
+# project box it belongs to. One undo step. Returns the box's id.
+func _quick_box(nf: Dictionary) -> String:
+	var r := Rect2(float(nf.get("x", 0)), float(nf.get("y", 0)), float(nf.get("w", 600)), float(nf.get("h", 420)))
+	_bd_begin()
+	var gid := "g" + _bd_fresh_id()
+	var box := _bd_new("geo")
+	box["geo"] = "rectangle"
+	box.merge({"color": "black", "fill": "none", "dash": "draw", "font": "draw", "size": "m"}, true)
+	box["group"] = gid
+	_bd_set_rect(box, r)
+	_bd_add(box)
+	var label := _bd_new("text")
+	for k in ["color", "fill", "dash", "font", "size"]:
+		label[k] = box[k]
+	label["text"] = str(nf.get("title", ""))
+	label["autosize"] = true
+	label["group"] = gid
+	_bd_set_rect(label, Rect2(r.position + Vector2(32, -37), Vector2(20, 30)))
+	_bd_add(label)
+	_bd_relayout(label)
+	var src := str(nf.get("from", ""))
+	if src != "" and _bd_by_id.has(src):
+		var ar := _bd_new("arrow")
+		for k in ["color", "fill", "dash", "font", "size"]:
+			ar[k] = box[k]
+		var ra = _bd_bind_rect(src)
+		ar["a"] = _bd_a(ra.get_center() if ra != null else r.get_center())
+		ar["b"] = _bd_a(r.get_center())
+		ar["bind_a"] = src
+		ar["bind_b"] = str(box["id"])
+		ar["bend"] = 0.0
+		ar["head_a"] = false
+		ar["head_b"] = true
+		_bd_add(ar)
+	_bd_commit()
+	return str(box["id"])
+
+
+# When the model can't tell where a "new …" belongs, it asks you by pointing,
+# not by chat: the termling waits (named, a plain shell) with a "where does it
+# go?" notification. It doesn't grab you: Cmd+' steps past it and it stays in
+# the notifications until you focus it. Focusing it starts targeting mode:
+# click a box to drop it in, click a project box (one with arrows out to topic
+# boxes) for a new topic box hanging off it, or click empty ground for a new box
+# right there. Esc puts it back in the notifications.
+func _quick_await_place(g: Node2D, token: String, qk: Dictionary) -> void:
+	var res: Dictionary = qk["res"]
+	var nm := str(res.get("name", ""))
+	if nm != "" and g.terminal.custom_name == "":
+		_names[g.term_id] = nm
+		g.terminal.set_custom_name(nm)
+	_quick_ask[g.term_id] = {"token": token, "q": qk["q"], "ask": str(res.get("ask", "")),
+		"options": res.get("options", [])}
+	if _focused_id == g.term_id:
+		_begin_target(g.term_id)   # you're still on it: ask right away
+		return
+	_quick_note(g.term_id)
+	_ping(g.term_id)
+
+
+func _quick_note(id: int) -> void:
+	_drop_note(id)
+	_notes.push_front({"project": "", "event": "place", "term_id": id, "ts": int(Time.get_unix_time_from_system())})
+	_update_panel()
+
+
+func _build_target() -> void:
+	var layer := CanvasLayer.new()
+	layer.layer = 6
+	add_child(layer)
+	var top := MarginContainer.new()
+	top.set_anchors_and_offsets_preset(Control.PRESET_TOP_WIDE)
+	top.add_theme_constant_override("margin_top", 14)
+	top.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	layer.add_child(top)
+	var center := CenterContainer.new()
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	top.add_child(center)
+	_target_hint = Label.new()
+	_target_hint.add_theme_font_size_override("font_size", 14)
+	_target_hint.add_theme_color_override("font_color", Color(0.95, 0.95, 0.98))
+	_target_hint.add_theme_stylebox_override("normal", _themed_box(Color(1.0, 0.75, 0.3, 0.8)))
+	_target_hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_target_hint.visible = false
+	center.add_child(_target_hint)
+	_target_mark = Node2D.new()
+	_target_mark.z_index = 100
+	_target_mark.draw.connect(_target_draw)
+	add_child(_target_mark)
+
+
+func _begin_target(id: int) -> void:
+	if not _groups.has(id) or not _quick_ask.has(id):
+		return
+	_target_id = id
+	var qa: Dictionary = _quick_ask[id]
+	var opts := []
+	for o in qa.get("options", []):
+		opts.append(str(o))
+	_target_hint.text = "where does %s go?%s%s\nclick a box  ·  a project box: new box off it  ·  empty ground: new box there  ·  esc: later" % [
+		_term_label(id), ("  " + str(qa["ask"])) if str(qa["ask"]) != "" else "",
+		("  (" + " / ".join(opts) + ")") if not opts.is_empty() else ""]
+	_target_hint.visible = true
+	_target_mark.queue_redraw()
+
+
+func _end_target(requeue: bool) -> void:
+	var id := _target_id
+	_target_id = -1
+	_target_hint.visible = false
+	_target_mark.queue_redraw()
+	if requeue and _groups.has(id) and _quick_ask.has(id):
+		_quick_note(id)   # back in the notifications, without taking the camera
+
+
+# Targeting owns left clicks (pan and zoom still work) and Esc.
+func _target_input(event: InputEvent) -> bool:
+	if event is InputEventMouseMotion:
+		_target_mark.queue_redraw()
+		return false
+	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
+		if event.pressed:
+			_target_pick(_world_mouse())
+		return true
+	if event is InputEventKey and event.pressed and event.keycode == KEY_ESCAPE:
+		_end_target(true)
+		return true
+	return false
+
+
+func _bd_is_hub(sid: String) -> bool:
+	for s in _bd_shapes:
+		if str(s["type"]) == "arrow" and str(s.get("bind_a", "")) == sid:
+			var b = _bd_by_id.get(str(s.get("bind_b", "")), null)
+			if b != null and _bd_is_container(b):
+				return true
+	return false
+
+
+func _target_draw() -> void:
+	if _target_id == -1:
+		return
+	var p := _world_mouse()
+	var w := 3.0 / maxf(_cam.zoom.x, 0.05)
+	var sid := _bd_container_at(p)
+	if sid == "":
+		_target_mark.draw_rect(Rect2(p - Vector2(300, 210), Vector2(600, 420)), Color(1.0, 0.75, 0.3, 0.8), false, w)
+		return
+	var r = _bd_container_rect(sid)
+	if r != null:
+		var col := Color(0.45, 0.85, 1.0, 0.9) if _bd_is_hub(sid) else Color(0.55, 0.95, 0.75, 0.9)
+		_target_mark.draw_rect(r, col, false, w * 1.5)
+
+
+func _target_pick(p: Vector2) -> void:
+	var id := _target_id
+	if not _quick_ask.has(id) or not _groups.has(id):
+		_end_target(false)
+		return
+	var qa: Dictionary = _quick_ask[id]
+	_quick_ask.erase(id)
+	_end_target(false)
+	var g: Node2D = _groups[id]
+	var sid := _bd_container_at(p)
+	var args := []
+	if sid != "" and _bd_is_hub(sid):
+		args = ["--from", sid]            # a topic box hanging off that project
+	elif sid != "":
+		_place_group(g, sid, null, true)   # in at once; the model only picks folder + agent
+		args = ["--zone", sid]
+	else:
+		var box := _quick_box({"title": _term_label(id), "x": p.x - 300.0, "y": p.y - 210.0, "w": 600.0, "h": 420.0})
+		_place_group(g, box, null, true)
+		args = ["--zone", box]
+	var token := str(qa["token"])
+	_quick[token] = {"q": qa["q"], "id": id, "t": Time.get_ticks_msec(), "res": null}
+	_create_process("/usr/bin/python3", [ProjectSettings.globalize_path("res://mcp/cove_quick.py"),
+		"--no-ask"] + args + [token, str(qa["q"])])
 
 
 # --- preview: camera + occluder fade while stepping search hits / radial jumps
@@ -4095,6 +4540,8 @@ func _update_panel() -> void:
 				who = _groups[tid].terminal.custom_name
 		var on := tid != -1 and tid == cur
 		row.text = ("▸ %s" if on else "• %s") % who
+		if str(n.get("event", "")) == "place":
+			row.text += "  ·  where does it go?"
 		row.add_theme_font_size_override("font_size", 13)
 		row.add_theme_color_override("font_color", Color(1, 1, 1) if on else Color(0.92, 0.9, 0.85))
 		if on:   # the one Cmd+' is showing
@@ -4288,6 +4735,7 @@ var _bd_tex := {}               # image src -> Texture2D (null if it failed to l
 var _bd_last_input_ms := 0      # last board click/key, for _bd_owns_keyboard
 # Redraw on change, not every frame (see _bd_tick).
 var _bd_live_layer: Node2D      # arrows tied to termlings, which move on their own
+var _bd_ink_layer: Node2D       # arrows anchored to text in Emacs critters: above the critters
 var _bd_dirty := true
 var _bd_drawn_px := 0             # frame-title size the shapes were last drawn at
 var _bd_zoom_seen := 0.0
@@ -4314,6 +4762,10 @@ func _bd_setup() -> void:
 	_bd_live_layer.z_index = -39
 	_bd_live_layer.draw.connect(_bd_draw_live)
 	add_child(_bd_live_layer)
+	_bd_ink_layer = Node2D.new()
+	_bd_ink_layer.z_index = 60
+	_bd_ink_layer.draw.connect(_bd_draw_ink)
+	add_child(_bd_ink_layer)
 	_bd_overlay = Node2D.new()
 	_bd_overlay.z_index = 100
 	_bd_overlay.draw.connect(_bd_draw_overlay)
@@ -4387,10 +4839,12 @@ func _bd_tick(delta: float) -> void:
 		_bd_member_sig = sig
 		_bd_layer.queue_redraw()
 		_bd_live_layer.queue_redraw()
+		_bd_ink_layer.queue_redraw()
 	else:
 		for s in _bd_shapes:
 			if _bd_is_live(s):
 				_bd_live_layer.queue_redraw()
+				_bd_ink_layer.queue_redraw()
 				break
 	var overlay_live := not _bd_sel.is_empty() or _bd_g != "" or not _bd_laser.is_empty() \
 		or _bd_bind_hint != "" or not _bd_guides.is_empty()
@@ -5887,8 +6341,17 @@ func _bd_draw_live() -> void:
 		return
 	var area := _bd_view_area(0.1)
 	for s in _bd_shapes:
-		if _bd_is_live(s) and _bd_shown(s) and area.intersects(_bd_bounds(s).grow(48.0)):
+		if _bd_is_live(s) and not _anc_bound(s) and _bd_shown(s) and area.intersects(_bd_bounds(s).grow(48.0)):
 			_bd_draw_shape(_bd_live_layer, s)
+
+
+func _bd_draw_ink() -> void:
+	if _cam == null:
+		return
+	var area := _bd_view_area(0.1)
+	for s in _bd_shapes:
+		if _anc_bound(s) and _bd_shown(s) and area.intersects(_bd_bounds(s).grow(48.0)):
+			_bd_draw_shape(_bd_ink_layer, s)
 
 
 func _bd_draw_shape(ci: CanvasItem, s: Dictionary) -> void:

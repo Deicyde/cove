@@ -38,6 +38,9 @@ var frame_path := ""
 var custom_name := ""    # user/agent-assigned name shown on the nameplate
 var remote := false      # a read-only shadow of a termling on another device
 var remote_peer := ""    # which device it lives on (shown on the nameplate)
+var link_host := ""      # a live cove-remote session: the Mac it runs on
+var link_up := true      # whether that link is connected right now
+var link_state := ""     # why it's down, when it's not just reconnecting ("asleep, type to wake")
 var page := false        # a Vibefox page critter: input goes to the browser, not kitty
 var emacs := false       # a Vibemacs frame (also page: input goes to Vibemacs, not kitty)
 var emacs_scale := 1.0   # its backing scale (2.0 on Retina)
@@ -50,6 +53,9 @@ var _focused := false     # last focus state, so set_remote can re-tint
 var _default_border_sb: StyleBox = null  # the local (blue) border style
 var _remote_border_sb: StyleBox = null   # a red variant for remote shadows
 var _backdrop: ColorRect = null          # red background mat, remote only
+var _link_border_sb: StyleBox = null     # violet: a live cove-remote termling
+const LINK_COLOR := Color(0.56, 0.38, 0.96)       # link up
+const LINK_DOWN_COLOR := Color(0.95, 0.62, 0.22)  # reconnecting
 var cols := 0
 var rows := 0
 var mouse_mode := 0      # 0 none, 1 button, 2 motion, 3 any
@@ -266,9 +272,49 @@ func _update_nameplate() -> void:
 		var who := (" @ " + remote_peer) if remote_peer != "" else ""
 		_nameplate.text = "◈ %s%s  (%d×%d)" % [base, who, cols, rows]
 		_nameplate.add_theme_color_override("font_color", Color(0.66, 0.78, 1.0))
+	elif link_host != "":
+		var state := "" if link_up else (", " + (link_state if link_state != "" else "reconnecting"))
+		_nameplate.text = "%s  @ %s%s  (%d×%d)" % [base, link_host, state, cols, rows]
+		_nameplate.add_theme_color_override("font_color",
+			LINK_COLOR.lightened(0.35) if link_up else LINK_DOWN_COLOR.lightened(0.2))
 	else:
 		_nameplate.text = "%s  (%d×%d)" % [base, cols, rows]
 		_nameplate.remove_theme_color_override("font_color")
+
+
+# A live terminal running on another Mac through cove-remote (not a shadow):
+# the nameplate says where, and whether the link is up.
+func set_remote_link(host: String, up: bool, state: String = "") -> void:
+	if link_host == host and link_up == up and link_state == state:
+		return
+	var restyle := link_host != host or link_up != up
+	link_host = host
+	link_up = up
+	link_state = state
+	if not restyle:
+		_update_nameplate()
+		return
+	if remote:
+		_update_nameplate()   # a read-only shadow keeps its red look
+		return
+	# A violet mat + border (amber while reconnecting), always on, so it never
+	# passes for a local termling. Red stays reserved for read-only shadows.
+	_ensure_border_styles()
+	_ensure_backdrop()
+	var on := host != ""
+	if _border:
+		if on and _link_border_sb is StyleBoxFlat:
+			(_link_border_sb as StyleBoxFlat).border_color = LINK_COLOR if up else LINK_DOWN_COLOR
+			_border.add_theme_stylebox_override("panel", _link_border_sb)
+		elif _default_border_sb:
+			_border.add_theme_stylebox_override("panel", _default_border_sb)
+	if _backdrop:
+		_backdrop.visible = on
+		var c := LINK_COLOR if up else LINK_DOWN_COLOR
+		_backdrop.color = Color(c.r * 0.7, c.g * 0.7, c.b * 0.7, 0.92) if on else Color(0.72, 0.09, 0.09, 0.92)
+	_layout_decorations()
+	_update_nameplate()
+	set_focused(_focused)
 
 
 func set_custom_name(n: String) -> void:
@@ -331,6 +377,7 @@ func set_remote(on: bool, peer: String = "") -> void:
 			_border.add_theme_stylebox_override("panel", _default_border_sb)
 	if _backdrop:
 		_backdrop.visible = on
+		_backdrop.color = Color(0.72, 0.09, 0.09, 0.92)
 	_layout_decorations()  # size the backdrop mat
 	_update_nameplate()
 	set_focused(_focused)  # re-apply tint + border visibility for current focus
@@ -346,6 +393,9 @@ func _ensure_border_styles() -> void:
 		var red: StyleBoxFlat = (_default_border_sb as StyleBoxFlat).duplicate()
 		red.border_color = Color(0.95, 0.25, 0.25, 0.95)
 		_remote_border_sb = red
+		var violet: StyleBoxFlat = (_default_border_sb as StyleBoxFlat).duplicate()
+		violet.border_color = LINK_COLOR
+		_link_border_sb = violet
 
 
 # The red background mat, created lazily and placed BEHIND the terminal (child 0
@@ -400,7 +450,7 @@ func set_focused(focused: bool) -> void:
 	screen.modulate.a = a
 	if _border:
 		# A remote shadow keeps its red border on even when unfocused.
-		_border.visible = focused or remote
+		_border.visible = focused or remote or link_host != ""
 
 
 # Temporary transparency used while previewing a search hit: an occluding
