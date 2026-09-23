@@ -14,7 +14,11 @@ import threading
 import time
 
 SOCK = sys.argv[1] if len(sys.argv) > 1 else "/tmp/vibefox/control.sock"
-LOG = os.environ.get("COVE_VIBEFOX_LOG", "/tmp/cove-vibefox.log")
+# Named after whose socket this bridge serves (/tmp/vibefox/control.sock ->
+# /tmp/cove-vibefox.log), so a second bridge to another app doesn't interleave
+# its traffic into this one's log and make it useless for diagnosis.
+_who = os.path.basename(os.path.dirname(SOCK)) or "bridge"
+LOG = os.environ.get("COVE_VIBEFOX_LOG", "/tmp/cove-%s.log" % _who)
 LOG_MAX = 256 * 1024
 _lock = threading.Lock()
 _log_lock = threading.Lock()
