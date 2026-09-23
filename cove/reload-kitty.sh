@@ -40,7 +40,14 @@ done
 sleep 0.6
 # Drop the stale frame files + socket, but KEEP state.json so Godot can restore
 # positions/names by session.
-rm -f "$DIR"/term-*.rgba /tmp/cove-kitty 2>/dev/null || true
+# (kitty's only: panes below 1000000; Vibefox and Vibemacs critters
+# belong to their apps, which keep publishing.)
+for _f in "$DIR"/term-*.rgba; do
+    _n=${_f##*/term-}; _n=${_n%.rgba}
+    case "$_n" in *[!0-9]*|"") continue ;; esac
+    [ "$_n" -lt 1000000 ] && rm -f "$_f"
+done
+rm -f /tmp/cove-kitty 2>/dev/null || true
 
 export COVE=1 KITTY_COVE=1 KITTY_COVE_DIR="$DIR"
 [ "${COVE_IOSURFACE:-}" = "1" ] && export KITTY_COVE_IOSURFACE=1
