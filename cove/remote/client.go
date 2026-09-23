@@ -31,6 +31,11 @@ import (
 
 var capReply = regexp.MustCompile(`\x1b\[\?7766;(\d)\$y`)
 
+// termReports are what kitty sends on its own when a program has asked for
+// them: focus in/out and mouse reports (SGR and X10). They aren't the user
+// typing, so they don't wake a sleeping host.
+var termReports = regexp.MustCompile(`(?s)\x1b\[(?:[IO]|<[0-9;]*[Mm]|M...)`)
+
 type client struct {
 	host      string
 	remoteBin string
@@ -316,14 +321,15 @@ func (c *client) input(data []byte) {
 	// Typing into a termling whose host is asleep wakes it. The keystroke
 	// only asks for the wake: it isn't sent (an Enter shouldn't land in an
 	// agent's prompt a minute later), nor is anything typed while it wakes.
+	typed := len(termReports.ReplaceAll(data, nil)) > 0
 	c.connMu.Lock()
 	asleep, waking := c.asleep, c.waking
-	if asleep && !waking {
+	if asleep && !waking && typed {
 		c.wakeOK = true
 	}
 	c.connMu.Unlock()
 	if asleep || waking {
-		if asleep && !waking {
+		if asleep && !waking && typed {
 			c.logln("typed while %s is asleep: waking it", c.host)
 			c.dropLink() // skip the backoff and any connect attempt in flight
 		}
@@ -462,40 +468,52 @@ func routes(host string) []string {
 
 func (c *client) connectOnce() error {
 	c.connMu.Lock()
-	wakeFirst := c.asleep && c.wakeOK // no point retrying a host known to be asleep
+	woke := c.asleep && c.wakeOK // a keystroke asked: no point trying first
 	c.connMu.Unlock()
-	if wakeFirst {
-		if !c.wakeHost() {
-			return errors.New("wake failed")
-		}
+	if woke && !c.wakeHost() {
+		return errors.New("wake failed")
 	}
 	err := c.tryRoutes()
-	var ue unreachableError
-	if err == nil || c.wasUp || !errors.As(err, &ue) || wakeCommand(c.host) == "" {
-		return err
+	if !woke && c.unreachable(err) {
+		// The host is down and knows how to be woken. Only an explicit attach
+		// or a keystroke may wake it: an open termling reconnecting on its own
+		// must never keep a hibernating box awake.
+		c.connMu.Lock()
+		ok := c.wakeOK
+		c.connMu.Unlock()
+		if ok {
+			if !c.wakeHost() {
+				return err
+			}
+			err = c.tryRoutes()
+		}
 	}
-	// The host is down and knows how to be woken. Only an explicit attach or
-	// a keystroke may wake it: an open termling reconnecting on its own must
-	// never keep a hibernating box awake.
-	c.connMu.Lock()
-	ok := c.wakeOK && !wakeFirst
-	c.connMu.Unlock()
-	if ok && c.wakeHost() {
-		return c.tryRoutes()
-	}
+	sleeping := c.unreachable(err)
 	c.connMu.Lock()
 	was := c.asleep
-	c.asleep = true
-	c.connMu.Unlock()
-	if !was {
-		c.logln("%s is asleep; waiting for a keystroke to wake it", c.host)
-		c.writeMeta()
+	c.waking = false // connectVia cleared it if the woken host answered
+	if sleeping {
+		c.asleep = true
 	}
-	return err
+	c.connMu.Unlock()
+	if sleeping && !was {
+		c.logln("%s is asleep; waiting for a keystroke to wake it", c.host)
+	}
+	return err // connectLoop writes the meta
+}
+
+// unreachable says whether err is ssh never reaching a host that has a wake
+// command, rather than a link that was up and dropped.
+func (c *client) unreachable(err error) bool {
+	var ue unreachableError
+	return err != nil && !c.wasUp && errors.As(err, &ue) && wakeCommand(c.host) != ""
 }
 
 // wakeHost runs the host's wake command (from ~/.config/cove-remote/hosts)
 // once, spending the request for it, and says whether it's worth connecting.
+// On success the client stays "waking" until the connection after it is up
+// or has failed: a keystroke in between must neither be sent nor count as
+// another request to wake.
 func (c *client) wakeHost() bool {
 	c.connMu.Lock()
 	c.waking, c.wakeOK = true, false
@@ -512,9 +530,10 @@ func (c *client) wakeHost() bool {
 	err := runWake(c.host, c.logf)
 	c.logln("wake finished after %v: %v", time.Since(began).Round(time.Second), err)
 	c.connMu.Lock()
-	c.waking = false
 	if err != nil {
-		c.asleep = true
+		c.waking, c.asleep = false, true
+	} else {
+		c.asleep = false
 	}
 	c.connMu.Unlock()
 	c.writeMeta()
@@ -535,6 +554,12 @@ func (c *client) tryRoutes() error {
 			return err
 		}
 		c.logln("route %s failed: %v", dest, err)
+		c.connMu.Lock()
+		wakeNow := c.asleep && c.wakeOK
+		c.connMu.Unlock()
+		if wakeNow {
+			return err // typed while asleep: wake it rather than try the rest
+		}
 	}
 	return err
 }
@@ -665,7 +690,7 @@ func (c *client) connectVia(dest string, timeout int) error {
 	c.inMu.Unlock()
 	c.connMu.Lock()
 	c.fw, c.connected, c.everUp, c.proto, c.route = fw, true, true, w.Proto, dest
-	c.asleep, c.wakeOK = false, false
+	c.asleep, c.waking, c.wakeOK = false, false, false
 	c.connMu.Unlock()
 	c.wasUp = true
 	c.flushInput(fw)
