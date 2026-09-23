@@ -104,23 +104,38 @@ kirans-macbook-pro  Kirans-MacBook-Pro.local  kirans-macbook-pro
 ssh runs with `AddressFamily=inet` (a `.local` name's IPv6 link-local address
 can hang for 30 s). The meta file's `route` says which one is in use.
 
-## Waking a stopped host
+## Sleeping hosts (wake commands)
 
 `~/.config/cove-remote/hosts` holds per-host settings, one per line, re-read
-on every use. `wake` is a shell command that `attach`, `ls` and `kill` run
-when ssh can't reach the host at all (ssh's exit 255), then retry:
+on every use. `wake` is a shell command that starts a stopped or hibernated
+host and returns once `ssh HOST true` works (non-zero means it couldn't); it
+gets `COVE_REMOTE_HOST`, has 10 minutes, and its output goes to the client
+log (stderr for `ls`/`kill`):
 
 ```
 # host   setting  value
 aws-dev  wake     ~/Documents/code/aws-devbox/bin/aws-dev-wake
 ```
 
-It should start the machine and return once `ssh HOST true` works (non-zero
-means it couldn't); it gets `COVE_REMOTE_HOST`, has 10 minutes, and its
-output goes to the client log (stderr for `ls`/`kill`). `attach` runs it at
-most once a minute, shows `[cove-remote: waking HOST]` on first connect and
-`⟳ waking HOST` at the cursor, and puts `"waking": true` in the meta file.
-Routes stay in the `routes` file.
+It runs only when someone asks, never from the reconnect loop (or open
+termlings would keep a hibernating box awake forever):
+
+- `attach` (a fresh one, not a USR2 upgrade), `ls` and `kill` run it when
+  ssh can't reach the host at all (ssh's exit 255), then retry.
+- A live termling whose host goes unreachable turns **asleep**: the cursor
+  shows `⏾ HOST asleep, type to wake`, the meta file gets `"asleep": true`
+  and the nameplate reads `@ HOST, asleep, type to wake`. It keeps retrying
+  quietly, so it reconnects if something else wakes the host. The next
+  keystroke runs the wake command; that keystroke and anything typed while
+  waking (`⟳ waking HOST`, `"waking": true`) are dropped, not sent.
+
+Hosts without a `wake` line behave as before (`reconnecting`). Routes stay
+in the `routes` file.
+
+The daemon writes `~/.cache/cove-remote/<session>/last-activity` (unix
+seconds, and the same mtime) at most every 10s when a byte really crosses the
+pty: program output or typed input, not pings, acks or reconnects. A host's
+idle checker reads it to decide when to hibernate.
 
 ## Upgrading live clients
 

@@ -63,7 +63,8 @@ type client struct {
 	ssh       *exec.Cmd     // the current link, killed to force a reconnect
 	wake      chan struct{} // skip the reconnect backoff
 	waking    bool          // the host's wake command is running
-	wokeAt    time.Time     // when it last ran
+	asleep    bool          // unreachable, and it has a wake command: typing wakes it
+	wakeOK    bool          // an explicit attach or a keystroke asked for a wake
 
 	exitCode chan int
 }
@@ -141,9 +142,12 @@ func runAttach(args []string) error {
 	}
 	// A hot upgrade (SIGUSR2) re-execs us with the byte we'd reached, so the
 	// new binary resumes the stream instead of replaying history.
+	// An explicit attach may wake a sleeping host; a hot upgrade isn't one.
+	c.wakeOK = true
 	if v := os.Getenv("COVE_REMOTE_RESUME"); v != "" {
 		fmt.Sscan(v, &c.outOff)
 		os.Unsetenv("COVE_REMOTE_RESUME")
+		c.wakeOK = false
 	}
 	c.h = hello{Session: sess, Client: fmt.Sprintf("%s-%d-%d", shortHost(), os.Getpid(), time.Now().UnixNano()), Resume: -1, Cwd: dir, Cmd: cmd, Env: env, Replay: *replay}
 
@@ -309,6 +313,22 @@ func (c *client) readStdin() {
 }
 
 func (c *client) input(data []byte) {
+	// Typing into a termling whose host is asleep wakes it. The keystroke
+	// only asks for the wake: it isn't sent (an Enter shouldn't land in an
+	// agent's prompt a minute later), nor is anything typed while it wakes.
+	c.connMu.Lock()
+	asleep, waking := c.asleep, c.waking
+	if asleep && !waking {
+		c.wakeOK = true
+	}
+	c.connMu.Unlock()
+	if asleep || waking {
+		if asleep && !waking {
+			c.logln("typed while %s is asleep: waking it", c.host)
+			c.dropLink() // skip the backoff and any connect attempt in flight
+		}
+		return
+	}
 	c.outMu.Lock()
 	c.pred.onInput(data)
 	os.Stdout.Write(c.pred.refresh(false))
@@ -374,10 +394,12 @@ func (c *client) ticker() {
 		c.pred.expire()
 		c.connMu.Lock()
 		down := !c.connected && c.everUp && time.Since(c.downSince) > 1500*time.Millisecond
-		waking := c.waking
+		waking, asleep := c.waking, c.asleep
 		c.connMu.Unlock()
 		if waking {
 			c.pred.status = "⟳ waking " + c.host
+		} else if asleep {
+			c.pred.status = "⏾ " + c.host + " asleep, type to wake"
 		} else if down {
 			c.pred.status = "⟳ " + c.host
 		} else {
@@ -439,22 +461,44 @@ func routes(host string) []string {
 }
 
 func (c *client) connectOnce() error {
+	c.connMu.Lock()
+	wakeFirst := c.asleep && c.wakeOK // no point retrying a host known to be asleep
+	c.connMu.Unlock()
+	if wakeFirst {
+		if !c.wakeHost() {
+			return errors.New("wake failed")
+		}
+	}
 	err := c.tryRoutes()
 	var ue unreachableError
-	if err != nil && !c.wasUp && errors.As(err, &ue) && c.wakeHost() {
-		err = c.tryRoutes()
+	if err == nil || c.wasUp || !errors.As(err, &ue) || wakeCommand(c.host) == "" {
+		return err
+	}
+	// The host is down and knows how to be woken. Only an explicit attach or
+	// a keystroke may wake it: an open termling reconnecting on its own must
+	// never keep a hibernating box awake.
+	c.connMu.Lock()
+	ok := c.wakeOK && !wakeFirst
+	c.connMu.Unlock()
+	if ok && c.wakeHost() {
+		return c.tryRoutes()
+	}
+	c.connMu.Lock()
+	was := c.asleep
+	c.asleep = true
+	c.connMu.Unlock()
+	if !was {
+		c.logln("%s is asleep; waiting for a keystroke to wake it", c.host)
+		c.writeMeta()
 	}
 	return err
 }
 
-// wakeHost runs the host's wake command (from ~/.config/cove-remote/hosts),
-// at most once a minute, and says whether it's worth retrying now.
+// wakeHost runs the host's wake command (from ~/.config/cove-remote/hosts)
+// once, spending the request for it, and says whether it's worth connecting.
 func (c *client) wakeHost() bool {
-	if wakeCommand(c.host) == "" || time.Since(c.wokeAt) < time.Minute {
-		return false
-	}
 	c.connMu.Lock()
-	c.waking = true
+	c.waking, c.wakeOK = true, false
 	first := !c.everUp
 	c.connMu.Unlock()
 	c.writeMeta()
@@ -463,14 +507,16 @@ func (c *client) wakeHost() bool {
 		fmt.Fprintf(os.Stdout, "\x1b[2m[cove-remote: waking %s]\x1b[0m\r\n", c.host)
 		c.outMu.Unlock()
 	}
-	c.logln("%s unreachable, running its wake command", c.host)
+	c.logln("running %s's wake command", c.host)
 	began := time.Now()
 	err := runWake(c.host, c.logf)
 	c.logln("wake finished after %v: %v", time.Since(began).Round(time.Second), err)
 	c.connMu.Lock()
 	c.waking = false
+	if err != nil {
+		c.asleep = true
+	}
 	c.connMu.Unlock()
-	c.wokeAt = time.Now()
 	c.writeMeta()
 	return err == nil
 }
@@ -619,6 +665,7 @@ func (c *client) connectVia(dest string, timeout int) error {
 	c.inMu.Unlock()
 	c.connMu.Lock()
 	c.fw, c.connected, c.everUp, c.proto, c.route = fw, true, true, w.Proto, dest
+	c.asleep, c.wakeOK = false, false
 	c.connMu.Unlock()
 	c.wasUp = true
 	c.flushInput(fw)
@@ -752,6 +799,8 @@ func (c *client) writeMeta() {
 	}
 	if c.waking {
 		m["waking"] = true
+	} else if c.asleep {
+		m["asleep"] = true
 	}
 	c.connMu.Unlock()
 	c.outMu.Lock()

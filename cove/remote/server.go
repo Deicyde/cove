@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -143,6 +144,8 @@ type daemon struct {
 
 	dir, coveDir string
 	meta         []byte
+
+	activityAt atomic.Int64 // unix nanos of the last last-activity write
 }
 
 type dconn struct {
@@ -184,6 +187,7 @@ func runServe(arg string) error {
 	info, _ := json.Marshal(map[string]any{"session": h.Session, "cmd": h.Cmd, "cwd": h.Cwd,
 		"pid": d.cmd.Process.Pid, "daemon": os.Getpid(), "created": time.Now().Unix()})
 	os.WriteFile(filepath.Join(d.dir, "info.json"), info, 0o600)
+	d.touchActivity()
 	if os.Getenv("COVE_REMOTE_NO_CAFFEINATE") == "" {
 		keepAwake(os.Getpid())
 	}
@@ -332,6 +336,7 @@ func (d *daemon) readPty() {
 				}
 				d.cond.Broadcast()
 				d.mu.Unlock()
+				d.touchActivity()
 			}
 			if err != nil {
 				close(eof)
@@ -441,6 +446,7 @@ func (d *daemon) serveConn(c net.Conn) {
 			d.mu.Unlock()
 			if len(data) > 0 {
 				d.ptmx.Write(data)
+				d.touchActivity()
 			}
 			dc.fw.offset(fInputAck, ack, nil)
 		case fResize:
@@ -504,6 +510,29 @@ func (d *daemon) sendOutput(dc *dconn, pos int64) {
 			}
 			return
 		}
+	}
+}
+
+// --- activity, for the host's idle checker ------------------------------------
+
+// activityEvery bounds how often last-activity is rewritten; idle checkers
+// think in tens of minutes.
+const activityEvery = 10 * time.Second
+
+// touchActivity records real traffic in <session>/last-activity: a byte the
+// program wrote or the user typed. Pings, acks, resizes and attaching don't
+// count, so an open termling on an idle agent lets the host go to sleep
+// (though a resize that makes the program redraw does). The file holds unix
+// seconds, and its mtime says the same.
+func (d *daemon) touchActivity() {
+	now := time.Now().UnixNano()
+	last := d.activityAt.Load()
+	if now-last < int64(activityEvery) || !d.activityAt.CompareAndSwap(last, now) {
+		return
+	}
+	p := filepath.Join(d.dir, "last-activity")
+	if os.WriteFile(p+".tmp", []byte(fmt.Sprintf("%d\n", now/int64(time.Second))), 0o600) == nil {
+		os.Rename(p+".tmp", p)
 	}
 }
 
