@@ -1,0 +1,118 @@
+// cove-remote: live terminals on another Mac that feel local.
+//
+//	cove-remote attach HOST [-- command]   run in a termling (local)
+//	cove-remote ls HOST                    list the sessions on HOST
+//	cove-remote kill HOST SESSION          end a session on HOST
+//	cove-remote bridge | serve             the remote halves (ssh runs these)
+//
+// See cove/skills/cove-remote/SKILL.md.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+	}
+	var err error
+	switch os.Args[1] {
+	case "attach":
+		err = runAttach(os.Args[2:])
+	case "bridge":
+		err = runBridge()
+	case "serve":
+		if len(os.Args) < 3 {
+			usage()
+		}
+		err = runServe(os.Args[2])
+	case "ls", "kill":
+		if len(os.Args) < 3 {
+			usage()
+		}
+		self, _ := os.Executable()
+		self, _ = filepath.EvalSymlinks(self)
+		rest := ""
+		for _, a := range os.Args[3:] {
+			rest += " " + shellQuote(a)
+		}
+		cmd := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", os.Args[2],
+			shellQuote(self)+" local-"+os.Args[1]+rest)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		err = cmd.Run()
+	case "local-ls":
+		err = localLs()
+	case "local-kill":
+		if len(os.Args) < 3 {
+			usage()
+		}
+		err = localKill(os.Args[2])
+	default:
+		usage()
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cove-remote:", err)
+		os.Exit(1)
+	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, `usage:
+  cove-remote attach [flags] HOST [-- command...]
+  cove-remote ls HOST
+  cove-remote kill HOST SESSION`)
+	os.Exit(2)
+}
+
+func localLs() error {
+	dirs, _ := filepath.Glob(filepath.Join(baseDir(), "*", "info.json"))
+	for _, p := range dirs {
+		var info struct {
+			Session string `json:"session"`
+			Cmd     string `json:"cmd"`
+			Cwd     string `json:"cwd"`
+			Pid     int    `json:"pid"`
+			Daemon  int    `json:"daemon"`
+		}
+		b, err := os.ReadFile(p)
+		if err != nil || json.Unmarshal(b, &info) != nil {
+			continue
+		}
+		state := "running"
+		if c, err := net.Dial("unix", filepath.Join(filepath.Dir(p), "sock")); err != nil {
+			state = "dead"
+		} else {
+			c.Close()
+		}
+		m := scanTree(info.Pid)
+		cwd := cwdOf(m.Pid)
+		if cwd == "" {
+			cwd = info.Cwd
+		}
+		fmt.Printf("%-22s %-8s %-8s %s  %s\n", info.Session, state, m.Agent, cwd, info.Cmd)
+	}
+	return nil
+}
+
+func localKill(sess string) error {
+	if !sessionRe.MatchString(sess) {
+		return fmt.Errorf("bad session name %q", sess)
+	}
+	b, err := os.ReadFile(filepath.Join(sessionDir(sess), "info.json"))
+	if err != nil {
+		return fmt.Errorf("no session %s", sess)
+	}
+	var info struct{ Pid, Daemon int }
+	json.Unmarshal(b, &info)
+	syscall.Kill(-info.Pid, syscall.SIGHUP)
+	syscall.Kill(info.Daemon, syscall.SIGTERM)
+	os.RemoveAll(sessionDir(sess))
+	return nil
+}
