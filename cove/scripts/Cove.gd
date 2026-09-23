@@ -175,6 +175,16 @@ var _vm_pid := -1
 var _vm_retry := 0.0
 var _vm_seq := 0
 var _mod_right := {}              # KEY_META/ALT/CTRL/SHIFT -> held on the right side
+# Godot editor panels: the godot_cove plugin publishes panels as
+# term-<3000000+n>.rgba (flag 0x80000, with FLAG_PAGE). Page critters whose input
+# goes to the plugin's control socket through a third bridge; a drag on the
+# focused one is the editor's own drag (see _godot_drag).
+const GODOT_SOCK := "/tmp/godot-cove/control.sock"
+const GODOT_PANE_BASE := 3000000
+var _gd_pipe: FileAccess = null
+var _gd_pid := -1
+var _gd_retry := 0.0
+var _gd_seq := 0
 var _app_focused := true          # does the Cove's own window have the OS focus
 var _press_dbl := false           # the current press was a double-click (skip its click)
 var _search_sel := 0          # highlighted row index
@@ -254,6 +264,7 @@ func _ready() -> void:
 	_setup_handoff()
 	_start_vibefox_bridge()
 	_start_vibemacs_bridge()
+	_start_godot_bridge()
 	_load_layout()   # restore positions/names/camera from the previous run
 	_restore_window()  # put the os-window back where (and how big / maximized) it was
 	_build_world()
@@ -511,7 +522,7 @@ func _is_page_file(id: int) -> bool:
 	var head := f.get_buffer(TermCritter.HEADER)
 	if head.size() < TermCritter.HEADER or head.decode_u32(0) != TermCritter.MAGIC:
 		return false
-	return (int(head.decode_u32(20)) & TermCritter.FLAG_PAGE) != 0
+	return (int(head.decode_u32(20)) & (TermCritter.FLAG_PAGE | TermCritter.FLAG_GODOT)) != 0
 
 
 func _remove_group(id: int) -> void:
@@ -1036,6 +1047,9 @@ func _poll_hold() -> void:
 # 1 drag-update, 2 end (kitty copies the selection to the clipboard on end).
 # Only the fast socket carries this; there's no kitten fallback for selection.
 func _send_select(g: Node2D, world: Vector2, phase: int) -> void:
+	if g != null and g.terminal.godot:
+		_godot_drag(g, world, phase)   # a Godot panel: the editor's own drag, not a text selection
+		return
 	if g == null or g.terminal.page or _sock == null or not _sock.call("is_connected"):
 		return
 	var t = g.terminal
@@ -1084,7 +1098,9 @@ func _unhandled_input(event: InputEvent) -> void:
 		# board's context menu.
 		if event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
 			var g := _group_at(wpos)
-			if g != null:
+			if g != null and g.terminal.godot and g.term_id == _focused_id:
+				_page_click(g, wpos, 2)   # the focused Godot panel: the editor's context menu
+			elif g != null:
 				_open_rename(g)
 			else:
 				_bd_context_menu(wpos, event.position)
@@ -1122,7 +1138,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				# away, and Alt-drag always moves.
 				_selecting = _press_group != null and not event.alt_pressed and not event.double_click \
 					and (_press_group.term_id == _focused_id or _press_group.term_id == _tracking_id)
-				if _press_group != null and _press_group.terminal.page:
+				if _press_group != null and _press_group.terminal.page and not _press_group.terminal.godot:
 					_selecting = false   # a page has no text selection: a drag moves it, a click clicks the page
 				_hold_armed = _selecting and _press_group.term_id != _present_id  # a presented one stays put
 				_press_dbl = event.double_click
@@ -1133,7 +1149,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				if event.double_click and _press_group != null:
 					_set_focus(_press_group.term_id)
 					_tracking_id = _press_group.term_id  # double-click: focus + follow
-					if _press_group.terminal.emacs:
+					if _press_group.terminal.emacs or _press_group.terminal.godot:
 						var dp: Vector2 = _press_group.terminal.pixel_at(wpos)
 						_page_input(_press_group.terminal.pane_id, "mouse",
 							{"x": roundi(dp.x), "y": roundi(dp.y), "button": 0, "clicks": 2})
@@ -1653,6 +1669,10 @@ func _scroll_terminal(g: Node2D, up: bool, lines: int) -> void:
 	var pane: int = t.pane_id
 	if pane == 0 or lines <= 0:
 		return
+	if t.godot:
+		# Point the editor at the cursor first, so the viewport zooms where you point.
+		var mp: Vector2 = t.pixel_at(_world_mouse())
+		_page_input(pane, "mouse_move", {"x": roundi(mp.x), "y": roundi(mp.y)})
 	if t.page:
 		# Browser pixels (critter scale): about three lines of a page per notch.
 		_page_input(pane, "wheel", {"dx": 0, "dy": (-1 if up else 1) * mini(lines, 10) * PAGE_WHEEL_PX})
@@ -2065,6 +2085,14 @@ func _apply_agent_state() -> void:
 		var meta: Dictionary = _page_meta.get(id, {})
 		var title := str(meta.get("title", ""))
 		pt.set_page_title(title)
+		if pt.godot:
+			_agents[pt.pane_id] = {
+				"session": "", "agent": "godot", "busy": false, "attention": false,
+				"cwd": str(meta.get("cwd", "")), "title": title if title != "" else "godot",
+				"panel": str(meta.get("panel", "")), "scene": str(meta.get("scene", "")),
+				"godot_project": str(meta.get("project", "")),
+			}
+			continue
 		if pt.emacs:
 			_agents[pt.pane_id] = {
 				"session": "", "agent": "emacs", "busy": false, "attention": false,
@@ -2405,7 +2433,7 @@ func _exec_command(c: Dictionary) -> String:
 	var cmd := str(c.get("cmd", ""))
 	# "Send to Cove" in Vibefox is the user's own right-click, so its focus is
 	# theirs: camera to that termling and follow it (what cove-focus.sh does).
-	if cmd == "focus" and str(c.get("source", "")) in ["vibefox", "vibemacs"]:
+	if cmd == "focus" and str(c.get("source", "")) in ["vibefox", "vibemacs", "godot"]:
 		var g := _find(int(c.get("id", -1)))
 		if g == null:
 			return "no such terminal"
@@ -2535,7 +2563,63 @@ func _vm_send(cmd: String, args: Dictionary) -> void:
 	_vm_pipe.flush()
 
 
+func _start_godot_bridge() -> void:
+	var script := ProjectSettings.globalize_path("res://cove-vibefox-bridge.py")
+	var r: Dictionary = OS.execute_with_pipe("/usr/bin/python3", [script, GODOT_SOCK], false)
+	if r.is_empty() or not r.has("stdio") or int(r.get("pid", -1)) <= 0:
+		push_warning("cove: couldn't start the Godot bridge — godot panels won't take input.")
+		_gd_pipe = null
+		_gd_pid = -1
+		return
+	_gd_pipe = r["stdio"]
+	_gd_pid = int(r["pid"])
+	_child_mutex.lock()
+	_child_pids.append(_gd_pid)
+	_child_mutex.unlock()
+
+
+func _gd_send(cmd: String, args: Dictionary) -> void:
+	if _gd_pipe == null or _gd_pid == -1:
+		return
+	_gd_seq += 1
+	_gd_pipe.store_line(JSON.stringify({"id": _gd_seq, "cmd": cmd, "args": args}))
+	_gd_pipe.flush()
+
+
+# Respawn the Godot bridge if it died, at most every 5s.
+func _tick_godot_bridge(delta: float) -> void:
+	if _gd_pid != -1 and not OS.is_process_running(_gd_pid):
+		_gd_pid = -1
+		_gd_pipe = null
+		_gd_retry = 5.0
+	if _gd_pid == -1:
+		_gd_retry -= delta
+		if _gd_retry <= 0.0:
+			_gd_retry = 5.0
+			_start_godot_bridge()
+
+
+# Page input for a Godot panel: the plugin takes Godot MouseButton indices
+# (1 left, 2 right, 3 middle); the Cove's page convention is 0/1/2 = L/M/R.
+func _godot_data(data: Dictionary) -> Dictionary:
+	if not data.has("button"):
+		return data
+	var d := data.duplicate()
+	d["button"] = {0: MOUSE_BUTTON_LEFT, 1: MOUSE_BUTTON_MIDDLE, 2: MOUSE_BUTTON_RIGHT}.get(int(data["button"]), MOUSE_BUTTON_LEFT)
+	return d
+
+
+# A drag on the focused Godot panel is the editor's own drag (move a node in the
+# 2D viewport, reorder the scene tree), fed from the text-selection path:
+# phase 0 press at the anchor, 1 move, 2 release.
+func _godot_drag(g: Node2D, world: Vector2, phase: int) -> void:
+	var px: Vector2 = g.terminal.pixel_at(world)
+	var kind: String = ["mouse_down", "mouse_move", "mouse_up"][clampi(phase, 0, 2)]
+	_page_input(g.terminal.pane_id, kind, {"x": roundi(px.x), "y": roundi(px.y), "button": 0})
+
+
 func _tick_vibefox(delta: float) -> void:
+	_tick_godot_bridge(delta)
 	if _vm_pid != -1 and not OS.is_process_running(_vm_pid):
 		_vm_pid = -1
 		_vm_pipe = null
@@ -2583,6 +2667,9 @@ func _vf_send(cmd: String, args: Dictionary) -> void:
 
 
 func _page_input(pane: int, kind: String, data: Dictionary) -> void:
+	if pane >= GODOT_PANE_BASE:
+		_gd_send("critter.input", {"id": pane, "kind": kind, "data": _godot_data(data)})
+		return
 	if pane >= EMACS_PANE_BASE:
 		_vm_send("critter.input", {"id": pane, "kind": kind, "data": data})
 		return
@@ -2617,6 +2704,9 @@ func _page_click(g: Node2D, world: Vector2, button: int) -> void:
 
 # Double-click: raise the mirrored tab in the browser.
 func _page_activate(g: Node2D) -> void:
+	if g.terminal.godot:
+		_gd_send("critter.activate", {"id": g.terminal.pane_id})
+		return
 	if g.terminal.emacs:
 		_vm_send("critter.activate", {"id": g.terminal.pane_id})
 		return
@@ -2762,6 +2852,11 @@ func _write_state() -> void:
 		if info.has("url"):   # a page critter: which tab it mirrors
 			terms[-1]["url"] = str(info["url"])
 			terms[-1]["tab"] = int(info["tab"])
+		if info.has("panel"):   # a Godot editor panel: which panel of which scene
+			terms[-1]["panel"] = str(info["panel"])
+			terms[-1]["scene"] = str(info["scene"])
+			if str(terms[-1]["project"]) == "":
+				terms[-1]["project"] = str(info["godot_project"])
 	# Remember the os-window geometry. Only refresh the windowed rect while actually
 	# windowed, so a maximized/fullscreen session still records the rect to fall back
 	# to when un-maximized (and across restarts).
@@ -2787,6 +2882,8 @@ func _write_state() -> void:
 		"window": window,
 		"zones": _bd_containers(),   # the board's frames/boxes: [{id, name, type, rect}]
 		"view": _view_rect_arr(),    # the world rect the user's window shows
+		# The Cove's OS pid: raise *this* window (the Godot editor is a "Godot" process too).
+		"pid": OS.get_process_id(),
 	}
 	_write_atomic(DIR + "/state.json", JSON.stringify(st))
 	_bd_heading_memo = null

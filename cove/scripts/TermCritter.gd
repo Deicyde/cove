@@ -11,6 +11,9 @@ const HEADER := 64
 const FLAG_BOTTOM_UP := 0x1
 const FLAG_PAGE := 0x10000  # a Vibefox page critter (a browser tab), not a kitty pane
 const FLAG_EMACS := 0x20000  # a Vibemacs frame; header [60] = backing scale * 100
+const FLAG_GODOT := 0x80000  # a Godot editor panel (godot-cove, with FLAG_PAGE); header [60] = editor scale * 100
+# World units per editor pixel at editor scale 1: editor text reads about as big as a termling's.
+const GODOT_ZOOM := 0.32
 
 # On-screen pixels per native terminal pixel. Resizing (changing cols/rows)
 # grows/shrinks the whole window rather than rescaling the text. kitty renders at
@@ -38,6 +41,8 @@ var remote_peer := ""    # which device it lives on (shown on the nameplate)
 var page := false        # a Vibefox page critter: input goes to the browser, not kitty
 var emacs := false       # a Vibemacs frame (also page: input goes to Vibemacs, not kitty)
 var emacs_scale := 1.0   # its backing scale (2.0 on Retina)
+var godot := false       # a Godot editor panel (also page: input goes to the godot_cove plugin)
+var godot_scale := 1.0   # the editor's display scale (pixels per editor unit)
 var page_title := ""     # the tab's title (from the term-<N>.json sidecar), nameplate fallback
 var _srgb_mat: ShaderMaterial = null  # linear->sRGB encode for kitty frames (not pages)
 var _emacs_mat: ShaderMaterial = null  # opaque, for Vibemacs frames
@@ -100,6 +105,11 @@ func poll() -> void:
 	emacs = (flags & FLAG_EMACS) != 0
 	if emacs:
 		emacs_scale = maxf(1.0, float(head.decode_u32(60)) / 100.0)
+	godot = (flags & FLAG_GODOT) != 0 and not emacs
+	if godot:
+		page = true   # a page in every way but where its input goes
+		var gs := float(head.decode_u32(60)) / 100.0
+		godot_scale = clampf(gs, 0.5, 4.0) if gs > 0.0 else 1.0
 	if page != was_page:
 		# Vibefox snapshots are already sRGB; kitty's frames are linear light. Only
 		# the latter want the encode shader, or a page comes out washed-out white.
@@ -125,6 +135,8 @@ func poll() -> void:
 	# stable and a 2x render shows as sharper glyphs, not a bigger window.
 	var render_scale := maxf(1.0, roundf(float(h) / float(maxi(rows, 1)) / BASE_CELL_H))
 	var z := BASE_ZOOM / emacs_scale if emacs else (PAGE_ZOOM if page else BASE_ZOOM / render_scale)
+	if godot:
+		z = GODOT_ZOOM / godot_scale
 	if not is_equal_approx(z, zoom):
 		zoom = z
 		screen.scale = Vector2.ONE * zoom
@@ -218,6 +230,13 @@ func _update_nameplate() -> void:
 	if _nameplate == null:
 		return
 	var base := custom_name if custom_name != "" else "termling %d" % term_id
+	if godot:
+		# A Godot editor panel: "◆", named after its scene/panel unless renamed.
+		if custom_name == "":
+			base = page_title if page_title != "" else "godot"
+		_nameplate.text = "◆ %s  (godot)" % base
+		_nameplate.add_theme_color_override("font_color", Color(0.55, 0.75, 0.95))
+		return
 	if emacs:
 		# A Vibemacs frame: "✎", named after its buffer unless renamed.
 		if custom_name == "":
