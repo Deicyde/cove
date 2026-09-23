@@ -23,7 +23,7 @@ Register in ~/.claude.json under mcpServers, e.g.:
   "cove": {"command": "python3",
            "args": ["/Users/.../kitty/cove/mcp/cove_mcp.py"]}
 """
-import sys, json, os, re, time, uuid, random, signal, base64, subprocess
+import sys, json, os, re, time, uuid, random, signal, base64, subprocess, shlex
 import cove_find  # sibling module: semantic terminal resolver
 
 DIR = os.environ.get("KITTY_COVE_DIR", "/tmp/cove")
@@ -219,9 +219,24 @@ def _is_descendant(sess, ancestor, lin=None):
     return False
 
 
+def _terms(lin=None):
+    """state.json's terminals, with spawned children's sessions filled in from
+    lineage. Godot learns a pane's session from a background poll, which can
+    lag (a minute, when the Cove is busy); spawn already knows the pane, so a
+    child never goes blank and orphaned in the meantime."""
+    terms = read_state().get("terminals", [])
+    if any(not t.get("session") for t in terms):
+        lin = lin if lin is not None else read_lineage()
+        by_pane = {r.get("pane"): s for s, r in lin.items() if r.get("pane") and not r.get("dead")}
+        for t in terms:
+            if not t.get("session") and t.get("pane_id") in by_pane:
+                t["session"] = by_pane[t["pane_id"]]
+    return terms
+
+
 def _term(ref):
     """A termling by id, kitty pane id, session or name."""
-    terms = read_state().get("terminals", [])
+    terms = _terms()
     r = str(ref)
     for key in ("id", "session", "name", "pane_id"):
         for t in terms:
@@ -633,10 +648,11 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "target": {}, "pad": {"type": "number"}, "max_px": {"type": "number"}}}},
     {"name": "spawn",
-     "description": "Spawn a CHILD termling (a new terminal) that you own, placed in a frame (`frame`, id or name) or, without one, in a small frame of its own in free space next to you, with a dashed arrow from your termling to it (link=false to skip). A claude child's folder-trust dialog is accepted when cwd is in your own repo (or a worktree of it); otherwise the result has trust_prompt=true for the user to answer. command runs in its shell (e.g. 'claude'; a claude child is shift+tabbed into auto mode unless auto_mode=false); prompt (with a claude/codex command) becomes the agent's first message. Returns {id, session, pane_id, rect, zone}. Then use send / read / wait / place / kill on it. Children can spawn their own children.",
+     "description": "Spawn a CHILD termling (a new terminal) that you own, placed in a frame (`frame`, id or name) or, without one, in a small frame of its own in free space next to you, with a dashed arrow from your termling to it (link=false to skip). A claude child's folder-trust dialog is accepted when cwd is in your own repo (or a worktree of it); otherwise the result has trust_prompt=true for the user to answer. command runs in its shell (e.g. 'claude'; a claude child is shift+tabbed into auto mode unless auto_mode=false); prompt (with a claude/codex command) becomes the agent's first message. host (e.g. 'kirans-macbook-pro') runs the child's shell/command on that Mac through cove-remote instead: same path as cwd there, native scrollback, survives dropped links and this Mac sleeping, and the remote session keeps running if the termling closes (see the cove-remote skill). Returns {id, session, pane_id, rect, zone}. Then use send / read / wait / place / kill on it. Children can spawn their own children.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"}, "frame": {"type": "string"}, "cwd": {"type": "string"},
          "command": {"type": "string"}, "prompt": {"type": "string"},
+         "host": {"type": "string", "description": "run it on this ssh host via cove-remote (e.g. kirans-macbook-pro)"},
          "auto_mode": {"type": "boolean", "description": "claude children: shift+tab into auto mode (default true)"},
          "link": {"type": "boolean"},
          "link_text": {"type": "string"}},
@@ -849,7 +865,8 @@ def call_tool(name, args):
         send(CMDS, {"cmd": "spawn_place", "pane": pane, "zone": zone, "pos": pos,
                     "name": str(args["name"])})
         lin = read_lineage()
-        lin[child] = {"parent": sess, "name": str(args["name"]), "created": int(time.time()), "seen": 0}
+        lin[child] = {"parent": sess, "name": str(args["name"]), "created": int(time.time()), "seen": 0,
+                      "pane": pane}
         if own_frame:
             lin[child]["frame"] = own_frame   # made for it: kill removes it too
         write_lineage(lin)
@@ -872,12 +889,25 @@ def call_tool(name, args):
             with open(pf, "w") as f:
                 f.write(str(args["prompt"]))
             command += ' "$(cat %s)"' % pf
+        host = str(args.get("host") or "").strip()
+        inner = command
+        if host:
+            # The local shell expands $(cat prompt) before cove-remote quotes it
+            # into the remote command line, so the prompt file needn't exist there.
+            remote = os.path.abspath(os.path.join(HERE, "..", "bin", "cove-remote"))
+            command = "%s attach --cwd %s %s" % (shlex.quote(remote), shlex.quote(cwd), shlex.quote(host))
+            if inner:
+                command += " -- " + inner
+            res["host"] = host
+            lin = read_lineage()
+            lin[child]["host"] = host   # kill ends the remote session too
+            write_lineage(lin)
         if command:
             time.sleep(0.8)   # let the shell draw its prompt
             _type(ct, command, True)
             _mark_sent(child)
             res["typed"] = command
-            if re.match(r"^\s*claude\b", command):
+            if re.match(r"^\s*claude\b", inner):
                 res.update(_settle_claude(ct, _same_project(cwd, t.get("cwd", "")),
                                           bool(args.get("auto_mode", True))))
                 if res["trust_prompt"]:
@@ -887,7 +917,7 @@ def call_tool(name, args):
     if name == "children":
         sess = my_session()
         lin = read_lineage()
-        by = {t.get("session"): t for t in read_state().get("terminals", []) if t.get("session")}
+        by = {t.get("session"): t for t in _terms(lin) if t.get("session")}
         kids = [_child_view(s, r, by) for s, r in lin.items()
                 if not r.get("dead") and _is_descendant(s, sess, lin)]
         return {"children": kids, "reports": _mail(sess)}
@@ -923,7 +953,7 @@ def call_tool(name, args):
         if args.get("ids"):
             targets = [require_child(i)["session"] for i in args["ids"]]
         else:
-            live = {t.get("session") for t in read_state().get("terminals", [])}
+            live = {t.get("session") for t in _terms(lin)}
             targets = [s for s, r in lin.items() if r.get("parent") == sess and not r.get("dead") and s in live]
         if not targets:
             return {"error": "no live children to wait for"}
@@ -934,7 +964,7 @@ def call_tool(name, args):
         deadline = time.time() + timeout
         while True:
             lin = read_lineage()
-            live = {t.get("session"): t for t in read_state().get("terminals", [])}
+            live = {t.get("session"): t for t in _terms(lin)}
             mail = _mail(sess)[mail0:]
             done = {}
             for s in targets:
@@ -976,6 +1006,13 @@ def call_tool(name, args):
         victims = [c["session"]] + [s for s in lin if _is_descendant(s, c["session"], lin)]
         arrows = []
         for s in victims:
+            if (lin.get(s) or {}).get("host"):
+                # Closing the termling only detaches cove-remote; end the session.
+                try:
+                    subprocess.run([os.path.join(HERE, "..", "bin", "cove-remote"), "kill",
+                                    lin[s]["host"], s], capture_output=True, timeout=15)
+                except (OSError, subprocess.SubprocessError):
+                    pass
             _kill_session(s)
             if s in lin:
                 lin[s]["dead"] = int(time.time())
