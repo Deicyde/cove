@@ -1769,7 +1769,13 @@ func _scroll_terminal(g: Node2D, up: bool, lines: int) -> void:
 		_page_input(pane, "mouse_move", {"x": roundi(mp.x), "y": roundi(mp.y)})
 	if t.page:
 		# Browser pixels (critter scale): about three lines of a page per notch.
-		_page_input(pane, "wheel", {"dx": 0, "dy": (-1 if up else 1) * mini(lines, 10) * PAGE_WHEEL_PX})
+		# The pointer rides along so the far side can scroll whatever is under it:
+		# a PDF viewer and an app's column scroll an inner element, not the window.
+		var wp: Vector2 = t.pixel_at(_world_mouse())
+		_page_input(pane, "wheel", {
+			"dx": 0, "dy": (-1 if up else 1) * mini(lines, 10) * PAGE_WHEEL_PX,
+			"x": roundi(wp.x), "y": roundi(wp.y),
+		})
 		return
 	if t.mouse_mode != 0:
 		var wheel := _wheel_bytes(t, up)
