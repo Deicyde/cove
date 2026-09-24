@@ -120,6 +120,7 @@ var _follows := {}           # follower term_id -> target term_id
 # (the assign command).
 var _zone_of := {}           # term_id -> board shape id it lives in ("" = loose; absent = not restored yet)
 var _zone_saved := {}        # term_id -> container ref from the last run (sessionless termlings only)
+var _zone_by_critter := {}   # page/Emacs/Godot critter key (_critter_key) -> container ref ("" = loose)
 var _zone_by_session := {}   # abduco session -> container ref (shape id, or a legacy zone name)
 var _legacy_zones := []      # pinned regions from an older state.json, turned into frames once
 var _notes := []             # [{project, event, term_id, ts}]
@@ -517,6 +518,14 @@ func _add_group(id: int) -> void:
 		g.position = _pending_place[id]
 		_pending_place.erase(id)
 		_pos_restored[id] = true
+	elif id >= EMACS_PANE_BASE and not _fs_emacs_land.is_empty() \
+			and Time.get_ticks_msec() < int(_fs_emacs_land["until"]):
+		# A file double-clicked in a folder view: its Emacs critter walks on
+		# beside the view, and takes focus.
+		g.position = _fs_emacs_land["at"]
+		_fs_emacs_land = {}
+		_pos_restored[id] = true
+		_jump_focus.call_deferred(id)
 	elif not _land_queue.is_empty():
 		# A handed-off termling landed here: appear under the drop point.
 		g.position = _land_queue.pop_front()
@@ -1903,6 +1912,10 @@ func _load_durable() -> void:
 			_pos_by_session[sess] = rec["pos"]
 		if rec.get("zone", null) != null:
 			_zone_by_session[sess] = str(rec["zone"])
+	var bc = d.get("by_critter", {})
+	if typeof(bc) == TYPE_DICTIONARY:
+		for k in bc:
+			_zone_by_critter[str(k)] = str(bc[k])
 
 
 func _write_durable() -> void:
@@ -1934,7 +1947,7 @@ func _write_durable() -> void:
 		by[sess] = r
 	var f := FileAccess.open(USER_LAYOUT, FileAccess.WRITE)
 	if f:
-		f.store_string(JSON.stringify({"by_session": by}))
+		f.store_string(JSON.stringify({"by_session": by, "by_critter": _zone_by_critter}))
 		f.close()
 
 
@@ -2365,12 +2378,20 @@ func _apply_zones() -> void:
 				ref = str(_zone_saved[id])
 			elif sess != "":
 				ref = str(_zone_by_session.get(sess, ""))
+			elif g.terminal.page and _critter_key(id) != "":
+				# A page/Emacs/Godot critter has no session and its pane id doesn't
+				# survive its app restarting: its frame is remembered by what it shows.
+				ref = str(_zone_by_critter.get(_critter_key(id), ""))
 			else:
-				continue   # wait for the ls poll to learn its session
+				continue   # wait for the ls poll to learn its session (or a critter's sidecar)
 			var sid := _bd_resolve_container(ref)
 			_zone_of[id] = sid
 			_zone_saved.erase(id)
 		var cur := str(_zone_of[id])
+		if g.terminal.page:
+			var ck := _critter_key(id)
+			if ck != "":
+				_zone_by_critter[ck] = cur
 		if cur == "":
 			if g.zone_rect() != null:
 				g.clear_zone()
@@ -2383,6 +2404,25 @@ func _apply_zones() -> void:
 			g.clear_zone()
 		elif not _follows.has(id) and not _rect_near(g.zone_rect(), r):
 			g.assign_zone(r)
+
+
+# What a page critter shows, stable across its app restarting (pane ids aren't):
+# the tab's url, the Emacs file (or buffer), the Godot project/scene/panel.
+# "" until its sidecar has been read.
+func _critter_key(id: int) -> String:
+	var meta: Dictionary = _page_meta.get(id, {})
+	var t = _groups[id].terminal if _groups.has(id) else null
+	if t == null or meta.is_empty():
+		return ""
+	if t.godot:
+		return "godot:%s|%s|%s" % [meta.get("project", ""), meta.get("scene", ""), meta.get("panel", "")]
+	if t.emacs:
+		var f := str(meta.get("file", ""))
+		if f == "":
+			f = str(meta.get("buffer", ""))
+		return "emacs:" + f if f != "" else ""
+	var u := str(meta.get("url", ""))
+	return "page:" + u if u != "" else ""
 
 
 func _rect_near(a, b: Rect2) -> bool:
@@ -5574,7 +5614,8 @@ func _bd_select_down(p: Vector2, ev: InputEventMouseButton) -> void:
 				_bd_g = "none"
 			return
 	if id != "" and str(_bd_by_id[id]["type"]) == "file" and ev.double_click:
-		OS.shell_open(str(_bd_by_id[id].get("path", "")))
+		var fr := _bd_rect(_bd_by_id[id])
+		_fs_open_file(str(_bd_by_id[id].get("path", "")), Vector2(fr.end.x + 380.0, fr.get_center().y))
 		_bd_g = "none"
 		return
 	# A todo list's checkboxes and "+ add item" row work on a single click.
@@ -9897,6 +9938,7 @@ var _fs_touched := {}    # term id -> {files: {path: {op, t, n}}, at, agent}: wh
 var _fs_tfetch := {}     # out path -> {term, t}
 var _fs_tmap := {}       # view id -> {at, files, dirs}: the merged touched map a view shows
 var _fs_quick_cam := {}  # camera state before the Cmd+O picker: {present, tracking, zoom, pos}
+var _fs_emacs_land := {} # {at, until}: where the next Emacs critter (a file we asked Vibemacs for) appears
 
 
 func _fs_is_view(s: Dictionary) -> bool:
@@ -10602,7 +10644,25 @@ func _fs_activate(s: Dictionary, it: Dictionary, mods := {}) -> void:
 		_fs_close_quick()
 		_fs_paste(id, path)
 		return
-	OS.shell_open(path)
+	var r := _bd_rect(s)
+	_fs_open_file(path, Vector2(r.end.x + 380.0, r.get_center().y))
+
+
+# Open a file in Vibemacs as an Emacs critter on the board, next to `near`. If a
+# critter already shows it, jump there instead. Without Vibemacs running, the
+# file opens in its default app.
+func _fs_open_file(path: String, near: Vector2) -> void:
+	for id in _groups:
+		var t = _groups[id].terminal
+		var meta: Dictionary = _page_meta.get(id, _page_meta.get(t.pane_id, {}))
+		if t.emacs and str(meta.get("file", "")) == path:
+			_jump_focus(id)
+			return
+	if _vm_pid == -1 or OS.execute("/bin/test", ["-S", VIBEMACS_SOCK]) != 0:
+		OS.shell_open(path)
+		return
+	_fs_emacs_land = {"at": near, "until": Time.get_ticks_msec() + 8000}
+	_vm_send("eval", {"code": "(vibemacs-cove-new-critter (find-file-noselect %s))" % JSON.stringify(path)})
 
 
 func _fs_button(s: Dictionary, b: String) -> void:
@@ -10950,7 +11010,8 @@ func _fs_menu_pick(id: int) -> void:
 				_bd_commit()
 		60:
 			if s != null:
-				OS.shell_open(str(s.get("path", "")))
+				var fr := _bd_rect(s)
+				_fs_open_file(str(s.get("path", "")), Vector2(fr.end.x + 380.0, fr.get_center().y))
 		61:
 			if s != null:
 				_create_process("/usr/bin/open", ["-R", str(s.get("path", ""))], false)
