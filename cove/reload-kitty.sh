@@ -19,17 +19,50 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KITTY="$REPO/kitty/launcher/kitty"
 KITTEN="${COVE_KITTEN:-$REPO/kitty/launcher/kitty.app/Contents/MacOS/kitten}"
 WRAPPER="$REPO/cove/cove-shell.sh"
-REATTACH="$REPO/cove/cove-reattach.sh"   # prints the saved screen, then abduco -A
+REATTACH="$REPO/cove/cove-reattach.sh"   # prints the saved screen, then abduco -a
 SOCK="${COVE_KITTY_SOCKET:-unix:/tmp/cove-kitty}"
 ABDUCO="$REPO/cove/bin/abduco"   # patched: no alt screen (build-abduco.sh)
 [ -x "$ABDUCO" ] || ABDUCO="$(command -v abduco 2>/dev/null || echo /opt/homebrew/bin/abduco)"
 
-[ -e "$KITTY" ] || { echo "kitty not built ($KITTY). Run cove/dev.sh first." >&2; exit 1; }
+LOCK_FILE="/tmp/cove-launch.lock"
+COVE_KITTY_PID=""
+STARTUP_COMPLETE=false
 
-# The termling sessions that will survive the kitty kill (abduco holds them).
-# (A leading "+" marks a session whose shell already exited: nothing to reattach.)
-SESSIONS=($("$ABDUCO" 2>/dev/null | awk 'NR>1 && $1!="+"{print $NF}' | grep '^cove-' || true))
-echo "reattaching ${#SESSIONS[@]} termling session(s): ${SESSIONS[*]:-<none>}"
+# If the new kitty never comes up, don't leave it half-started holding the
+# socket; the sessions stay in abduco for the next attempt.
+cleanup_startup() {
+    if [ "$STARTUP_COMPLETE" != true ] && [ -n "$COVE_KITTY_PID" ]; then
+        kill "$COVE_KITTY_PID" 2>/dev/null || true
+        for _ in $(seq 1 30); do
+            kill -0 "$COVE_KITTY_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -9 "$COVE_KITTY_PID" 2>/dev/null || true
+        wait "$COVE_KITTY_PID" 2>/dev/null || true
+        rm -f /tmp/cove-kitty "$DIR/kitty.pid" "$DIR/dev-env"
+    fi
+}
+
+[ -e "$KITTY" ] || { echo "kitty not built ($KITTY). Run cove/dev.sh first." >&2; exit 1; }
+[ -x "$KITTEN" ] || { echo "kitten not built ($KITTEN)" >&2; exit 1; }
+[ -x "$ABDUCO" ] || { echo "abduco not found at $ABDUCO" >&2; exit 1; }
+# One launch at a time (run.sh and dev.sh take the same lock; dev.sh passes it
+# down when it hands off to us).
+if [ "${COVE_LAUNCH_LOCK_HELD:-}" != 1 ]; then
+    exec 9>"$LOCK_FILE"
+    if ! /usr/bin/lockf -s -t 0 9; then
+        echo "another Cove launch is already in progress" >&2
+        exit 1
+    fi
+fi
+unset COVE_LAUNCH_LOCK_HELD
+trap cleanup_startup EXIT
+
+# Don't stop anything we can't reattach afterwards.
+if ! "$ABDUCO" >/dev/null 2>&1; then
+    echo "failed to list abduco sessions" >&2
+    exit 1
+fi
 
 # Save each termling's screen + scrollback (with colours) while this kitty still
 # has it: abduco keeps the processes, not the screen, so without this every
@@ -45,7 +78,7 @@ except Exception:
     sys.exit(0)
 def save(w):
     for p in w.get("foreground_processes", []):
-        m = re.search(r"abduco\S*\s+-A\s+(cove-\d+)", " ".join(p.get("cmdline", [])))
+        m = re.search(r"abduco\S*\s+-[aA]\s+(cove-\d+)", " ".join(p.get("cmdline", [])))
         if m:
             try:
                 txt = subprocess.run([kitten, "@", "--to", sock, "get-text", "--match", "id:%d" % w["id"],
@@ -78,7 +111,26 @@ for _ in $(seq 1 30); do
     [ "$_alive" = 0 ] && break; sleep 0.1
 done
 for _p in $KPIDS; do kill -9 "$_p" 2>/dev/null || true; done
-sleep 0.3
+
+# List the sessions only now, so one created while kitty was stopping isn't
+# lost, and once the old kitty's clients have let go of theirs. (A leading "+"
+# marks a session whose shell already exited: nothing to reattach. "*" is
+# still attached: a slow old client or someone's `abduco -a`; abduco takes
+# several clients, so reattach those too rather than drop them off the board.)
+for _ in $(seq 1 50); do
+    if ! session_listing=$("$ABDUCO" 2>/dev/null); then
+        echo "failed to list abduco sessions after stopping kitty" >&2
+        exit 1
+    fi
+    ATTACHED=($(printf '%s\n' "$session_listing" | awk 'NR>1 && $1=="*"{print $NF}' | grep -E '^cove-[0-9]+$' || true))
+    [ "${#ATTACHED[@]}" -eq 0 ] && break
+    sleep 0.1
+done
+SESSIONS=($(printf '%s\n' "$session_listing" | awk 'NR>1 && $1!="+"{print $NF}' | grep -E '^cove-[0-9]+$' || true))
+if [ "${#ATTACHED[@]}" -ne 0 ]; then
+    echo "warning: ${#ATTACHED[@]} session(s) still attached elsewhere, reattaching anyway: ${ATTACHED[*]}" >&2
+fi
+echo "reattaching ${#SESSIONS[@]} termling session(s): ${SESSIONS[*]:-<none>}"
 # Drop the stale frame files + socket, but KEEP state.json so Godot can restore
 # positions/names by session.
 # (kitty's only: panes below 1000000; Vibefox and Vibemacs critters
@@ -88,7 +140,7 @@ for _f in "$DIR"/term-*.rgba; do
     case "$_n" in *[!0-9]*|"") continue ;; esac
     [ "$_n" -lt 1000000 ] && rm -f "$_f"
 done
-rm -f /tmp/cove-kitty 2>/dev/null || true
+rm -f /tmp/cove-kitty "$DIR/kitty.pid" "$DIR/dev-env" 2>/dev/null || true
 
 export COVE=1 KITTY_COVE=1 KITTY_COVE_DIR="$DIR"
 [ "${COVE_IOSURFACE:-}" = "1" ] && export KITTY_COVE_IOSURFACE=1
@@ -102,26 +154,59 @@ COMMON=(--title cove --listen-on "$SOCK"
 # Restart kitty. First window reattaches session[0] (or a fresh shell via the
 # wrapper if there are none); the rest are reattached below via remote control.
 if [ "${#SESSIONS[@]}" -eq 0 ]; then
-    nohup "$KITTY" "${COMMON[@]}" "$WRAPPER" >/tmp/cove-kitty.log 2>&1 &
+    nohup "$KITTY" "${COMMON[@]}" "$WRAPPER" 9>&- >/tmp/cove-kitty.log 2>&1 &
 else
-    nohup "$KITTY" "${COMMON[@]}" "$REATTACH" "${SESSIONS[0]}" "${SHELL:-/bin/zsh}" >/tmp/cove-kitty.log 2>&1 &
+    nohup "$KITTY" "${COMMON[@]}" "$REATTACH" "${SESSIONS[0]}" 9>&- >/tmp/cove-kitty.log 2>&1 &
 fi
 COVE_KITTY_PID=$!
 
-# Wait for kitty to publish its first frame.
-for _ in $(seq 1 80); do ls "$DIR"/term-*.rgba >/dev/null 2>&1 && break; sleep 0.1; done
+# The sessions kitty has a window for, one per line ("cove-N" is a whole JSON
+# string in its ls: the window's cmdline and the abduco client's).
+kitty_sessions() {
+    "$KITTEN" @ --to "$SOCK" ls 2>/dev/null | grep -oE '"cove-[0-9]+"' | tr -d '"' | sort -u
+}
+
+# Wait for remote control, and for the first session's window.
+kitty_ready=false
+for _ in $(seq 1 80); do
+    if kill -0 "$COVE_KITTY_PID" 2>/dev/null && "$KITTEN" @ --to "$SOCK" ls >/dev/null 2>&1; then
+        if [ "${#SESSIONS[@]}" -eq 0 ] || kitty_sessions | grep -qx "${SESSIONS[0]}"; then
+            kitty_ready=true
+            break
+        fi
+    fi
+    sleep 0.1
+done
+if [ "$kitty_ready" != true ]; then
+    echo "kitty did not become ready at $SOCK" >&2
+    exit 1
+fi
 echo "$COVE_KITTY_PID" > "$DIR/kitty.pid"
 
-# Reattach the remaining sessions, each as its own OS window.
-# Retry: under load a launch can time out, and a session that misses its window
-# silently vanishes from the board (26 of 70 did on 2026-09-25).
-for ((i=1; i<${#SESSIONS[@]}; i++)); do
-    for _try in 1 2 3; do
+# Reattach the remaining sessions, each as its own OS window. Under load a
+# launch can time out, and a session that misses its window silently vanishes
+# from the board (26 of 70 did on 2026-09-25). A timed-out launch may still
+# land, so relaunch only what kitty's ls doesn't show after a grace period.
+_missing=("${SESSIONS[@]:1}")
+for _try in 1 2 3; do
+    [ "${#_missing[@]}" -eq 0 ] && break
+    for _s in "${_missing[@]}"; do
         "$KITTEN" @ --to "$SOCK" launch --type=os-window \
-            "$REATTACH" "${SESSIONS[$i]}" "${SHELL:-/bin/zsh}" >/dev/null 2>&1 && break
-        [ "$_try" = 3 ] && echo "WARNING: couldn't reattach ${SESSIONS[$i]} (still alive in abduco)" >&2
-        sleep 2
+            "$REATTACH" "$_s" >/dev/null 2>&1 || true
     done
+    for _ in $(seq 1 20); do
+        _have=" $(kitty_sessions | tr '\n' ' ')"
+        _still=()
+        for _s in "${_missing[@]}"; do
+            case "$_have" in *" $_s "*) ;; *) _still+=("$_s") ;; esac
+        done
+        _missing=("${_still[@]+"${_still[@]}"}")
+        [ "${#_missing[@]}" -eq 0 ] && break
+        sleep 0.1
+    done
+done
+for _s in "${_missing[@]+"${_missing[@]}"}"; do
+    echo "WARNING: couldn't reattach $_s (still alive in abduco)" >&2
 done
 
 # Refresh dev-env (new pid) and relaunch Godot.
@@ -133,5 +218,7 @@ GODOT=$GODOT
 COVE_KITTY_PID=$COVE_KITTY_PID
 EOF
 COVE_KITTEN="$KITTEN" COVE_KITTY_SOCKET="$SOCK" \
-    nohup "$GODOT" --path "$APP" >/tmp/cove-godot.log 2>&1 &
+    nohup "$GODOT" --path "$APP" 9>&- >/tmp/cove-godot.log 2>&1 &
+STARTUP_COMPLETE=true
+exec 9>&-
 echo "warm reload done: kitty restarted (new code), ${#SESSIONS[@]} termling(s) reattached."
