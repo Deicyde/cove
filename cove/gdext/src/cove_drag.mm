@@ -88,6 +88,7 @@ static NSImage *make_drag_image(NSString *label) {
 	};
 	NSString *text = label.length ? [@"🐚 " stringByAppendingString:label] : @"🐚 termling";
 	[text drawInRect:NSInsetRect(r, 14, 17) withAttributes:attrs];
+	[ps release];
 	[img unlockFocus];
 	return img;
 }
@@ -163,6 +164,7 @@ static NSImage *make_drag_image_from_iosurface(uint32_t sid, int tex_w, int tex_
 			NSParagraphStyleAttributeName : ps,
 		};
 		[[@"🐚 " stringByAppendingString:label] drawInRect:NSMakeRect(6, 3, sw - 12, 17) withAttributes:attrs];
+		[ps release];
 	}
 	[out unlockFocus];
 	CGImageRelease(cg);
@@ -179,6 +181,7 @@ static NSImage *make_drag_image_from_png(NSString *path, NSString *label) {
 	}
 	NSImage *src = [[NSImage alloc] initWithContentsOfFile:path];
 	if (!src || src.size.width < 1 || src.size.height < 1) {
+		[src release];
 		return nil;
 	}
 	double nw = src.size.width, nh = src.size.height;
@@ -208,8 +211,10 @@ static NSImage *make_drag_image_from_png(NSString *path, NSString *label) {
 			NSParagraphStyleAttributeName : ps,
 		};
 		[[@"🐚 " stringByAppendingString:label] drawInRect:NSMakeRect(6, 3, sw - 12, 17) withAttributes:attrs];
+		[ps release];
 	}
 	[out unlockFocus];
+	[src release];
 	return out;
 }
 
@@ -384,11 +389,12 @@ bool CoveDrag::attach(int64_t view_handle) {
 	}
 	// Union our type into whatever the view already registers (file types etc.).
 	NSArray<NSPasteboardType> *existing = [view registeredDraggedTypes];
-	NSMutableArray *types = existing ? [existing mutableCopy] : [NSMutableArray array];
+	NSMutableArray *types = existing ? [existing mutableCopy] : [[NSMutableArray alloc] init];
 	if (![types containsObject:COVE_TYPE]) {
 		[types addObject:COVE_TYPE];
 	}
 	[view registerForDraggedTypes:types];
+	[types release];
 	install_destination(view);
 	return true;
 }
@@ -450,6 +456,9 @@ bool CoveDrag::begin_drag(const String &payload, const String &label,
 	NSDraggingSession *s = [g_view beginDraggingSessionWithItems:@[ di ]
 														   event:ev
 														  source:(id<NSDraggingSource>)g_source];
+	[item release];
+	[di release];
+	[img release];
 	g_dragging = (s != nil);
 	return g_dragging;
 }
