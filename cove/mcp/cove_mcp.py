@@ -1040,10 +1040,21 @@ def call_tool(name, args):
                     if lin[s].get(k):
                         arrows.append(lin[s][k])
         write_lineage(lin)
-        mine = [a for a in arrows if str(a).startswith(my_session() + ".")]
-        if mine:
+        # Everything that belonged to the killed termlings goes: the arrow and
+        # frame we made for each (keyed by its owner's session: ours for the
+        # child, the child's for its own children), plus any arrow still tied to
+        # one of them. Only deleting ids with *our* prefix left the child's
+        # arrows to its children dangling on the board.
+        owners = tuple(s + "." for s in [my_session()] + victims)
+        gone = {"term:" + s for s in victims}
+        ids = [a for a in arrows if str(a).startswith(owners)]
+        for sh in read_board().get("shapes", []):
+            if sh.get("type") == "arrow" and (sh.get("bind_a") in gone or sh.get("bind_b") in gone):
+                ids.append(str(sh["id"]))
+        ids = sorted(set(ids))
+        if ids:
             try:
-                send(CMDS, {"cmd": "board", "op": "delete", "ids": mine})
+                send(CMDS, {"cmd": "board", "op": "delete", "ids": ids})
             except ValueError:
                 pass
         return {"ok": True, "killed": victims}
