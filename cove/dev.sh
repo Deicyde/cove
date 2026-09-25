@@ -12,19 +12,52 @@ KITTEN="$REPO/kitty/launcher/kitty.app/Contents/MacOS/kitten"
 SOCK="unix:/tmp/cove-kitty"
 DIR="/tmp/cove"
 GODOT="${GODOT:-godot}"
+ABDUCO="$APP/bin/abduco"
+[ -x "$ABDUCO" ] || ABDUCO="$(command -v abduco 2>/dev/null || echo /opt/homebrew/bin/abduco)"
 
 [ -e "$KITTY" ] || { echo "kitty not built ($KITTY) — see cove/README.md" >&2; exit 1; }
+[ -x "$KITTEN" ] || { echo "kitten not built ($KITTEN)" >&2; exit 1; }
 command -v "$GODOT" >/dev/null 2>&1 || { echo "godot not found; set GODOT=/path/to/godot" >&2; exit 1; }
+[ -x "$ABDUCO" ] || { echo "abduco not found at $ABDUCO" >&2; exit 1; }
+exec 9>/tmp/cove-launch.lock
+if ! /usr/bin/lockf -s -t 0 9; then
+    echo "another Cove launch is already in progress" >&2
+    exit 1
+fi
+
+# Check session discovery before stopping the running Cove.
+if ! session_listing=$("$ABDUCO" 2>/dev/null); then
+    echo "failed to list abduco sessions" >&2
+    exit 1
+fi
+SESSIONS=($(printf '%s\n' "$session_listing" | awk 'NR>1 && $1 != "+"{print $NF}' | grep -E '^cove-[0-9]+$' || true))
 
 # The GDExtension (CoveInput/IOSurface) must be registered for fast input.
 if [ ! -f "$APP/.godot/extension_list.cfg" ]; then
     "$GODOT" --path "$APP" --editor --headless --quit >/dev/null 2>&1 || true
 fi
 
+# Reuse the warm-restart path when a crashed or running Cove already owns
+# sessions. It preserves layout and reattaches them instead of wiping /tmp/cove.
+if [ "${#SESSIONS[@]}" -ne 0 ]; then
+    mkdir -p "$DIR"
+    cat > "$DIR/dev-env.new" <<EOF
+COVE_KITTEN=$KITTEN
+COVE_KITTY_SOCKET=$SOCK
+APP=$APP
+GODOT=$GODOT
+EOF
+    mv "$DIR/dev-env.new" "$DIR/dev-env"
+    COVE_LAUNCH_LOCK_HELD=1 "$APP/reload-kitty.sh"
+    "$APP/cove-remote-start.sh" 9>&- || true
+    exec 9>&-
+    exit 0
+fi
+
 pkill -if 'godot --path' 2>/dev/null || true
 # Kill any previous cove-kitty. macOS `pkill -f` can't read kitty's args, so
-# match via the pid file dev.sh wrote + a `ps` scan on the launcher + title.
-[ -f "$DIR/kitty.pid" ] && kill "$(cat "$DIR/kitty.pid" 2>/dev/null)" 2>/dev/null || true
+# match via a `ps` scan on the launcher + title (which also finds the pid in
+# kitty.pid, when that's still a Cove kitty rather than a reused pid).
 for _p in $(ps -Ao pid=,command= | awk '/[l]auncher\/kitty --title cove/ {print $1}'); do
     kill "$_p" 2>/dev/null || true
 done
@@ -43,7 +76,7 @@ KITTY_COVE=1 KITTY_COVE_DIR="$DIR" nohup "$KITTY" --title cove \
     -o initial_window_width=110c -o initial_window_height=32c \
     -o "map cmd+n cove_new_os_window" \
     -o shell="$WRAPPER" \
-    "$WRAPPER" >/tmp/cove-kitty.log 2>&1 &
+    "$WRAPPER" 9>&- >/tmp/cove-kitty.log 2>&1 &
 COVE_KITTY_PID=$!
 
 for _ in $(seq 1 60); do ls "$DIR"/term-*.rgba >/dev/null 2>&1 && break; sleep 0.1; done
@@ -59,9 +92,10 @@ COVE_KITTY_PID=$COVE_KITTY_PID
 EOF
 
 # Auto-start remote termlings (relay + peer auto-viewer) — survives Godot reloads.
-"$APP/cove-remote-start.sh" || true
+"$APP/cove-remote-start.sh" 9>&- || true
 
 COVE_KITTEN="$KITTEN" COVE_KITTY_SOCKET="$SOCK" \
-    nohup "$GODOT" --path "$APP" >/tmp/cove-godot.log 2>&1 &
+    nohup "$GODOT" --path "$APP" 9>&- >/tmp/cove-godot.log 2>&1 &
+exec 9>&-
 echo "Cove dev up (kitty + godot). Edit scripts, then: cove/reload.sh"
 echo "Quit everything with: cove/stop.sh"

@@ -16,8 +16,10 @@ if [ -z "$kpid" ] || ! kill -0 "$kpid" 2>/dev/null; then
     kpid="$(ps -Ao pid=,command= | awk '/[l]auncher\/kitty --title cove/ {print $1; exit}')"
 fi
 if [ -z "$kpid" ]; then
-    echo "kitty (cove) isn't running — start fresh with cove/dev.sh." >&2
-    exit 1
+    # Gone (a failed reload-kitty.sh, a crash): its termlings live on in abduco,
+    # so restart kitty and reattach them rather than send you back to dev.sh.
+    echo "kitty (cove) isn't running; restarting it with reload-kitty.sh." >&2
+    exec "$APP/reload-kitty.sh"
 fi
 
 pkill -if "godot --path $APP" 2>/dev/null || pkill -if 'godot --path' 2>/dev/null || true
