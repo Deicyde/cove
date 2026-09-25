@@ -101,6 +101,7 @@ class DevRestartRecoveryTest(unittest.TestCase):
         self, *, launch_times_out: bool = False, stays_attached: bool = False,
         kitty_broken: bool = False, first_session_dead: bool = False,
         stale_pid_file: bool = False, listing_fails_after_stop: bool = False,
+        ls_blinks: bool = False,
     ) -> None:
         with tempfile.TemporaryDirectory(prefix='cove-reload-test-') as tdir:
             root = Path(tdir)
@@ -127,6 +128,7 @@ class DevRestartRecoveryTest(unittest.TestCase):
             kitty_args = root / 'kitty-args'
             launch_args = root / 'launch-args'
             old_ls = root / 'old-ls.json'
+            ls_count = root / 'ls-count'
 
             self.write_executable(
                 abduco,
@@ -171,9 +173,16 @@ Path(os.environ['KITTY_EXITED']).touch()
                 'ls)\n'
                 '    if kill -0 "$OLD_KITTY_PID" 2>/dev/null; then cat "$OLD_LS"; exit 0; fi\n'
                 '    [ -f "$KITTY_READY" ] || exit 1\n'
-                '    printf "["; sep=\n'
-                '    for s in $(ls "$LANDED"); do printf \'%s{"title":"%s"}\' "$sep" "$s"; sep=,; done\n'
-                '    printf "]\\n"\n'
+                '    n=$(cat "$LS_COUNT" 2>/dev/null || echo 0); n=$((n + 1)); printf "%s\\n" "$n" > "$LS_COUNT"\n'
+                # Under load, right after the ready check (call 1), ls can fail
+                # or come back without the reattach windows yet.
+                '    if [ "$LS_BLINKS" = 1 ]; then case "$n" in 2) exit 1 ;; 3) echo "[]"; exit 0 ;; esac; fi\n'
+                # Indented like kitty's, one cmdline element per line. A decoy
+                # first: only its title and user vars name a session, so it
+                # mustn't count as that session's window.
+                '    printf \'[{"tabs": [{"windows": [\\n{"cmdline": [\\n"/bin/zsh"\\n],\\n"title": "cove-111",\\n"user_vars": {\\n"s": "cove-111"\\n}}\'\n'
+                '    for s in $(ls "$LANDED"); do printf \',\\n{"cmdline": [\\n  "%s",\\n  "%s"\\n],\\n"title": "zsh"}\' "$REATTACH" "$s"; done\n'
+                '    printf "\\n]}]}]\\n"\n'
                 '    ;;\n'
                 'get-text) printf "screen of %s\\n" "$6" ;;\n'
                 'launch)\n'
@@ -255,11 +264,14 @@ Path(os.environ['KITTY_EXITED']).touch()
                 'KITTY_READY': str(kitty_ready),
                 'LANDED': str(landed),
                 'LAUNCH_ARGS': str(launch_args),
+                'LS_BLINKS': '1' if ls_blinks else '0',
+                'LS_COUNT': str(ls_count),
                 'OLD_KITTY_PID': str(old_kitty.pid),
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
                 'LAUNCH_TIMES_OUT': '1' if launch_times_out else '0',
                 'NEW_KITTY_BROKEN': '1' if kitty_broken else '0',
                 'OLD_LS': str(old_ls),
+                'REATTACH': str(reattach),
                 'SHELL': '/bin/zsh',
             }
             try:
@@ -343,6 +355,9 @@ Path(os.environ['KITTY_EXITED']).touch()
 
     def test_dead_first_session_does_not_sink_the_reload(self) -> None:
         self.exercise_reload(first_session_dead=True)
+
+    def test_ls_failing_or_empty_for_a_moment_does_not_sink_the_reload(self) -> None:
+        self.exercise_reload(ls_blinks=True)
 
     def test_stale_pid_file_does_not_kill_a_bystander(self) -> None:
         self.exercise_reload(stale_pid_file=True)

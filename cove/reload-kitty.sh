@@ -186,10 +186,16 @@ else
 fi
 COVE_KITTY_PID=$!
 
-# The sessions kitty has a window for, one per line ("cove-N" is a whole JSON
-# string in its ls: the window's cmdline and the abduco client's).
+# The sessions kitty has a reattach window for, one per line: the argument after
+# cove-reattach.sh in a cmdline (ls is indented JSON, one element per line), so
+# a title or user var naming a session doesn't count. Prints nothing, and never
+# fails, when ls fails or has none yet: under load ls can time out, and under
+# `set -e` that mustn't abort the reload. (awk, not python: this is polled.)
 kitty_sessions() {
-    "$KITTEN" @ --to "$SOCK" ls 2>/dev/null | grep -oE '"cove-[0-9]+"' | tr -d '"' | sort -u
+    { "$KITTEN" @ --to "$SOCK" ls 2>/dev/null || true; } | awk '
+        after && match($0, /^[[:space:]]*"cove-[0-9]+"/) { s = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]*"/, "", s); sub(/"$/, "", s); print s }
+        { after = ($0 ~ /\/cove-reattach\.sh",[[:space:]]*$/) }
+    ' | sort -u
 }
 
 # Wait for remote control. Not for the first session's window: if that session
