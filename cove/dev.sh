@@ -79,6 +79,9 @@ KITTY_COVE=1 KITTY_COVE_DIR="$DIR" nohup "$KITTY" --title cove \
     "$WRAPPER" 9>&- >/tmp/cove-kitty.log 2>&1 &
 COVE_KITTY_PID=$!
 
+# If kitty never answers, stop it and drop what it left so a retry isn't fooled.
+# Its first window may already have made an abduco session, which outlives kitty
+# by design: the next dev.sh then finds it and takes the warm-restart path.
 cleanup_cold_start() {
     kill "$COVE_KITTY_PID" 2>/dev/null || true
     for _ in $(seq 1 30); do
@@ -94,8 +97,10 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Failing here kills kitty, so allow a slow first start (a loaded machine, a
+# fresh build): 30 s, where reload-kitty.sh's warm start allows 8 s.
 kitty_ready=false
-for _ in $(seq 1 80); do
+for _ in $(seq 1 300); do
     if kill -0 "$COVE_KITTY_PID" 2>/dev/null \
             && "$KITTEN" @ --to "$SOCK" ls >/dev/null 2>&1; then
         kitty_ready=true
