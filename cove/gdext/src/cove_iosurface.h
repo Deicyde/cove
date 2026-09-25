@@ -13,7 +13,7 @@ class CoveIOSurface : public RefCounted {
 	GDCLASS(CoveIOSurface, RefCounted);
 
 	void *_surface = nullptr;   // IOSurfaceRef
-	void *_mtl_texture = nullptr;  // id<MTLTexture> (manually retained)
+	void *_mtl_texture = nullptr;  // id<MTLTexture> (owned +1 from newTexture...; Godot retains its own)
 	RID _rid;
 	Ref<Texture2DRD> _tex;
 	int _id = 0, _w = 0, _h = 0;

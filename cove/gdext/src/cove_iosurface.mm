@@ -78,7 +78,6 @@ Ref<Texture2DRD> CoveIOSurface::import_surface(int iosurface_id, int width, int 
 		CFRelease(surf);
 		return Ref<Texture2DRD>();
 	}
-	[tex retain];
 	RID rid = rd->texture_create_from_extension(
 			RenderingDevice::TEXTURE_TYPE_2D,
 			RenderingDevice::DATA_FORMAT_B8G8R8A8_UNORM,
