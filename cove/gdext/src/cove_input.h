@@ -31,6 +31,9 @@ public:
 	// Drag-out: detach an OS window from the cove onto the desktop, centred on
 	// (x, y) in Cocoa screen coords: [4][id u64][x i32][y i32].
 	bool send_detach(int64_t os_window_id, int x, int y);
+	// A whole pre-framed message ([kind u8][id u64 LE][payload]), for message
+	// kinds added after this extension (so a new one needs no rebuild).
+	bool send_raw(const PackedByteArray &msg);
 	void close_conn();
 
 	CoveInput() {}

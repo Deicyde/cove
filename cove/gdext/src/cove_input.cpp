@@ -28,6 +28,7 @@ void CoveInput::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("spawn"), &CoveInput::spawn);
 	ClassDB::bind_method(D_METHOD("send_mouse", "pane_id", "phase", "x", "y", "in_left_half"), &CoveInput::send_mouse);
 	ClassDB::bind_method(D_METHOD("send_detach", "os_window_id", "x", "y"), &CoveInput::send_detach);
+	ClassDB::bind_method(D_METHOD("send_raw", "msg"), &CoveInput::send_raw);
 	ClassDB::bind_method(D_METHOD("close_conn"), &CoveInput::close_conn);
 }
 
@@ -178,6 +179,17 @@ bool CoveInput::send_mouse(int64_t pane_id, int phase, int x, int y, bool in_lef
 	memcpy(msg + 14, &yy, 4);
 	msg[18] = in_left_half ? 1 : 0;
 	if (!write_all(_fd, msg, sizeof msg)) {
+		close_conn();
+		return false;
+	}
+	return true;
+}
+
+bool CoveInput::send_raw(const PackedByteArray &msg) {
+	if (_fd < 0 || msg.size() < 9) {
+		return false;
+	}
+	if (!write_all(_fd, msg.ptr(), (size_t)msg.size())) {
 		close_conn();
 		return false;
 	}

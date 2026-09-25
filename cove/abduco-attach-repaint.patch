@@ -1,0 +1,26 @@
+--- client.c.orig
++++ client.c
+@@ -76,6 +76,23 @@
+ 		if (client.need_resize) {
+ 			struct winsize ws;
+ 			if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) != -1) {
++				/* cove: on attach, pulse the size (one row fewer, then the real
++				 * size) so the program gets a real resize and repaints. The
++				 * server only resends the same size, which TUIs ignore, so a
++				 * reattached idle agent stayed blank until you typed into it. */
++				static bool pulsed = false;
++				if (!pulsed && ws.ws_row > 2) {
++					struct winsize small = ws;
++					small.ws_row -= 1;
++					Packet p0 = {
++						.type = MSG_RESIZE,
++						.u = { .ws = small },
++						.len = sizeof(small),
++					};
++					if (client_send_packet(&p0))
++						usleep(150 * 1000);
++				}
++				pulsed = true;
+ 				Packet pkt = {
+ 					.type = MSG_RESIZE,
+ 					.u = { .ws = ws },

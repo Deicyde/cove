@@ -65,6 +65,22 @@ var iosurface_id := 0
 var _tex: ImageTexture
 var _size := Vector2i.ZERO
 var _last_seq := -1
+var _last_read_ms := 0   # when the rgba path last read a frame (see UNFOCUSED_READ_MS)
+var _last_head_ms := 0   # when poll() last read the header (see OFFSCREEN_HEAD_MS)
+const OFFSCREEN_HEAD_MS := 250
+# Suspension (kitty MSG_SUSPEND): a termling well off screen for SUSPEND_AFTER_MS
+# asks kitty to stop rendering it and free its spare frame buffer; it resumes the
+# moment it's within half a view of the screen, focused, or screenshotted, so a
+# fresh frame is there before it's visible. suspend_sink(on) sends the message.
+const SUSPEND_AFTER_MS := 10000
+var suspend_sink: Callable
+var _suspended := false
+var _suspend_synced := false   # told kitty "not suspended" once (a new Cove can't know)
+var _far_since := 0
+# An unfocused termling's rgba frames are read at most this often. Each 2x frame
+# is ~10 MB read + copied + uploaded on the main thread, so a handful of busy
+# agents at full rate starved the focused termling and made typing lag.
+const UNFOCUSED_READ_MS := 160
 var _file: FileAccess      # kept open: kitty rewrites the frame in place (mmap)
 var _renamed_frames := false  # ...but a page critter's are published by rename (see poll)
 # Zero-copy path: two importers/textures (double-buffered), swapped per frame.
@@ -97,6 +113,17 @@ func poll() -> void:
 	# we hold stays bound to the old, unlinked one -- the sprite freezes on the
 	# frame that was current when we opened it, while its input goes on working.
 	# There are only ever a handful of them, so they pay the reopen.
+	# Well off screen (not even within half a view of it), re-read the header only
+	# every OFFSCREEN_HEAD_MS: each read is two seeks and a read syscall, ~70
+	# termlings x 60 fps, and nothing it carries is visible out there. Near or on
+	# screen (and when focused) it's still read every frame.
+	if iosurface_id != 0 and not page and suspend_sink.is_valid():
+		_update_suspend()
+	if _last_seq != -1 and not force_read and not _focused:   # (IOSurface termlings never set _tex)
+		var now_ms := Time.get_ticks_msec()
+		if now_ms - _last_head_ms < OFFSCREEN_HEAD_MS and not _near_screen():
+			return
+		_last_head_ms = now_ms
 	if _renamed_frames:
 		_file = null
 	if _file == null:
@@ -136,8 +163,11 @@ func poll() -> void:
 	rows = int(head.decode_u32(36))
 	mouse_mode = int(head.decode_u32(40))
 	mouse_proto = int(head.decode_u32(44))
-	iosurface_id = int(head.decode_u32(48))
+	var iosurface_id_a := int(head.decode_u32(48))
 	var iosurface_id_b := int(head.decode_u32(52))
+	# Non-zero = zero-copy. Either buffer's id can be 0: a suspended termling keeps
+	# only the buffer holding its last frame (kitty frees the other).
+	iosurface_id = iosurface_id_a if iosurface_id_a != 0 else iosurface_id_b
 	var ready_index := int(head.decode_u32(56))
 	if w <= 0 or h <= 0 or seq == _last_seq:
 		return
@@ -146,6 +176,11 @@ func poll() -> void:
 	# moment it's back in view.
 	if iosurface_id == 0 and _tex != null and _size == Vector2i(w, h) and not force_read and not _on_screen():
 		return
+	var now := Time.get_ticks_msec()
+	if iosurface_id == 0 and _tex != null and _size == Vector2i(w, h) and not _focused and not force_read \
+			and now - _last_read_ms < UNFOCUSED_READ_MS:
+		return
+	_last_read_ms = now
 	_last_seq = seq
 	# Normalise for kitty's render scale (1x vs 2x Retina) so world size is
 	# stable and a 2x render shows as sharper glyphs, not a bigger window.
@@ -159,7 +194,7 @@ func poll() -> void:
 		_layout_decorations()
 
 	if iosurface_id != 0 and not _importers.is_empty():
-		_apply_iosurface(w, h, iosurface_id, iosurface_id_b, ready_index)
+		_apply_iosurface(w, h, iosurface_id_a, iosurface_id_b, ready_index)
 	else:
 		f.seek(HEADER)
 		var px := f.get_buffer(w * h * 4)
@@ -180,6 +215,35 @@ func poll() -> void:
 
 
 # Is any of the terminal inside the window (with a margin)?
+func _update_suspend() -> void:
+	if not _suspend_synced:
+		_suspend_synced = true
+		suspend_sink.call(false)
+	var far := not _focused and not force_read and not _near_screen()
+	if not far:
+		_far_since = 0
+		if _suspended:
+			_suspended = false
+			suspend_sink.call(false)
+		return
+	var now_ms := Time.get_ticks_msec()
+	if _far_since == 0:
+		_far_since = now_ms
+	elif not _suspended and now_ms - _far_since > SUSPEND_AFTER_MS:
+		_suspended = true
+		suspend_sink.call(true)
+
+
+# The viewport grown by half its size each way: termlings about to scroll into
+# view keep full-rate header reads, so they never show up stale.
+func _near_screen() -> bool:
+	if screen == null or screen.texture == null:
+		return true
+	var r: Rect2 = screen.get_global_transform_with_canvas() * screen.get_rect()
+	var vr := get_viewport_rect()
+	return vr.grow_individual(vr.size.x * 0.5, vr.size.y * 0.5, vr.size.x * 0.5, vr.size.y * 0.5).intersects(r)
+
+
 func _on_screen() -> bool:
 	if screen == null or screen.texture == null:
 		return true

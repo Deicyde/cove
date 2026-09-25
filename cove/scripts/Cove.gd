@@ -108,6 +108,16 @@ var _land_queue: Array = []    # world positions for the next landed handoff dro
 var _ls_thread: Thread
 var _ls_mutex: Mutex
 var _ls_data := {}            # pane_id -> {agent, busy, attention, cwd}
+var _ls_gen := 0              # bumped by the ls thread with each fresh _ls_data
+var _ls_seen := -1            # the _ls_gen _ls_copy was taken at
+var _ls_copy := {}            # main thread's copy of _ls_data
+var _agent_accum := 0.0       # time since the last full _apply_agent_info
+var _rc_task := -1            # WorkerThreadPool task listing DIR (see _reconcile_async)
+var _rc_ids := []             # its result
+var _state_task := -1         # WorkerThreadPool task writing state.json
+var _bg_pids := {}            # agent pids we put in Darwin background (see _apply_bg_policy)
+var _bg_focus_seen := -2      # _focused_id the policy last ran for
+var _state_rename_dir: DirAccess   # that task's own DirAccess
 var _ls_run := true
 var _child_mutex := Mutex.new()
 var _child_pids: Array[int] = []
@@ -337,9 +347,13 @@ func _exit_tree() -> void:
 		var t = _groups[id].terminal
 		if t.page:
 			_page_input(t.pane_id, "focus", {"focused": false, "cove_focused": false})
+	_bg_restore_all()
 	_ls_run = false
 	if _ls_thread and _ls_thread.is_started():
 		_ls_thread.wait_to_finish()
+	for task in [_rc_task, _state_task]:
+		if task != -1:
+			WorkerThreadPool.wait_for_task_completion(task)
 	_write_durable()   # capture the latest names/positions before we go
 	if _bd_save_in >= 0.0:
 		_bd_save_now()   # the board saves on a debounce; flush a pending save
@@ -384,11 +398,12 @@ func _process(delta: float) -> void:
 	if _rescan_accum > 0.4:
 		_rescan_accum = 0.0
 		_reap_children()
-		_reconcile()
+		_reconcile_async()
 		_apply_spawn_places()
 		_apply_zones()
 	if _sock != null and not _sock.call("is_connected") and _input_tries < 100:
 		_try_connect_sock()
+	_reconcile_poll()
 	_tick_vibefox(delta)
 	_sync_page_focus()
 	_apply_agent_state()
@@ -486,23 +501,65 @@ func _process(delta: float) -> void:
 
 # --- terminal discovery -----------------------------------------------------
 
+# kitty MSG_SUSPEND (6): [kind u8][os-window id u64 LE][on u8]. See TermCritter.
+func _send_suspend(on: bool, id: int) -> void:
+	if _sock == null or not _sock.has_method("send_raw") or not _sock.call("is_connected"):
+		return
+	var msg := PackedByteArray()
+	msg.resize(10)
+	msg[0] = 6
+	msg.encode_u64(1, id)
+	msg[9] = 1 if on else 0
+	_sock.call("send_raw", msg)
+
+
 func _reconcile() -> void:
-	var present := {}
+	_reconcile_with(_term_ids_on_disk())
+
+
+# The term ids with a frame file in DIR. Safe off the main thread: listing DIR
+# costs ~20 ms on macOS (DirAccess asks the OS whether each of ~100 files is
+# hidden), a stall every 0.4 s when it ran on the main thread.
+static func _term_ids_on_disk() -> Array:
+	var ids := []
 	var dir := DirAccess.open(DIR)
 	if dir:
 		dir.list_dir_begin()
 		var fn := dir.get_next()
 		while fn != "":
 			if fn.begins_with("term-") and fn.ends_with(".rgba"):
-				var id := int(fn.substr(5, fn.length() - 10))
-				present[id] = true
-				if not _groups.has(id):
-					_add_group(id)
+				ids.append(int(fn.substr(5, fn.length() - 10)))
 			fn = dir.get_next()
 		dir.list_dir_end()
+	return ids
+
+
+func _reconcile_with(ids: Array) -> void:
+	var present := {}
+	for id in ids:
+		present[id] = true
+		if not _groups.has(id):
+			_add_group(id)
 	for id in _groups.keys():
 		if not present.has(id):
 			_remove_group(id)
+
+
+# The periodic rescan lists DIR on a worker; _reconcile_poll applies the result
+# on the main thread the frame it's ready.
+func _reconcile_async() -> void:
+	if _rc_task != -1:
+		return
+	_rc_task = WorkerThreadPool.add_task(func(): _rc_ids = _term_ids_on_disk())
+
+
+func _reconcile_poll() -> void:
+	if _rc_task == -1 or not WorkerThreadPool.is_task_completed(_rc_task):
+		return
+	WorkerThreadPool.wait_for_task_completion(_rc_task)
+	_rc_task = -1
+	_reconcile_with(_rc_ids)
+	_apply_spawn_places()   # a new termling gets its spot the frame it appears
 
 
 func _add_group(id: int) -> void:
@@ -555,6 +612,8 @@ func _add_group(id: int) -> void:
 			_quick_claim = ""
 	_world.add_child(g)
 	g.setup(id, "%s/term-%d.rgba" % [DIR, id], _bounds)
+	if id < PAGE_PANE_BASE:
+		g.terminal.suspend_sink = _send_suspend.bind(id)
 	if _names.has(id):
 		g.terminal.set_custom_name(_names[id])
 	_groups[id] = g
@@ -1858,7 +1917,11 @@ func _load_layout() -> void:
 		var id := int(t.get("id", -1))
 		if id == -1:
 			continue
-		pos[id] = t.get("pos", [0, 0])
+		# Termlings with a session restore by session (_learn_session), never by id:
+		# after a kitty restart id N is some other termling, and an id-keyed spot
+		# would also block the session restore (_pos_restored).
+		if str(t.get("session", "")) == "":
+			pos[id] = t.get("pos", [0, 0])
 		# Names with a session are restored by session (_learn_session), never by
 		# id: ids are reissued when kitty restarts.
 		if str(t.get("name", "")) != "" and str(t.get("session", "")) == "":
@@ -2030,6 +2093,7 @@ func _reap_children() -> void:
 func _start_ls_poll() -> void:
 	if kitten_exe == "" or kitty_socket == "":
 		return
+	_bg_restore_all()   # a previous Cove may have died with agents in the background
 	_ls_mutex = Mutex.new()
 	_ls_thread = Thread.new()
 	_ls_thread.start(_ls_loop)
@@ -2056,6 +2120,7 @@ func _ls_loop() -> void:
 		var data := _parse_ls(txt, sess_info)
 		_ls_mutex.lock()
 		_ls_data = data
+		_ls_gen += 1
 		_ls_mutex.unlock()
 		OS.delay_msec(1000)
 
@@ -2081,6 +2146,7 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 			kids[ppid] = []
 		kids[ppid].append(pid)
 	var res := {}
+	var remote_sess := []
 	for pid in cmd:
 		var c: String = cmd[pid]
 		# The abduco *master* holds the session: its argv carries the session name
@@ -2122,10 +2188,55 @@ func _scan_sessions(ptxt: String) -> Dictionary:
 		# idle: a bare shell at its prompt (nothing running under it), so it's
 		# safe to type a `cd` into it.
 		var idle: bool = agent == "shell" and shell_pid != -1 and kids.get(shell_pid, []).is_empty()
-		res[sess] = {"agent": agent, "busy": agent != "shell", "idle": idle, "pid": src, "cwd": _cwd_of(src)}
+		res[sess] = {"agent": agent, "busy": agent != "shell", "idle": idle, "pid": src, "cwd": ""}
+		if agent_pid != -1:
+			# A tool shell (Claude's Bash tool runs `zsh -c ...`) or the caffeinate it
+			# holds during a turn: the agent is working, whatever the hook last said.
+			var tool := false
+			for k in kids.get(agent_pid, []):
+				var kc: String = str(cmd.get(k, ""))
+				if kc.contains("zsh -c") or kc.contains("bash -c") or kc.begins_with("caffeinate"):
+					tool = true
+					break
+			res[sess]["tool"] = tool
+			res[sess]["act"] = _read_activity(sess)
 		if remote_link:
-			_apply_remote_link(res[sess], sess)
+			remote_sess.append(sess)
+	# One lsof for every session, not one per session: under load each spawn can
+	# take many seconds, and ~60 of them serially kept sessions unlearned for minutes.
+	var pids := []
+	for sess in res:
+		if int(res[sess]["pid"]) > 0:
+			pids.append(int(res[sess]["pid"]))
+	var cwds := _cwds_of(pids)
+	for sess in res:
+		res[sess]["cwd"] = str(cwds.get(int(res[sess]["pid"]), ""))
+	for sess in remote_sess:
+		_apply_remote_link(res[sess], sess)
 	return res
+
+
+# [state, unix ts, legacy]: what ~/.claude/hooks/cove-activity.sh last recorded
+# for this session ("working" on a prompt, "idle" on Stop/Notification). Agents
+# started before that hook existed fall back to their last cove-notify event
+# (legacy = true: only trusted after a longer quiet spell). [] = unknown.
+static func _read_activity(sess: String) -> Array:
+	var f := FileAccess.open(DIR + "/activity/" + sess, FileAccess.READ)
+	if f != null:
+		var parts := f.get_as_text().strip_edges().split(" ")
+		if parts.size() >= 2:
+			return [parts[0], float(parts[1]), false]
+	var ev := FileAccess.open(DIR + "/events/" + sess + ".jsonl", FileAccess.READ)
+	if ev == null:
+		return []
+	var n := ev.get_length()
+	ev.seek(maxi(0, n - 200))
+	var lines := ev.get_as_text().strip_edges().split("\n")
+	var last = JSON.parse_string(lines[lines.size() - 1]) if lines.size() > 0 else null
+	if typeof(last) != TYPE_DICTIONARY:
+		return []
+	var e := str(last.get("event", ""))
+	return ["idle" if e in ["Stop", "Notification"] else "working", float(last.get("ts", 0)), true]
 
 
 # A cove-remote termling: `cove-remote attach` writes what the remote session
@@ -2168,16 +2279,24 @@ func _session_token(c: String) -> String:
 	return ""
 
 
-func _cwd_of(pid: int) -> String:
-	if pid <= 0:
-		return ""
+# pid -> cwd for many pids in a single lsof call (`p<pid>` then `n<path>` lines).
+func _cwds_of(pids: Array) -> Dictionary:
+	var res := {}
+	if pids.is_empty():
+		return res
+	var ids := PackedStringArray()
+	for pid in pids:
+		ids.append(str(pid))
 	var out := []
-	OS.execute("/usr/sbin/lsof", ["-a", "-p", str(pid), "-d", "cwd", "-Fn"], out, false)
+	OS.execute("/usr/sbin/lsof", ["-a", "-p", ",".join(ids), "-d", "cwd", "-Fn"], out, false)
 	var txt: String = out[0] if out.size() > 0 else ""
+	var cur := -1
 	for line in txt.split("\n", false):
-		if line.begins_with("n"):
-			return line.substr(1)
-	return ""
+		if line.begins_with("p"):
+			cur = int(line.substr(1))
+		elif line.begins_with("n") and cur != -1:
+			res[cur] = line.substr(1)
+	return res
 
 
 func _session_from_procs(procs) -> String:
@@ -2210,6 +2329,8 @@ func _parse_ls(txt: String, sess_info: Dictionary) -> Dictionary:
 					"attention": bool(w.get("needs_attention", false)),
 					"cwd": str(si.get("cwd", w.get("cwd", ""))),
 					"title": str(w.get("title", "")),
+					"tool": bool(si.get("tool", false)),
+					"act": si.get("act", []),
 				}
 				if si.has("remote_host"):
 					res[pane]["remote_host"] = si["remote_host"]
@@ -2221,10 +2342,34 @@ func _parse_ls(txt: String, sess_info: Dictionary) -> Dictionary:
 # --- apply agent state + attention to groups --------------------------------
 
 func _apply_agent_state() -> void:
+	# The ls poll only changes once a second, but this ran (and deep-copied all of
+	# it) every frame. Now: when there's a fresh poll, or every 0.1 s for what else
+	# feeds it (notes, page sidecars, new groups). The camera pan stays per-frame.
+	if _focused_id != _bg_focus_seen:
+		_bg_focus_seen = _focused_id
+		_apply_bg_policy()   # the termling you just focused gets its cores back now
+	var fresh := false
 	if _ls_mutex:
 		_ls_mutex.lock()
-		_agents = _ls_data.duplicate(true)
+		if _ls_gen != _ls_seen:
+			_ls_seen = _ls_gen
+			_ls_copy = _ls_data.duplicate(true)
+			fresh = true
 		_ls_mutex.unlock()
+	_agent_accum += get_process_delta_time()
+	if fresh or _agent_accum >= 0.1:
+		_agent_accum = 0.0
+		_apply_agent_info()
+	# one-shot camera pan to a terminal that needs input (only if not following)
+	if _pan_once != -1 and _tracking_id == -1 and _groups.has(_pan_once):
+		var tp: Vector2 = _groups[_pan_once].terminal.global_position
+		_cam.position = _cam.position.lerp(tp, 5.0 * get_process_delta_time())
+		if _cam.position.distance_to(tp) < 24.0:
+			_pan_once = -1
+
+
+func _apply_agent_info() -> void:
+	_agents = _ls_copy.duplicate(true)
 	# Page critters aren't kitty windows, so the ls poll knows nothing of them:
 	# describe them here (agent "page", the tab's title/url from the sidecar) so
 	# state.json, search and the nameplate treat them like any termling.
@@ -2279,12 +2424,80 @@ func _apply_agent_state() -> void:
 		else:
 			_kitty_attn.erase(id)
 		g.set_attention(_attn_ids.has(id))
-	# one-shot camera pan to a terminal that needs input (only if not following)
-	if _pan_once != -1 and _tracking_id == -1 and _groups.has(_pan_once):
-		var tp: Vector2 = _groups[_pan_once].terminal.global_position
-		_cam.position = _cam.position.lerp(tp, 5.0 * get_process_delta_time())
-		if _cam.position.distance_to(tp) < 24.0:
-			_pan_once = -1
+	_apply_bg_policy()
+
+
+# --- idle agents on the efficiency cores -------------------------------------
+# An agent TUI that's idle (its turn ended over a minute ago, no tool running),
+# off screen (its termling suspended), not focused and not remote is put in Darwin background (`taskpolicy -b`): it
+# runs on the efficiency cores with throttled I/O, leaving the performance cores
+# to kitty, the Cove and whatever you're working in. Focusing it, a new prompt,
+# or a tool starting moves it straight back (`taskpolicy -B`). The pids are kept
+# in bg-pids.json so a Cove that died leaves nothing stuck in the background.
+
+const BG_IDLE_S := 60.0       # quiet this long (by the activity hook) first
+const BG_LEGACY_S := 300.0    # ...or this long for agents older than the hook
+
+
+func _apply_bg_policy() -> void:
+	var now := Time.get_unix_time_from_system()
+	var seen := {}
+	var changed := false
+	for id in _groups:
+		var info: Dictionary = _agents.get(_groups[id].terminal.pane_id, {})
+		var pid := int(info.get("pid", -1))
+		if pid <= 0:
+			continue
+		seen[pid] = true
+		var want := false
+		# Only while its termling is also suspended (well off screen): a TUI in
+		# Darwin background barely repaints, so one you can see must stay normal.
+		if str(info.get("agent", "")) in ["claude", "codex", "opencode"] and id != _focused_id \
+				and _groups[id].terminal._suspended \
+				and str(info.get("remote_host", "")) == "" and not bool(info.get("tool", false)):
+			var act: Array = info.get("act", [])
+			if act.size() >= 3 and str(act[0]) == "idle":
+				want = now - float(act[1]) > (BG_LEGACY_S if bool(act[2]) else BG_IDLE_S)
+		if want != _bg_pids.has(pid):
+			_set_bg(pid, want)
+			changed = true
+			if not want:
+				# Back from Darwin background, where a TUI barely repaints: make it
+				# redraw now (also brings back a screen left blank by a kitty restart).
+				var t = _groups[id].terminal
+				var sess := str(info.get("session", ""))
+				if sess != "" and t.rows > 2 and t.cols > 0:
+					OS.create_process("/usr/bin/python3", [ProjectSettings.globalize_path("res://abduco-repaint.py"),
+						sess, str(t.rows), str(t.cols)])
+	for pid in _bg_pids.keys():
+		if not seen.has(pid):
+			_bg_pids.erase(pid)   # gone (or no longer a termling's agent)
+			changed = true
+	if changed:
+		_write_atomic(DIR + "/bg-pids.json", JSON.stringify(_bg_pids.keys()))
+
+
+func _set_bg(pid: int, on: bool) -> void:
+	OS.create_process("/usr/sbin/taskpolicy", ["-b" if on else "-B", "-p", str(pid)])
+	if on:
+		_bg_pids[pid] = true
+	else:
+		_bg_pids.erase(pid)
+
+
+# Everything back to normal priority: at startup (for a previous Cove's leftovers)
+# and when the Cove quits.
+func _bg_restore_all() -> void:
+	var pids := _bg_pids.keys()
+	var f := FileAccess.open(DIR + "/bg-pids.json", FileAccess.READ)
+	if f != null:
+		var j = JSON.parse_string(f.get_as_text())
+		if typeof(j) == TYPE_ARRAY:
+			pids.append_array(j)
+	for pid in pids:
+		OS.create_process("/usr/sbin/taskpolicy", ["-B", "-p", str(int(pid))])   # (non-blocking)
+	_bg_pids.clear()
+	DirAccess.remove_absolute(DIR + "/bg-pids.json")
 
 
 # A remote shadow pane (from cove-remote-auto.sh) carries the title
@@ -3105,6 +3318,7 @@ func _write_state() -> void:
 		"terminals": terms,
 		"camera": [snappedf(_cam.position.x, 0.1), snappedf(_cam.position.y, 0.1), _cam.zoom.x],
 		"focused": _focused_id,
+		"fps": Engine.get_frames_per_second(),   # render rate (the Cove runs uncapped up to max_fps)
 		# the "needs you" queue, oldest first; session-keyed so it survives a kitty restart
 		"attention_queue": _attention.queue.map(func(q): return {"id": q, "session": _sessions.get(q, "")}),
 		"window": window,
@@ -3113,20 +3327,32 @@ func _write_state() -> void:
 		# The Cove's OS pid: raise *this* window (the Godot editor is a "Godot" process too).
 		"pid": OS.get_process_id(),
 	}
-	_write_atomic(DIR + "/state.json", JSON.stringify(st))
 	_bd_heading_memo = null
+	if _state_task != -1:
+		if not WorkerThreadPool.is_task_completed(_state_task):
+			return
+		WorkerThreadPool.wait_for_task_completion(_state_task)
+	_state_task = WorkerThreadPool.add_task(func(): _write_atomic(DIR + "/state.json", JSON.stringify(st), true))
 
 
 # Write to a temp file and rename it over the target, so readers (the MCP
 # server polls state.json every second) never see a half-written file.
-func _write_atomic(path: String, txt: String) -> void:
+func _write_atomic(path: String, txt: String, on_worker := false) -> void:
 	var tmp := path + ".tmp"
 	var f := FileAccess.open(tmp, FileAccess.WRITE)
 	if f == null:
 		return
 	f.store_string(txt)
 	f.close()
-	if DirAccess.rename_absolute(ProjectSettings.globalize_path(tmp), ProjectSettings.globalize_path(path)) != OK:
+	# A kept DirAccess: DirAccess.rename_absolute builds a new one per call, and its
+	# constructor's getcwd was most of the cost of writing state.json 5x a second.
+	if on_worker:
+		if _state_rename_dir == null:
+			_state_rename_dir = DirAccess.open(DIR)
+	elif _rename_dir == null:
+		_rename_dir = DirAccess.open(DIR)
+	var rd := _state_rename_dir if on_worker else _rename_dir
+	if rd == null or rd.rename(ProjectSettings.globalize_path(tmp), ProjectSettings.globalize_path(path)) != OK:
 		DirAccess.remove_absolute(ProjectSettings.globalize_path(tmp))
 
 
@@ -4789,6 +5015,11 @@ var _bd_zoom_still := 0.0         # seconds the camera zoom has held still
 var _bd_drawn_area := Rect2()     # world rect the shapes were last drawn over (culling)
 var _bd_dz := 1.0                 # the zoom the shapes are drawn for, rounded up to a power of 2 (detail level)
 var _bd_member_sig := 0
+var _bd_live_sig_last := 0   # what the live/ink layers were last drawn for (see _bd_live_sig)
+var _bd_live_list := []      # the live arrows (_bd_is_live), cached: see _bd_live_shapes
+var _bd_live_at := -100000   # msec the cache was built
+var _rename_dir: DirAccess   # kept for _write_atomic's renames
+var _bd_sess_id := {}        # session -> term id, a checked cache for _bd_term_id
 var _bd_overlay_was_live := true
 # Link bookmarks (see "board: link bookmarks").
 var _bd_unfurl := {}            # url -> metadata from cove_unfurl.py (title, image, favicon, github...)
@@ -4886,12 +5117,16 @@ func _bd_tick(delta: float) -> void:
 		_bd_layer.queue_redraw()
 		_bd_live_layer.queue_redraw()
 		_bd_ink_layer.queue_redraw()
+		_bd_live_sig_last = 0   # re-check next frame
+		_bd_live_at = -100000   # the shapes may have changed: rebuild the live list
 	else:
-		for s in _bd_shapes:
-			if _bd_is_live(s):
-				_bd_live_layer.queue_redraw()
-				_bd_ink_layer.queue_redraw()
-				break
+		# Live arrows (an end on a termling or pinned to text) only need redrawing
+		# when an end moved or the view did, not every frame.
+		var live := _bd_live_sig()
+		if live != _bd_live_sig_last:
+			_bd_live_sig_last = live
+			_bd_live_layer.queue_redraw()
+			_bd_ink_layer.queue_redraw()
 	var overlay_live := not _bd_sel.is_empty() or _bd_g != "" or not _bd_laser.is_empty() \
 		or _bd_bind_hint != "" or not _bd_guides.is_empty()
 	if overlay_live or _bd_overlay_was_live:
@@ -5210,8 +5445,14 @@ func _bd_term_id(key: String) -> int:
 		return int(key.substr(5))
 	if key.begins_with("term:"):
 		var sess := key.substr(5)
+		# Every arrow end looks its termling up here, several times a frame: try the
+		# remembered id first (checked, so a stale entry just falls through).
+		var hit := int(_bd_sess_id.get(sess, -1))
+		if hit != -1 and _groups.has(hit) and str(_sessions.get(hit, "")) == sess:
+			return hit
 		for id in _sessions:
 			if str(_sessions[id]) == sess and _groups.has(id):
+				_bd_sess_id[sess] = id
 				return id
 	return -1
 
@@ -6377,6 +6618,56 @@ func _bd_view_area(margin: float) -> Rect2:
 	return r
 
 
+# What the live/ink layers depend on: the end rects (and anchor state) of every
+# live arrow they'd draw, plus the view they're culled to, snapped to 4% steps
+# (they cull with a 10% margin, so a view that moved less than a step needs no
+# redraw).
+func _bd_live_sig() -> int:
+	var parts := []
+	var area := _bd_view_area(0.1)
+	for s in _bd_live_shapes():
+		if not _bd_shown(s):
+			continue
+		var rects := []
+		for k in ["bind_a", "bind_b"]:
+			var key := str(s.get(k, ""))
+			if key.begins_with("anchor:"):
+				var an = _anc_get(key)
+				parts.append(an)
+				rects.append(null if an == null else Rect2(an["p"], Vector2.ZERO))
+			else:
+				var r = _bd_bind_rect(key)
+				parts.append(r)
+				rects.append(r)
+		# Only arrows the layers would draw: one bobbing along with a termling off
+		# screen changes nothing visible. The curve stays inside its ends and control
+		# point (within 2x the bend of the chord), so this box is a cheap, safe
+		# superset of the drawing's cull test (which computes the whole curve).
+		var cull: Rect2
+		if rects[0] != null and rects[1] != null:
+			cull = (rects[0] as Rect2).merge(rects[1]).grow(absf(float(s.get("bend", 0.0))) * 2.0 + 200.0)
+		else:
+			cull = _bd_bounds(s).grow(48.0)
+		if not area.intersects(cull):
+			parts.resize(parts.size() - 2)
+	var v := _bd_view_area(0.0)
+	var step := maxf(v.size.x, v.size.y) * 0.04
+	parts.append((v.position / step).floor())
+	parts.append((v.size / step).floor())
+	return hash(parts)
+
+
+# The live arrows, without scanning every shape (and its bind strings) up to three
+# times a frame. Rebuilt whenever the board redraws in full (any edit), and at
+# least every half second in case something changed a binding without that.
+func _bd_live_shapes() -> Array:
+	var now := Time.get_ticks_msec()
+	if now - _bd_live_at > 500:
+		_bd_live_at = now
+		_bd_live_list = _bd_shapes.filter(func(s): return _bd_is_live(s))
+	return _bd_live_list
+
+
 # An arrow with an end on a termling: it moves whenever the termling wanders.
 func _bd_is_live(s: Dictionary) -> bool:
 	return str(s["type"]) == "arrow" and (str(s.get("bind_a", "")).begins_with("term") \
@@ -6387,8 +6678,8 @@ func _bd_draw_live() -> void:
 	if _cam == null:
 		return
 	var area := _bd_view_area(0.1)
-	for s in _bd_shapes:
-		if _bd_is_live(s) and not _anc_bound(s) and _bd_shown(s) and area.intersects(_bd_bounds(s).grow(48.0)):
+	for s in _bd_live_shapes():
+		if not _anc_bound(s) and _bd_shown(s) and area.intersects(_bd_bounds(s).grow(48.0)):
 			_bd_draw_shape(_bd_live_layer, s)
 
 
@@ -6396,7 +6687,7 @@ func _bd_draw_ink() -> void:
 	if _cam == null:
 		return
 	var area := _bd_view_area(0.1)
-	for s in _bd_shapes:
+	for s in _bd_live_shapes():   # anchor-bound arrows are all live
 		if _anc_bound(s) and _bd_shown(s) and area.intersects(_bd_bounds(s).grow(48.0)):
 			_bd_draw_shape(_bd_ink_layer, s)
 

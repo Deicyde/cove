@@ -52,6 +52,14 @@ var _dragging := false    # the user is sliding this termling around by the mous
 var _home := Vector2.ZERO  # centre of the idle-wander neighbourhood
 var _home_set := false     # anchored once position is final (first _process tick)
 var _zone = null           # Rect2 the termling is confined to, or null = free wander
+var _shown_agent := ""     # agent the tag/colour were last set for (see _update_indicators)
+var _crew_awake := true    # carriers animating (paused while the whole group is off screen)
+
+# Every group's ground point, gathered once per frame for _separation (a method
+# call per sibling per group was ~5k GDScript calls a frame with 70 termlings).
+static var _sep_frame := -1
+static var _sep_pos := PackedVector2Array()
+static var _sep_ok := PackedByteArray()   # 1 where the child at that index is a group
 
 
 func setup(id: int, path: String, world_bounds: Rect2) -> void:
@@ -216,6 +224,13 @@ func _process(delta: float) -> void:
 	terminal.poll()
 	_layout(delta)
 	_update_indicators(delta)
+	# Off screen, the carriers' walk cycle is invisible: pause it. Movement and
+	# state still run here, so nothing jumps when the group comes back into view.
+	var awake := _group_on_screen()
+	if awake != _crew_awake:
+		_crew_awake = awake
+		_left.set_process(awake)
+		_right.set_process(awake)
 
 	match _state:
 		"lifted":
@@ -286,14 +301,40 @@ func _separation() -> Vector2:
 	if parent == null:
 		return push
 	var min_d: float = terminal.onscreen_size().x * 0.55 + 180.0
-	for sib in parent.get_children():
-		if sib == self or not sib.has_method("get_ground_pos"):
+	var frame := Engine.get_process_frames()
+	if _sep_frame != frame or _sep_pos.size() != parent.get_child_count():
+		_sep_frame = frame
+		var kids := parent.get_children()
+		_sep_pos.resize(kids.size())
+		_sep_ok.resize(kids.size())
+		for i in kids.size():
+			var ok: bool = kids[i].has_method("get_ground_pos")
+			_sep_ok[i] = 1 if ok else 0
+			_sep_pos[i] = kids[i].get_ground_pos() if ok else Vector2.ZERO
+	var me := get_index()
+	var min_d2 := min_d * min_d
+	for i in _sep_pos.size():
+		if i == me or _sep_ok[i] == 0:
 			continue
-		var d: Vector2 = position - sib.get_ground_pos()
-		var dist := d.length()
-		if dist > 0.5 and dist < min_d:
+		var d: Vector2 = position - _sep_pos[i]
+		var d2 := d.length_squared()
+		if d2 > 0.25 and d2 < min_d2:
+			var dist := sqrt(d2)
 			push += (d / dist) * (min_d - dist) * 2.8
 	return push.limit_length(SPEED * 2.5)
+
+
+# The whole group (terminal, carriers, tag, "!") against the viewport, with a
+# margin, in screen space.
+func _group_on_screen() -> bool:
+	var ts: Vector2 = terminal.onscreen_size()
+	if ts.x <= 0:
+		return true
+	var sep := ts.x * 0.5 + 24.0 + 80.0
+	var top := -_carry_h() - ts.y * 0.5 - 80.0
+	var local := Rect2(-sep, top, sep * 2.0, -top + 60.0)
+	var r: Rect2 = get_global_transform_with_canvas() * local
+	return get_viewport_rect().grow(64.0).intersects(r)
 
 
 func _layout(_delta: float) -> void:
@@ -302,30 +343,46 @@ func _layout(_delta: float) -> void:
 		return
 	var sep := ts.x * 0.5 + 24.0
 	var carry_h := _carry_h()
-	_left.position = Vector2(-sep, 0)
-	_right.position = Vector2(sep, 0)
+	# (Each position write pushes a transform to the renderer even when unchanged,
+	# so only write what moved.)
+	_set_pos(_left, Vector2(-sep, 0))
+	_set_pos(_right, Vector2(sep, 0))
 	var bob := 0.0
 	if _state == "wander" and _recover <= 0.0 and (_target - position).length() > 6.0 and _goal == null:
 		bob = sin(_t * 9.0) * 3.0
-	terminal.position = Vector2(0, -carry_h + bob)
+	_set_pos(terminal, Vector2(0, -carry_h + bob))
 	# tag under the terminal, bang above it
-	_tag.position = Vector2(-ts.x * 0.5, 6.0)
-	_bang.position = Vector2(-8, -carry_h - ts.y * 0.5 - 40.0)
+	_set_pos(_tag, Vector2(-ts.x * 0.5, 6.0))
+	_set_pos(_bang, Vector2(-8, -carry_h - ts.y * 0.5 - 40.0))
+
+
+static func _set_pos(n, p: Vector2) -> void:   # a Node2D or a Control (the tag)
+	if n.position != p:
+		n.position = p
 
 
 func _update_indicators(delta: float) -> void:
 	var col: Color = AGENT_COLORS.get(_agent, AGENT_COLORS["shell"])
-	# label text
-	_tag.text = _agent if _agent != "shell" else ""
-	_tag.add_theme_color_override("font_color", col.lightened(0.3))
+	# label text + colour, only when the agent changes: a theme override re-sets
+	# (and redraws) the label every time, even with the same colour.
+	if _agent != _shown_agent:
+		_shown_agent = _agent
+		_tag.text = _agent if _agent != "shell" else ""
+		_tag.add_theme_color_override("font_color", col.lightened(0.3))
 	# aura: coloured glow behind the terminal, pulsing while busy. Only tint the
 	# RGB — keep the lerped alpha so it fully fades out when the agent isn't busy
 	# (otherwise it reads as a permanent grey shadow behind every terminal).
 	var pulse := 0.5 + 0.35 * sin(_t * 4.0)
 	var target_a := (pulse if _busy else 0.0)
 	var a: float = lerp(_aura.modulate.a, target_a * 0.5, 6.0 * delta)
-	_aura.modulate = Color(col.r, col.g, col.b, a)
-	_aura.position.y = -_carry_h()
+	if target_a == 0.0 and a < 0.002:
+		a = 0.0   # settle, instead of creeping toward 0 (and redrawing) forever
+	var m := Color(col.r, col.g, col.b, a)
+	if _aura.modulate != m:
+		_aura.modulate = m
+	var ay := -_carry_h()
+	if _aura.position.y != ay:
+		_aura.position.y = ay
 	# attention: bouncing "!" + we let Cove pulse the border via focus
 	_bang.visible = _attention
 	if _attention:

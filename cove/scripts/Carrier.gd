@@ -61,8 +61,10 @@ func set_airborne(airborne: bool) -> void:
 
 func _process(delta: float) -> void:
 	_t += delta
-	_body.flip_h = _facing < 0
-	_face.flip_h = _facing < 0
+	var flip := _facing < 0
+	if _body.flip_h != flip:
+		_body.flip_h = flip
+		_face.flip_h = flip
 	match _state:
 		"walk":
 			# 2-frame walk + gentle bob
