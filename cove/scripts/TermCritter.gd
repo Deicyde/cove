@@ -215,6 +215,11 @@ func poll() -> void:
 
 
 # Is any of the terminal inside the window (with a margin)?
+# How long this termling has been well off screen (0 = it's near or on screen).
+func far_for_ms() -> int:
+	return 0 if _far_since == 0 else Time.get_ticks_msec() - _far_since
+
+
 func _update_suspend() -> void:
 	if not _suspend_synced:
 		_suspend_synced = true

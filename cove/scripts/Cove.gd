@@ -2437,6 +2437,8 @@ func _apply_agent_info() -> void:
 
 const BG_IDLE_S := 60.0       # quiet this long (by the activity hook) first
 const BG_LEGACY_S := 300.0    # ...or this long for agents older than the hook
+const BG_FAR_MS := 60000      # and off screen this long: termlings wandering at the
+                              # edge of the view would otherwise flip in and out
 
 
 func _apply_bg_policy() -> void:
@@ -2453,7 +2455,7 @@ func _apply_bg_policy() -> void:
 		# Only while its termling is also suspended (well off screen): a TUI in
 		# Darwin background barely repaints, so one you can see must stay normal.
 		if str(info.get("agent", "")) in ["claude", "codex", "opencode"] and id != _focused_id \
-				and _groups[id].terminal._suspended \
+				and _groups[id].terminal.far_for_ms() > BG_FAR_MS \
 				and str(info.get("remote_host", "")) == "" and not bool(info.get("tool", false)):
 			var act: Array = info.get("act", [])
 			if act.size() >= 3 and str(act[0]) == "idle":
@@ -2467,7 +2469,7 @@ func _apply_bg_policy() -> void:
 				var t = _groups[id].terminal
 				var sess := str(info.get("session", ""))
 				if sess != "" and t.rows > 2 and t.cols > 0:
-					OS.create_process("/usr/bin/python3", [ProjectSettings.globalize_path("res://abduco-repaint.py"),
+					_create_process("/usr/bin/python3", [ProjectSettings.globalize_path("res://abduco-repaint.py"),
 						sess, str(t.rows), str(t.cols)])
 	for pid in _bg_pids.keys():
 		if not seen.has(pid):
@@ -2478,7 +2480,9 @@ func _apply_bg_policy() -> void:
 
 
 func _set_bg(pid: int, on: bool) -> void:
-	OS.create_process("/usr/sbin/taskpolicy", ["-b" if on else "-B", "-p", str(pid)])
+	# (_create_process: reaped. Unreaped, these piled up as ~3000 zombies in an
+	# hour and hit the per-user process limit, so nothing could fork.)
+	_create_process("/usr/sbin/taskpolicy", ["-b" if on else "-B", "-p", str(pid)])
 	if on:
 		_bg_pids[pid] = true
 	else:
@@ -2495,7 +2499,7 @@ func _bg_restore_all() -> void:
 		if typeof(j) == TYPE_ARRAY:
 			pids.append_array(j)
 	for pid in pids:
-		OS.create_process("/usr/sbin/taskpolicy", ["-B", "-p", str(int(pid))])   # (non-blocking)
+		_create_process("/usr/sbin/taskpolicy", ["-B", "-p", str(int(pid))])   # (non-blocking, reaped)
 	_bg_pids.clear()
 	DirAccess.remove_absolute(DIR + "/bg-pids.json")
 
