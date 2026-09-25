@@ -186,15 +186,30 @@ else
 fi
 COVE_KITTY_PID=$!
 
-# The sessions kitty has a reattach window for, one per line: the argument after
-# cove-reattach.sh in a cmdline (ls is indented JSON, one element per line), so
-# a title or user var naming a session doesn't count. Prints nothing, and never
-# fails, when ls fails or has none yet: under load ls can time out, and under
-# `set -e` that mustn't abort the reload. (awk, not python: this is polled.)
+# The sessions kitty has a window for, one per line, read from each window's own
+# cmdline (ls is indented JSON, one element per line). kitty reports the live
+# argv, so that's `cove-reattach.sh cove-N` only until the script execs, then
+# `abduco -a cove-N` (or `-A`, for a cove-shell.sh window). Titles, user vars
+# and foreground_processes don't count: a shell where someone ran abduco by hand
+# isn't that session's window. Prints nothing, and never fails, when ls fails or
+# has none yet: under load ls can time out, and under `set -e` that mustn't
+# abort the reload. (awk, not python: this is polled.)
 kitty_sessions() {
     { "$KITTEN" @ --to "$SOCK" ls 2>/dev/null || true; } | awk '
-        after && match($0, /^[[:space:]]*"cove-[0-9]+"/) { s = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]*"/, "", s); sub(/"$/, "", s); print s }
-        { after = ($0 ~ /\/cove-reattach\.sh",[[:space:]]*$/) }
+        function indent(s) { match(s, /^[[:space:]]*/); return RLENGTH }
+        BEGIN { skip = -1 }
+        skip >= 0 { if (indent($0) == skip && $0 ~ /^[[:space:]]*\]/) skip = -1; next }
+        /"foreground_processes": \[[[:space:]]*$/ { skip = indent($0); next }
+        /^[[:space:]]*"cmdline": \[[[:space:]]*$/ { incmd = 1; n = 0; next }
+        incmd && /^[[:space:]]*\]/ {
+            incmd = 0
+            for (i = 1; i < n; i++) {
+                if (a[i] ~ /\/cove-reattach\.sh$/ && a[i+1] ~ /^cove-[0-9]+$/) print a[i+1]
+                if (a[i] ~ /(^|\/)abduco$/ && a[i+1] ~ /^-[aA]$/ && a[i+2] ~ /^cove-[0-9]+$/) print a[i+2]
+            }
+            next
+        }
+        incmd { s = $0; sub(/^[[:space:]]*"/, "", s); sub(/",?[[:space:]]*$/, "", s); a[++n] = s }
     ' | sort -u
 }
 

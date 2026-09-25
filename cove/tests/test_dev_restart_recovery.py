@@ -154,7 +154,7 @@ if os.environ['NEW_KITTY_BROKEN'] != '1':
     Path(os.environ['KITTY_READY']).touch()
     # Its first window: the session's, unless that died (abduco -a fails).
     if os.environ['FIRST_SESSION_DEAD'] != '1':
-        (Path(os.environ['LANDED']) / sys.argv[-1]).touch()
+        (Path(os.environ['LANDED']) / sys.argv[-1]).write_text('pre-exec')
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 # Never outlive the test, even if the script under test was SIGKILLed
 # before it could stop us.
@@ -166,6 +166,27 @@ while not Path(os.environ['GODOT_STARTED']).exists():
 Path(os.environ['KITTY_EXITED']).touch()
 ''',
             )
+            # kitty's ls: indented JSON, one cmdline element per line, and a
+            # window's cmdline is its live argv. A landed window shows
+            # `cove-reattach.sh cove-N` until the script execs, then
+            # `abduco -a cove-N`. The first window (kitty's own) is caught
+            # before the exec, the launched ones after it. A decoy first: its
+            # title, user vars and foreground process (someone ran abduco in
+            # its shell) name cove-111, so it mustn't count as that window.
+            fake_ls = root / 'fake-ls.py'
+            fake_ls.write_text(f'''import json, os
+from pathlib import Path
+abduco, reattach = {str(abduco)!r}, {str(reattach)!r}
+windows = [{{"cmdline": ["/bin/zsh"], "title": "cove-111", "user_vars": {{"s": "cove-111"}},
+            "foreground_processes": [{{"cmdline": [abduco, "-a", "cove-111"]}}]}}]
+for s in sorted(os.listdir(os.environ["LANDED"])):
+    if (Path(os.environ["LANDED"]) / s).read_text() == "pre-exec":
+        cmd = ["/bin/sh", reattach, s]
+    else:
+        cmd = [abduco, "-a", s]
+    windows.append({{"cmdline": cmd, "title": "zsh", "foreground_processes": [{{"cmdline": [abduco, "-a", s]}}]}})
+print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=True))
+''')
             self.write_executable(
                 kitten,
                 '#!/bin/sh\n'
@@ -177,12 +198,7 @@ Path(os.environ['KITTY_EXITED']).touch()
                 # Under load, right after the ready check (call 1), ls can fail
                 # or come back without the reattach windows yet.
                 '    if [ "$LS_BLINKS" = 1 ]; then case "$n" in 2) exit 1 ;; 3) echo "[]"; exit 0 ;; esac; fi\n'
-                # Indented like kitty's, one cmdline element per line. A decoy
-                # first: only its title and user vars name a session, so it
-                # mustn't count as that session's window.
-                '    printf \'[{"tabs": [{"windows": [\\n{"cmdline": [\\n"/bin/zsh"\\n],\\n"title": "cove-111",\\n"user_vars": {\\n"s": "cove-111"\\n}}\'\n'
-                '    for s in $(ls "$LANDED"); do printf \',\\n{"cmdline": [\\n  "%s",\\n  "%s"\\n],\\n"title": "zsh"}\' "$REATTACH" "$s"; done\n'
-                '    printf "\\n]}]}]\\n"\n'
+                f'    exec "{sys.executable}" "{fake_ls}"\n'
                 '    ;;\n'
                 'get-text) printf "screen of %s\\n" "$6" ;;\n'
                 'launch)\n'
@@ -287,7 +303,9 @@ Path(os.environ['KITTY_EXITED']).touch()
                     old_kitty.kill()
                     reaper.join(timeout=2)
 
-            deadline = time.monotonic() + 2
+            # Generous: the fake kitty is a python process, slow to notice
+            # Godot under heavy load.
+            deadline = time.monotonic() + 15
             while not kitty_exited.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             # Screens are saved from the old kitty before it's stopped.
