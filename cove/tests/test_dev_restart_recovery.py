@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -96,6 +97,93 @@ class DevRestartRecoveryTest(unittest.TestCase):
                     f'GODOT={godot}',
                 ],
             )
+
+    def test_dev_cleans_up_if_kitty_never_becomes_ready(self) -> None:
+        with tempfile.TemporaryDirectory(prefix='cove-dev-test-') as tdir:
+            root = Path(tdir)
+            repo = root / 'repo'
+            runtime = root / 'runtime' / 'cove'
+            socket = Path(f'{runtime}-kitty')
+            fake_bin = root / 'bin'
+            launcher = self.copy_script('dev.sh', repo, runtime)
+
+            kitty = repo / 'kitty' / 'launcher' / 'kitty'
+            kitten = repo / 'kitty' / 'launcher' / 'kitty.app' / 'Contents' / 'MacOS' / 'kitten'
+            kitty_pid = root / 'kitty-pid'
+            self.write_executable(
+                kitty,
+                f'''#!{sys.executable}
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+runtime = Path(os.environ['RUNTIME'])
+runtime.mkdir(parents=True, exist_ok=True)
+(runtime / 'kitty.pid').write_text('stale\n')
+(runtime / 'dev-env').write_text('stale\n')
+Path(os.environ['SOCKET']).write_text('stale\n')
+Path(os.environ['KITTY_PID']).write_text(str(os.getpid()))
+def stop(*_):
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+while True:
+    time.sleep(0.01)
+''',
+            )
+            self.write_executable(kitten, '#!/bin/sh\nexit 1\n')
+            self.write_executable(
+                repo / 'cove' / 'bin' / 'abduco',
+                '#!/bin/sh\nprintf "%s\\n" "Active sessions (on host test)"\n',
+            )
+            unexpected = root / 'unexpected-start'
+            godot = fake_bin / 'godot'
+            self.write_executable(godot, f'#!/bin/sh\n: > "{unexpected}"\n')
+            self.write_executable(repo / 'cove' / 'cove-remote-start.sh', f'#!/bin/sh\n: > "{unexpected}"\n')
+            self.write_executable(fake_bin / 'pkill', '#!/bin/sh\nexit 1\n')
+            self.write_executable(fake_bin / 'ps', '#!/bin/sh\nexit 0\n')
+            self.write_executable(fake_bin / 'sleep', '#!/bin/sh\nexec /bin/sleep 0.01\n')
+            (repo / 'cove' / '.godot').mkdir(parents=True)
+            (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('')
+            runtime.parent.mkdir(parents=True)
+
+            env = {
+                'GODOT': str(godot),
+                'HOME': str(root / 'home'),
+                'KITTY_PID': str(kitty_pid),
+                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'RUNTIME': str(runtime),
+                'SHELL': '/bin/zsh',
+                'SOCKET': str(socket),
+            }
+            kitty_still_running = False
+            try:
+                result = subprocess.run(
+                    ['/bin/bash', str(launcher)], cwd=repo, env=env,
+                    text=True, capture_output=True, timeout=30, check=False,
+                )
+            finally:
+                if kitty_pid.exists():
+                    try:
+                        os.kill(int(kitty_pid.read_text()), 0)
+                        kitty_still_running = True
+                    except ProcessLookupError:
+                        pass
+                if kitty_still_running:
+                    subprocess.run(
+                        ['/bin/kill', '-KILL', kitty_pid.read_text()],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('kitty did not become ready', result.stderr)
+            self.assertFalse(kitty_still_running)
+            self.assertFalse(socket.exists())
+            self.assertFalse((runtime / 'kitty.pid').exists())
+            self.assertFalse((runtime / 'dev-env').exists())
+            self.assertFalse(unexpected.exists())
 
     def exercise_reload(
         self, *, launch_times_out: bool = False, stays_attached: bool = False,

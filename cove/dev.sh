@@ -79,7 +79,34 @@ KITTY_COVE=1 KITTY_COVE_DIR="$DIR" nohup "$KITTY" --title cove \
     "$WRAPPER" 9>&- >/tmp/cove-kitty.log 2>&1 &
 COVE_KITTY_PID=$!
 
-for _ in $(seq 1 60); do ls "$DIR"/term-*.rgba >/dev/null 2>&1 && break; sleep 0.1; done
+cleanup_cold_start() {
+    kill "$COVE_KITTY_PID" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        kill -0 "$COVE_KITTY_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -9 "$COVE_KITTY_PID" 2>/dev/null || true
+    wait "$COVE_KITTY_PID" 2>/dev/null || true
+    rm -f /tmp/cove-kitty "$DIR/kitty.pid" "$DIR/dev-env"
+}
+trap cleanup_cold_start EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+kitty_ready=false
+for _ in $(seq 1 80); do
+    if kill -0 "$COVE_KITTY_PID" 2>/dev/null \
+            && "$KITTEN" @ --to "$SOCK" ls >/dev/null 2>&1; then
+        kitty_ready=true
+        break
+    fi
+    sleep 0.1
+done
+if [ "$kitty_ready" != true ]; then
+    echo "kitty did not become ready at $SOCK" >&2
+    exit 1
+fi
 # Record the kitty pid so reload.sh/stop.sh find it without pgrep (which can't
 # read kitty's args on macOS).
 echo "$COVE_KITTY_PID" > "$DIR/kitty.pid"
@@ -96,6 +123,7 @@ EOF
 
 COVE_KITTEN="$KITTEN" COVE_KITTY_SOCKET="$SOCK" \
     nohup "$GODOT" --path "$APP" 9>&- >/tmp/cove-godot.log 2>&1 &
+trap - EXIT HUP INT TERM
 exec 9>&-
 echo "Cove dev up (kitty + godot). Edit scripts, then: cove/reload.sh"
 echo "Quit everything with: cove/stop.sh"
