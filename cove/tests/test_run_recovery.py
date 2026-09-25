@@ -18,8 +18,15 @@ class RunRecoveryTest(unittest.TestCase):
         path.write_text(body)
         path.chmod(0o755)
 
+    def spawn(self, argv: list[str], env: dict[str, str]) -> None:
+        proc = subprocess.Popen(argv, env=env)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+
     def run_launcher(
-        self, sessions: list[str], *, lock_held: bool = False,
+        self, sessions: list[str], *, attached: list[str] = (),
+        lock_held: bool = False, kitty_alive: bool = False,
+        godot_alive: bool = False, stuck_kitty: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp = tempfile.TemporaryDirectory(prefix='cove-run-test-')
         self.addCleanup(temp.cleanup)
@@ -35,8 +42,9 @@ class RunRecoveryTest(unittest.TestCase):
         (repo / 'cove' / '.godot').mkdir(parents=True)
         (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('')
 
+        kitty = repo / 'kitty' / 'launcher' / 'kitty'
         self.write_executable(
-            repo / 'kitty' / 'launcher' / 'kitty',
+            kitty,
             '#!/bin/sh\n'
             'printf "%s\\n" "$@" > "$KITTY_ARGS"\n'
             'mkdir -p "$KITTY_COVE_DIR"\n'
@@ -53,9 +61,11 @@ class RunRecoveryTest(unittest.TestCase):
             'resize-os-window) printf "%s\\n" "$*" >> "$RESIZE_ARGS" ;;\n'
             'esac\n',
         )
+        # Once kitty is up, its reattached clients show as attached ("*").
         self.write_executable(
             repo / 'cove' / 'bin' / 'abduco',
-            '#!/bin/sh\ncat "$ABDUCO_LIST"\n',
+            '#!/bin/sh\n'
+            'if [ -f "$KITTY_READY" ]; then sed "s/^  /* /" "$ABDUCO_LIST"; else cat "$ABDUCO_LIST"; fi\n',
         )
         self.write_executable(repo / 'cove' / 'cove-shell.sh', '#!/bin/sh\nexit 0\n')
         self.write_executable(repo / 'cove' / 'cove-remote-start.sh', '#!/bin/sh\nexit 0\n')
@@ -66,9 +76,12 @@ class RunRecoveryTest(unittest.TestCase):
         (runtime / 'state.json').write_text('saved-layout\n')
         (runtime / 'term-7.rgba').write_text('stale-kitty-frame\n')
         (runtime / 'term-1000000.rgba').write_text('app-frame\n')
+        for stale in ('kitty.pid', 'dev-env', 'events.jsonl'):
+            (runtime / stale).write_text('stale\n')
         socket.write_text('stale-socket\n')
         listing = ['Active sessions (on host test)']
         listing.extend(f'  Thu 2026-09-24 00:00:00 {session}' for session in sessions)
+        listing.extend(f'* Thu 2026-09-24 00:00:00 {session}' for session in attached)
         listing.append('+ Thu 2026-09-24 00:00:00 cove-333')
         (root / 'abduco-list').write_text('\n'.join(listing) + '\n')
 
@@ -84,6 +97,18 @@ class RunRecoveryTest(unittest.TestCase):
             'RESIZE_ARGS': str(root / 'resize-args'),
             'SHELL': '/bin/zsh',
         }
+        if kitty_alive:
+            (root / 'kitty-ready').write_text('')
+        if godot_alive:
+            live_godot = root / 'live' / 'godot'
+            self.write_executable(live_godot, '#!/bin/sh\nwhile :; do sleep 0.1; done\n')
+            self.spawn(['/bin/sh', str(live_godot), '--path', str(repo / 'cove')], env)
+        if stuck_kitty:
+            # Alive but never serves remote control.
+            self.spawn(['/bin/sh', str(kitty), '--title', 'cove'], {
+                **env, 'KITTY_ARGS': str(root / 'stuck-args'),
+                'KITTY_READY': str(root / 'stuck-ready'), 'KITTY_COVE_DIR': str(root / 'stuck'),
+            })
         lock_file = None
         if lock_held:
             lock_file = Path(f'{runtime}-launch.lock').open('w')
@@ -91,7 +116,7 @@ class RunRecoveryTest(unittest.TestCase):
         try:
             result = subprocess.run(
                 ['/bin/bash', str(launcher)], cwd=repo, env=env,
-                text=True, capture_output=True, timeout=10, check=False,
+                text=True, capture_output=True, timeout=30, check=False,
             )
         finally:
             if lock_file is not None:
@@ -124,6 +149,8 @@ class RunRecoveryTest(unittest.TestCase):
         self.assertEqual((runtime / 'state.json').read_text(), 'saved-layout\n')
         self.assertFalse((runtime / 'term-7.rgba').exists())
         self.assertTrue((runtime / 'term-1000000.rgba').exists())
+        for stale in ('kitty.pid', 'dev-env', 'events.jsonl'):
+            self.assertFalse((runtime / stale).exists(), stale)
         self.assertEqual(
             (root / 'kitty-args').read_text().splitlines()[-3:],
             [str(root / 'repo/cove/bin/abduco'), '-a', 'cove-111'],
@@ -137,6 +164,54 @@ class RunRecoveryTest(unittest.TestCase):
                 f'@ --to unix:{root / "runtime/cove-kitty"} resize-os-window --match all --unit cells --incremental --width=-1',
             ],
         )
+
+    def test_sessions_attached_elsewhere_are_skipped(self) -> None:
+        result, root = self.run_launcher(['cove-111'], attached=['cove-444'])
+        runtime = root / 'runtime' / 'cove'
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('skipping 1 session(s) attached elsewhere: cove-444', result.stderr)
+        self.assertEqual(
+            (root / 'kitty-args').read_text().splitlines()[-3:],
+            [str(root / 'repo/cove/bin/abduco'), '-a', 'cove-111'],
+        )
+        self.assertFalse((root / 'launch-args').exists())
+        self.assertEqual((runtime / 'state.json').read_text(), 'saved-layout\n')
+
+    def test_only_attached_sessions_keeps_layout(self) -> None:
+        result, root = self.run_launcher([], attached=['cove-444'])
+        runtime = root / 'runtime' / 'cove'
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((root / 'kitty-args').read_text().splitlines()[-1], str(root / 'repo/cove/cove-shell.sh'))
+        self.assertEqual((runtime / 'state.json').read_text(), 'saved-layout\n')
+        self.assertFalse((runtime / 'kitty.pid').exists())
+
+    def test_live_kitty_without_godot_relaunches_godot(self) -> None:
+        result, root = self.run_launcher(['cove-111'], kitty_alive=True)
+        runtime = root / 'runtime' / 'cove'
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('relaunching Godot', result.stdout)
+        self.assertTrue((root / 'godot-done').exists())
+        self.assertFalse((root / 'kitty-args').exists())
+        self.assertEqual((runtime / 'kitty.pid').read_text(), 'stale\n')
+
+    def test_live_kitty_and_godot_is_rejected(self) -> None:
+        result, root = self.run_launcher([], kitty_alive=True, godot_alive=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Cove is already running', result.stderr)
+        self.assertFalse((root / 'godot-done').exists())
+
+    def test_unresponsive_kitty_is_rejected(self) -> None:
+        result, root = self.run_launcher(['cove-111'], stuck_kitty=True)
+        runtime = root / 'runtime' / 'cove'
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not answering', result.stderr)
+        self.assertFalse((root / 'kitty-args').exists())
+        self.assertEqual((runtime / 'kitty.pid').read_text(), 'stale\n')
 
 
 if __name__ == '__main__':
