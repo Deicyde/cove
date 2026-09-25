@@ -63,6 +63,8 @@ using this option means that you will not be notified of failures.
         return {'action': ' '.join(args), 'self': opts.self, 'match_window': opts.match}
 
     def response_from_kitty(self, boss: Boss, window: Window | None, payload_get: PayloadGetType) -> ResponseType:
+        # kitten @ action --match sends match_window, which takes precedence
+        # over --self and over a legacy raw 'match' field.
         if payload_get('match_window'):
             w = self.windows_for_payload(boss, window, payload_get)
         else:

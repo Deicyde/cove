@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# License: GPLv3 Copyright: 2026 Kovid Goyal <kovid at kovidgoyal.net>
+# License: GPLv3 Copyright: 2026 Jack McCarthy
 
 from types import SimpleNamespace
 
