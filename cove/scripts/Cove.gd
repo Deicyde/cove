@@ -356,7 +356,8 @@ func _build_world() -> void:
 	if _saved.has("cam"):
 		var c = _saved["cam"]
 		_cam.position = Vector2(c[0], c[1])
-		_cam.zoom = Vector2(c[2], c[2])
+		var z := clampf(float(c[2]), MIN_ZOOM, PRESENT_MAX_ZOOM)
+		_cam.zoom = Vector2(z, z)
 	add_child(_cam)
 	_cam.make_current()
 
@@ -456,15 +457,14 @@ func _process(delta: float) -> void:
 	elif _present_id != -1:
 		if _groups.has(_present_id):
 			_present_zoom = _fit_zoom_for(_groups[_present_id])
-			var z := lerpf(_cam.zoom.x, _present_zoom, 8.0 * delta)
-			_cam.zoom = Vector2(z, z)
+			_ease_zoom(_present_zoom, delta)
 		else:
 			_leave_present()   # the presented termling went away
 	elif _present_leaving:
-		var z := lerpf(_cam.zoom.x, _present_prev_zoom, 8.0 * delta)
-		_cam.zoom = Vector2(z, z)
-		if absf(z - _present_prev_zoom) < 0.003:
-			_cam.zoom = Vector2(_present_prev_zoom, _present_prev_zoom)
+		var goal := maxf(MIN_ZOOM, _present_prev_zoom)
+		_ease_zoom(goal, delta)
+		if absf(_cam.zoom.x - goal) < 0.003:
+			_cam.zoom = Vector2(goal, goal)
 			_present_leaving = false
 	elif _zoom_goal > 0.0:
 		_ease_zoom(_zoom_goal, delta)
@@ -1691,7 +1691,8 @@ func _attend(id: int, dismiss := true) -> void:
 
 
 func _ease_zoom(goal: float, delta: float) -> void:
-	var z := lerpf(_cam.zoom.x, goal, 8.0 * delta)
+	var weight := clampf(8.0 * delta, 0.0, 1.0)
+	var z := maxf(MIN_ZOOM, lerpf(_cam.zoom.x, goal, weight))
 	_cam.zoom = Vector2(z, z)
 
 
