@@ -79,8 +79,11 @@ def me():
         for t in terms:
             if t.get("session") == sess:
                 return t
+    # Our kitty window id, but only if it's from the kitty running now (kitty
+    # sets KITTY_PID in each window's env): after a restart the id we were born
+    # with belongs to another termling, and acting as it misroutes everything.
     pane = os.environ.get("KITTY_WINDOW_ID", "")
-    if pane.isdigit():
+    if pane.isdigit() and os.environ.get("KITTY_PID", "") == _kitty_pid() != "":
         for t in terms:
             if t.get("pane_id") == int(pane):
                 return t
@@ -183,6 +186,20 @@ def _dev_env():
     return env
 
 
+def _kitty_pid():
+    """The running Cove kitty's pid. Kitty window ids are only meaningful within
+    one kitty: a restart renumbers every window, so an id recorded under an
+    earlier kitty now names some other termling."""
+    pid = _dev_env().get("COVE_KITTY_PID", "")
+    if not pid:
+        try:
+            with open(os.path.join(DIR, "kitty.pid")) as f:
+                pid = f.read().strip()
+        except OSError:
+            pass
+    return pid
+
+
 def _kitten(*args, timeout=15):
     env = _dev_env()
     kitten = env.get("COVE_KITTEN") or os.path.join(
@@ -227,7 +244,10 @@ def _terms(lin=None):
     terms = read_state().get("terminals", [])
     if any(not t.get("session") for t in terms):
         lin = lin if lin is not None else read_lineage()
-        by_pane = {r.get("pane"): s for s, r in lin.items() if r.get("pane") and not r.get("dead")}
+        # Only panes recorded under the running kitty: a restart renumbers them.
+        kp = _kitty_pid()
+        by_pane = {r.get("pane"): s for s, r in lin.items()
+                   if r.get("pane") and not r.get("dead") and kp and str(r.get("kitty", "")) == kp}
         for t in terms:
             if not t.get("session") and t.get("pane_id") in by_pane:
                 t["session"] = by_pane[t["pane_id"]]
@@ -866,7 +886,7 @@ def call_tool(name, args):
                     "name": str(args["name"])})
         lin = read_lineage()
         lin[child] = {"parent": sess, "name": str(args["name"]), "created": int(time.time()), "seen": 0,
-                      "pane": pane}
+                      "pane": pane, "kitty": _kitty_pid()}
         if own_frame:
             lin[child]["frame"] = own_frame   # made for it: kill removes it too
         write_lineage(lin)
@@ -929,7 +949,7 @@ def call_tool(name, args):
         if text or not args.get("keys"):
             _type(c, text, bool(args.get("enter", True)))
         _mark_sent(c["session"])
-        return {"ok": True, "to": c["id"]}
+        return {"ok": True, "to": c.get("session") or c["id"], "id": c["id"]}   # session first: ids change on kitty restarts
     if name == "read":
         c = _term(args["id"])
         if c is None:
