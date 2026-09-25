@@ -56,8 +56,8 @@ fi
 
 pkill -if 'godot --path' 2>/dev/null || true
 # Kill any previous cove-kitty. macOS `pkill -f` can't read kitty's args, so
-# match via the pid file dev.sh wrote + a `ps` scan on the launcher + title.
-[ -f "$DIR/kitty.pid" ] && kill "$(cat "$DIR/kitty.pid" 2>/dev/null)" 2>/dev/null || true
+# match via a `ps` scan on the launcher + title (which also finds the pid in
+# kitty.pid, when that's still a Cove kitty rather than a reused pid).
 for _p in $(ps -Ao pid=,command= | awk '/[l]auncher\/kitty --title cove/ {print $1}'); do
     kill "$_p" 2>/dev/null || true
 done

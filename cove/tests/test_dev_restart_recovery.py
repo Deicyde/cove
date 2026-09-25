@@ -55,6 +55,11 @@ class DevRestartRecoveryTest(unittest.TestCase):
                 f'#!/bin/sh\nprintf "%s\\n" "$COVE_LAUNCH_LOCK_HELD" > "{reload_called}"\n',
             )
             self.write_executable(repo / 'cove' / 'cove-remote-start.sh', f'#!/bin/sh\n: > "{remote_called}"\n')
+            # If the handoff ever regresses, dev.sh falls through to stopping
+            # "the" Cove: keep that away from the real one running this test.
+            stopped = root / 'stop-attempted'
+            for tool in ('pkill', 'ps'):
+                self.write_executable(fake_bin / tool, f'#!/bin/sh\n: > "{stopped}"\nexit 1\n')
             (repo / 'cove' / '.godot').mkdir(parents=True)
             (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('')
 
@@ -80,6 +85,7 @@ class DevRestartRecoveryTest(unittest.TestCase):
             self.assertEqual(reload_called.read_text(), '1\n')
             self.assertTrue(remote_called.exists())
             self.assertFalse(unexpected.exists())
+            self.assertFalse(stopped.exists())
             self.assertEqual(state.read_text(), 'saved-layout\n')
             self.assertEqual(
                 (runtime / 'dev-env').read_text().splitlines(),
@@ -93,7 +99,8 @@ class DevRestartRecoveryTest(unittest.TestCase):
 
     def exercise_reload(
         self, *, launch_times_out: bool = False, stays_attached: bool = False,
-        kitty_broken: bool = False,
+        kitty_broken: bool = False, first_session_dead: bool = False,
+        stale_pid_file: bool = False, listing_fails_after_stop: bool = False,
     ) -> None:
         with tempfile.TemporaryDirectory(prefix='cove-reload-test-') as tdir:
             root = Path(tdir)
@@ -112,7 +119,8 @@ class DevRestartRecoveryTest(unittest.TestCase):
             counter = root / 'abduco-count'
             attached = root / 'abduco-attached'
             detached = root / 'abduco-detached'
-            second_attached = root / 'second-attached'
+            landed = root / 'landed'   # one file per session with a window
+            landed.mkdir()
             godot_started = root / 'godot-started'
             kitty_ready = root / 'kitty-ready'
             kitty_exited = root / 'kitty-exited'
@@ -126,6 +134,7 @@ class DevRestartRecoveryTest(unittest.TestCase):
                 'if [ "$#" -ne 0 ]; then exit 0; fi\n'
                 'count=$(cat "$ABDUCO_COUNT" 2>/dev/null || echo 0)\n'
                 'count=$((count + 1)); printf "%s\\n" "$count" > "$ABDUCO_COUNT"\n'
+                'if [ "$ABDUCO_FAIL_AFTER" -ne 0 ] && [ "$count" -gt "$ABDUCO_FAIL_AFTER" ]; then exit 1; fi\n'
                 'if [ "$count" -le 3 ]; then cat "$ABDUCO_ATTACHED"; else cat "$ABDUCO_DETACHED"; fi\n',
             )
             self.write_executable(
@@ -137,11 +146,20 @@ import sys
 import time
 from pathlib import Path
 
-Path(os.environ['KITTY_ARGS']).write_text('\\n'.join(sys.argv[1:]) + '\\n')
+args = Path(os.environ['KITTY_ARGS'])
+args.write_text('\\n'.join(sys.argv[1:]) + '\\n')
 if os.environ['NEW_KITTY_BROKEN'] != '1':
     Path(os.environ['KITTY_READY']).touch()
+    # Its first window: the session's, unless that died (abduco -a fails).
+    if os.environ['FIRST_SESSION_DEAD'] != '1':
+        (Path(os.environ['LANDED']) / sys.argv[-1]).touch()
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+# Never outlive the test, even if the script under test was SIGKILLed
+# before it could stop us.
+deadline = time.monotonic() + 30
 while not Path(os.environ['GODOT_STARTED']).exists():
+    if time.monotonic() > deadline or not args.parent.exists():
+        sys.exit(1)
     time.sleep(0.01)
 Path(os.environ['KITTY_EXITED']).touch()
 ''',
@@ -153,15 +171,17 @@ Path(os.environ['KITTY_EXITED']).touch()
                 'ls)\n'
                 '    if kill -0 "$OLD_KITTY_PID" 2>/dev/null; then cat "$OLD_LS"; exit 0; fi\n'
                 '    [ -f "$KITTY_READY" ] || exit 1\n'
-                '    if [ -f "$SECOND_ATTACHED" ]; then\n'
-                '        printf \'%s\\n\' \'[{"title":"cove-111"},{"title":"cove-222"}]\'\n'
-                '    else\n'
-                '        printf \'%s\\n\' \'[{"title":"cove-111"}]\'\n'
-                '    fi\n'
+                '    printf "["; sep=\n'
+                '    for s in $(ls "$LANDED"); do printf \'%s{"title":"%s"}\' "$sep" "$s"; sep=,; done\n'
+                '    printf "]\\n"\n'
                 '    ;;\n'
                 'get-text) printf "screen of %s\\n" "$6" ;;\n'
+                'launch)\n'
+                '    printf "%s\\n" "$*" >> "$LAUNCH_ARGS"\n'
+                '    eval "s=\\${$#}"\n'
+                '    if [ "$s" = cove-111 ] && [ "$FIRST_SESSION_DEAD" = 1 ]; then exit 1; fi\n'
                 # A launch that times out under load can still open its window.
-                'launch) printf "%s\\n" "$*" >> "$LAUNCH_ARGS"; : > "$SECOND_ATTACHED"; [ "$LAUNCH_TIMES_OUT" != 1 ] ;;\n'
+                '    : > "$LANDED/$s"; [ "$LAUNCH_TIMES_OUT" != 1 ] ;;\n'
                 'esac\n',
             )
             self.write_executable(wrapper, '#!/bin/sh\nexit 0\n')
@@ -174,7 +194,7 @@ Path(os.environ['KITTY_EXITED']).touch()
                 fake_bin / 'ps',
                 '#!/bin/sh\n'
                 'if [ "${1:-}" = -p ]; then\n'
-                '    printf \'%s\\n\' \'/fake/launcher/kitty --title cove\'\n'
+                '    if [ "$2" = "$OLD_KITTY_PID" ]; then echo "/fake/launcher/kitty --title cove"; else echo "/bin/sleep 30"; fi\n'
                 'else\n'
                 '    printf "%s %s\\n" "$OLD_KITTY_PID" "/fake/launcher/kitty --title cove"\n'
                 'fi\n',
@@ -191,7 +211,14 @@ Path(os.environ['KITTY_EXITED']).touch()
             stale_frame.write_text('stale\n')
             app_frame.write_text('app\n')
             socket.write_text('stale socket\n')
-            (runtime / 'kitty.pid').write_text(f'{old_kitty.pid}\n')
+            # A crash can leave kitty.pid naming a pid that's since been reused
+            # by something else, which must survive the reload.
+            bystander = None
+            if stale_pid_file:
+                bystander = subprocess.Popen(['/bin/sleep', '30'])
+                self.addCleanup(bystander.wait)
+                self.addCleanup(bystander.kill)
+            (runtime / 'kitty.pid').write_text(f'{(bystander or old_kitty).pid}\n')
             (runtime / 'dev-env').write_text(
                 f'COVE_KITTEN={kitten}\nCOVE_KITTY_SOCKET=unix:{socket}\n'
                 f'APP={repo / "cove"}\nGODOT={godot}\nCOVE_KITTY_PID={old_kitty.pid}\n'
@@ -217,19 +244,22 @@ Path(os.environ['KITTY_EXITED']).touch()
                 'ABDUCO_ATTACHED': str(attached),
                 'ABDUCO_COUNT': str(counter),
                 'ABDUCO_DETACHED': str(detached),
+                # The first listing is the up-front check, before kitty stops.
+                'ABDUCO_FAIL_AFTER': '1' if listing_fails_after_stop else '0',
+                'FIRST_SESSION_DEAD': '1' if first_session_dead else '0',
                 'GODOT_ARGS': str(root / 'godot-args'),
                 'GODOT_STARTED': str(godot_started),
                 'HOME': str(root / 'home'),
                 'KITTY_ARGS': str(kitty_args),
                 'KITTY_EXITED': str(kitty_exited),
                 'KITTY_READY': str(kitty_ready),
+                'LANDED': str(landed),
                 'LAUNCH_ARGS': str(launch_args),
                 'OLD_KITTY_PID': str(old_kitty.pid),
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
                 'LAUNCH_TIMES_OUT': '1' if launch_times_out else '0',
                 'NEW_KITTY_BROKEN': '1' if kitty_broken else '0',
                 'OLD_LS': str(old_ls),
-                'SECOND_ATTACHED': str(second_attached),
                 'SHELL': '/bin/zsh',
             }
             try:
@@ -253,11 +283,15 @@ Path(os.environ['KITTY_EXITED']).touch()
             self.assertEqual(sorted(f.name for f in scroll.iterdir()), ['cove-111.ansi', 'cove-222.ansi'])
             self.assertEqual((scroll / 'cove-111.ansi').read_text(), 'screen of id:1\n')
             self.assertEqual((scroll / 'cove-222.ansi').read_text(), 'screen of id:2\n')
-            if kitty_broken:
+            if bystander is not None:
+                self.assertIsNone(bystander.poll(), 'killed the process a stale kitty.pid named')
+            if kitty_broken or listing_fails_after_stop:
                 # A failed reload keeps dev-env (reload.sh needs it) minus the
                 # dead kitty's pid, and doesn't start Godot.
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn('kitty did not become ready', result.stderr)
+                self.assertIn('failed to list abduco sessions after stopping kitty'
+                              if listing_fails_after_stop else 'kitty did not become ready',
+                              result.stderr)
                 self.assertEqual(
                     (runtime / 'dev-env').read_text().splitlines(),
                     [f'COVE_KITTEN={kitten}', f'COVE_KITTY_SOCKET=unix:{socket}',
@@ -274,12 +308,17 @@ Path(os.environ['KITTY_EXITED']).touch()
             self.assertTrue(app_frame.exists())
             self.assertFalse(socket.exists())
             self.assertEqual(kitty_args.read_text().splitlines()[-2:], [str(reattach), 'cove-111'])
-            # Exactly one launch: the window that landed isn't opened twice.
-            self.assertEqual(
-                launch_args.read_text().strip(),
-                f'@ --to unix:{socket} launch --type=os-window {reattach} cove-222',
-            )
-            self.assertNotIn("couldn't reattach", result.stderr)
+            launch = f'@ --to unix:{socket} launch --type=os-window {reattach}'
+            if first_session_dead:
+                # Its window never came: the others are reattached anyway, it
+                # is retried, then reported, and Godot still starts.
+                self.assertEqual(launch_args.read_text().splitlines(),
+                                 [f'{launch} cove-222', f'{launch} cove-111', f'{launch} cove-111'])
+                self.assertIn("couldn't reattach cove-111", result.stderr)
+            else:
+                # Exactly one launch: the window that landed isn't opened twice.
+                self.assertEqual(launch_args.read_text().strip(), f'{launch} cove-222')
+                self.assertNotIn("couldn't reattach", result.stderr)
             if stays_attached:
                 self.assertIn('still attached elsewhere, reattaching anyway: cove-111 cove-222', result.stderr)
             self.assertTrue((runtime / 'kitty.pid').read_text().strip().isdigit())
@@ -298,6 +337,15 @@ Path(os.environ['KITTY_EXITED']).touch()
 
     def test_failed_reload_keeps_dev_env(self) -> None:
         self.exercise_reload(kitty_broken=True)
+
+    def test_listing_failure_after_stop_drops_the_dead_pid(self) -> None:
+        self.exercise_reload(listing_fails_after_stop=True)
+
+    def test_dead_first_session_does_not_sink_the_reload(self) -> None:
+        self.exercise_reload(first_session_dead=True)
+
+    def test_stale_pid_file_does_not_kill_a_bystander(self) -> None:
+        self.exercise_reload(stale_pid_file=True)
 
     def test_reload_sh_restarts_a_dead_kitty(self) -> None:
         with tempfile.TemporaryDirectory(prefix='cove-reload-sh-test-') as tdir:

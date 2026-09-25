@@ -117,7 +117,15 @@ pkill -if "godot --path $APP" 2>/dev/null || pkill -if 'godot --path' 2>/dev/nul
 # and saves the wrong spots to state.json (seen 2026-09-25 under heavy load).
 for _ in $(seq 1 50); do pgrep -if "godot --path $APP" >/dev/null || break; sleep 0.1; done
 pkill -9 -if "godot --path $APP" 2>/dev/null || true
-KPIDS="$(cat "$DIR/kitty.pid" 2>/dev/null || true) $(ps -Ao pid=,command= | awk '/[l]auncher\/kitty --title cove/ {print $1}')"
+# kitty.pid can outlive its kitty (a crash), and the pid be reused: only kill
+# it if it's still a Cove kitty.
+KPIDS="$(ps -Ao pid=,command= | awk '/[l]auncher\/kitty --title cove/ {print $1}')"
+_pidfile="$(cat "$DIR/kitty.pid" 2>/dev/null || true)"
+case "$_pidfile" in
+*[!0-9]*|"") ;;
+*) ps -p "$_pidfile" -o command= 2>/dev/null | grep -q 'launcher/kitty --title cove' \
+       && KPIDS="$_pidfile $KPIDS" ;;
+esac
 for _p in $KPIDS; do kill "$_p" 2>/dev/null || true; done
 # A long-lived kitty can ignore SIGTERM, then unlink the NEW kitty's socket when
 # it finally exits. Give it a moment, then make sure.
@@ -126,6 +134,9 @@ for _ in $(seq 1 30); do
     [ "$_alive" = 0 ] && break; sleep 0.1
 done
 for _p in $KPIDS; do kill -9 "$_p" 2>/dev/null || true; done
+# The old kitty is gone: from here on, a failure must not leave its pid behind.
+rm -f "$DIR/kitty.pid"
+write_dev_env
 
 # List the sessions only now, so one created while kitty was stopping isn't
 # lost, and once the old kitty's clients have let go of theirs. (A leading "+"
@@ -155,8 +166,7 @@ for _f in "$DIR"/term-*.rgba; do
     case "$_n" in *[!0-9]*|"") continue ;; esac
     [ "$_n" -lt 1000000 ] && rm -f "$_f"
 done
-rm -f /tmp/cove-kitty "$DIR/kitty.pid" 2>/dev/null || true
-write_dev_env
+rm -f /tmp/cove-kitty 2>/dev/null || true
 
 export COVE=1 KITTY_COVE=1 KITTY_COVE_DIR="$DIR"
 [ "${COVE_IOSURFACE:-}" = "1" ] && export KITTY_COVE_IOSURFACE=1
@@ -182,14 +192,14 @@ kitty_sessions() {
     "$KITTEN" @ --to "$SOCK" ls 2>/dev/null | grep -oE '"cove-[0-9]+"' | tr -d '"' | sort -u
 }
 
-# Wait for remote control, and for the first session's window.
+# Wait for remote control. Not for the first session's window: if that session
+# died since the listing, its window closes at once, and that mustn't sink the
+# reload of every other session. The loop below reattaches it like the rest.
 kitty_ready=false
 for _ in $(seq 1 80); do
     if kill -0 "$COVE_KITTY_PID" 2>/dev/null && "$KITTEN" @ --to "$SOCK" ls >/dev/null 2>&1; then
-        if [ "${#SESSIONS[@]}" -eq 0 ] || kitty_sessions | grep -qx "${SESSIONS[0]}"; then
-            kitty_ready=true
-            break
-        fi
+        kitty_ready=true
+        break
     fi
     sleep 0.1
 done
@@ -199,14 +209,17 @@ if [ "$kitty_ready" != true ]; then
 fi
 echo "$COVE_KITTY_PID" > "$DIR/kitty.pid"
 
-# Reattach the remaining sessions, each as its own OS window. Under load a
+# Reattach every session, each as its own OS window. Under load a
 # launch can time out, and a session that misses its window silently vanishes
 # from the board (26 of 70 did on 2026-09-25). A timed-out launch may still
 # land, so relaunch only what kitty's ls doesn't show after a grace period.
-_missing=("${SESSIONS[@]:1}")
+# The first session's window is kitty's own, already on its way, so the first
+# round launches only the rest.
+_missing=("${SESSIONS[@]+"${SESSIONS[@]}"}")
+_launch=("${SESSIONS[@]:1}")
 for _try in 1 2 3; do
     [ "${#_missing[@]}" -eq 0 ] && break
-    for _s in "${_missing[@]}"; do
+    for _s in "${_launch[@]+"${_launch[@]}"}"; do
         "$KITTEN" @ --to "$SOCK" launch --type=os-window \
             "$REATTACH" "$_s" >/dev/null 2>&1 || true
     done
@@ -220,9 +233,10 @@ for _try in 1 2 3; do
         [ "${#_missing[@]}" -eq 0 ] && break
         sleep 0.1
     done
+    _launch=("${_missing[@]+"${_missing[@]}"}")
 done
 for _s in "${_missing[@]+"${_missing[@]}"}"; do
-    echo "WARNING: couldn't reattach $_s (still alive in abduco)" >&2
+    echo "WARNING: couldn't reattach $_s (if it's still in abduco, run cove/reload-kitty.sh again)" >&2
 done
 
 # Refresh dev-env (new pid) and relaunch Godot.
