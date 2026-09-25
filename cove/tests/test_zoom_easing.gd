@@ -58,6 +58,16 @@ func _run() -> void:
 	root.remove_child(restored)
 	restored.free()
 
+	for bad in [NAN, INF, -INF]:
+		var nonfinite := RestoreTestCove.new()
+		nonfinite.set_process(false)
+		root.add_child(nonfinite)
+		nonfinite._saved = {"cam": [0.0, 0.0, bad]}
+		nonfinite._build_world()
+		_check_close(nonfinite._cam.zoom.x, 0.9, "non-finite saved zoom %s" % bad)
+		root.remove_child(nonfinite)
+		nonfinite.free()
+
 	camera.free()
 	cove.free()
 	quit(1 if _failures else 0)

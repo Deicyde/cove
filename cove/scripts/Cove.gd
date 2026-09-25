@@ -356,8 +356,10 @@ func _build_world() -> void:
 	if _saved.has("cam"):
 		var c = _saved["cam"]
 		_cam.position = Vector2(c[0], c[1])
-		var z := clampf(float(c[2]), MIN_ZOOM, PRESENT_MAX_ZOOM)
-		_cam.zoom = Vector2(z, z)
+		var z := float(c[2])
+		if is_finite(z):   # clampf passes NaN through; keep the default zoom instead
+			z = clampf(z, MIN_ZOOM, PRESENT_MAX_ZOOM)
+			_cam.zoom = Vector2(z, z)
 	add_child(_cam)
 	_cam.make_current()
 
