@@ -1128,6 +1128,7 @@ render(monotonic_t now, bool input_read) {
         // rendering is done in cocoa_os_window_resized()
         if (w->live_resize.in_progress) continue;
 #endif
+        if (cove_window_suspended(w->id)) continue;  // cove: off screen in Godot, frame kept
         if (!render_os_window(w, now, scan_for_animated_images)) {
             // since we didn't scan the window for animations, force a rescan on next wakeup/render frame
             if (scan_for_animated_images) global_state.check_for_active_animated_images = true;

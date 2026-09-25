@@ -30,6 +30,8 @@ bool cove_has_pending_control(void);
 // True if this OS window has been dragged out of the Cove: it lives on the
 // desktop as a normal, visible kitty window and is not exported to Godot.
 bool cove_window_is_detached(id_type id);
+// Suspended by Godot (MSG_SUSPEND): not rendered until resumed.
+bool cove_window_suspended(id_type id);
 
 // x sentinel for cove_enqueue_detach: let the macOS side place the window near
 // the current key window (a fresh cascade) instead of centring on a point.

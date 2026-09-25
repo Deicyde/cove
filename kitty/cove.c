@@ -54,7 +54,7 @@
 #define COVE_HEADER_BYTES 64u
 #define COVE_FLAG_BOTTOM_UP 0x1u
 #define DEFAULT_DIR "/tmp/cove"
-#define COVE_MAX 64
+#define COVE_MAX 256
 
 typedef struct {
     id_type id;          // 0 == free slot
@@ -108,6 +108,7 @@ resolve_dir(void) {
 #define MSG_MOUSE 3
 #define MSG_DETACH 4
 #define MSG_ADOPT 5
+#define MSG_SUSPEND 6   // [on u8]: stop/resume rendering a termling nobody can see
 
 typedef struct { id_type id; uint32_t cols, rows; } PendingResize;
 static PendingResize resize_queue[COVE_MAX];
@@ -124,6 +125,15 @@ static id_type adopt_queue[COVE_MAX];   // programmatic drag-in (MSG_ADOPT)
 static int adopt_count = 0;
 static id_type detached_ids[COVE_MAX];
 static int detached_n = 0;
+
+// Suspended termlings (MSG_SUSPEND): Godot suspends ones well off screen, so we
+// skip rendering them and free the spare IOSurface of the pair, keeping the one
+// with the last frame. Resuming forces a fresh frame before Godot shows it.
+typedef struct { id_type id; uint8_t on; } PendingSuspend;
+static PendingSuspend suspend_queue[COVE_MAX];
+static int suspend_count = 0;
+static id_type suspended_ids[COVE_MAX];
+static int suspended_n = 0;
 
 // Mouse-driven text selection: Godot sends cell coords as you drag over the
 // focused terminal; we replay them into kitty's own selection so highlighting +
@@ -184,7 +194,7 @@ enqueue_mouse(id_type id, uint8_t phase, uint32_t x, uint32_t y, uint8_t in_left
 bool
 cove_has_pending_control(void) {
     pthread_mutex_lock(&resize_lock);
-    bool any = resize_count > 0 || pending_spawns > 0 || mouse_count > 0 || detach_count > 0 || adopt_count > 0;
+    bool any = resize_count > 0 || pending_spawns > 0 || mouse_count > 0 || detach_count > 0 || adopt_count > 0 || suspend_count > 0;
     pthread_mutex_unlock(&resize_lock);
     return any;
 }
@@ -271,6 +281,13 @@ handle_input_client(int cfd) {
             if (adopt_count < COVE_MAX) adopt_queue[adopt_count++] = (id_type)id;
             pthread_mutex_unlock(&resize_lock);
             wakeup_main_loop();
+        } else if (kind == MSG_SUSPEND) {
+            unsigned char on;
+            if (!read_all(cfd, &on, 1)) return;
+            pthread_mutex_lock(&resize_lock);
+            if (suspend_count < COVE_MAX) suspend_queue[suspend_count++] = (PendingSuspend){ (id_type)id, on };
+            pthread_mutex_unlock(&resize_lock);
+            wakeup_main_loop();
         } else return;  // unknown kind: drop the connection
     }
 }
@@ -347,6 +364,48 @@ cove_readopt(uint64_t os_window_id) {
     log_error("cove: re-adopted os-window %llu into the cove", (unsigned long long)os_window_id);
 }
 
+bool
+cove_window_suspended(id_type id) {
+    for (int i = 0; i < suspended_n; i++) if (suspended_ids[i] == id) return true;
+    return false;
+}
+
+static void
+suspended_remove(id_type id) {
+    for (int i = 0; i < suspended_n; i++) if (suspended_ids[i] == id) { suspended_ids[i] = suspended_ids[--suspended_n]; return; }
+}
+
+static Slot* slot_if_any(id_type id);
+
+// Main thread. On: stop rendering it and free the spare IOSurface (under the
+// window's own GL context: FBOs are per-context), publishing a header with that
+// buffer's id zeroed so Godot releases its import of it too. Off: force a frame.
+static void
+apply_suspend(id_type id, bool on) {
+    OSWindow *osw = os_window_for_id(id);
+    if (!on) {
+        if (!cove_window_suspended(id)) return;
+        suspended_remove(id);
+        if (osw) osw->redraw_count++;
+        return;
+    }
+    if (cove_window_suspended(id) || !osw || cove_window_is_detached(id) || suspended_n >= COVE_MAX) return;
+    suspended_ids[suspended_n++] = id;
+#ifdef __APPLE__
+    Slot *s = slot_if_any(id);
+    if (!s || !s->base || !cove_iosurface_on()) return;
+    int spare = s->io_current ^ 1;
+    if (!s->iosurf[spare].surface) return;
+    void *prev = make_os_window_context_current(osw);
+    cove_macos_free(&s->iosurf[spare]);
+    if (prev) glfwMakeContextCurrent((GLFWwindow*)prev);
+    uint32_t *hdr = (uint32_t*)s->base;
+    hdr[12 + spare] = 0;
+    __sync_synchronize();
+    hdr[3] = ++s->seq;
+#endif
+}
+
 void
 cove_drain_control(void) {
     if (state != 1) return;
@@ -354,7 +413,8 @@ cove_drain_control(void) {
     PendingMouse mlocal[COVE_MOUSE_MAX];
     PendingDetach dlocal[COVE_MAX];
     id_type alocal[COVE_MAX];
-    int n, spawns, mn, dn, an;
+    PendingSuspend slocal[COVE_MAX];
+    int n, spawns, mn, dn, an, sn;
     pthread_mutex_lock(&resize_lock);
     n = resize_count;
     memcpy(local, resize_queue, (size_t)n * sizeof(PendingResize));
@@ -370,6 +430,9 @@ cove_drain_control(void) {
     an = adopt_count;
     memcpy(alocal, adopt_queue, (size_t)an * sizeof(id_type));
     adopt_count = 0;
+    sn = suspend_count;
+    memcpy(slocal, suspend_queue, (size_t)sn * sizeof(PendingSuspend));
+    suspend_count = 0;
     pthread_mutex_unlock(&resize_lock);
     for (int i = 0; i < n; i++) {
         call_boss(resize_os_window, "Kiis", local[i].id, (int)local[i].cols, (int)local[i].rows, "cells");
@@ -380,6 +443,7 @@ cove_drain_control(void) {
     for (int i = 0; i < mn; i++) apply_mouse(&mlocal[i]);
     for (int i = 0; i < dn; i++) apply_detach(&dlocal[i]);
     for (int i = 0; i < an; i++) apply_adopt(alocal[i]);
+    for (int i = 0; i < sn; i++) apply_suspend(slocal[i].id, slocal[i].on != 0);
 }
 
 // One thread per client: Godot holds a persistent connection, but short-lived
@@ -458,6 +522,12 @@ slot_for(id_type id) {
     return free_slot;
 }
 
+static Slot*
+slot_if_any(id_type id) {
+    for (int i = 0; i < COVE_MAX; i++) if (slots[i].id == id) return &slots[i];
+    return NULL;
+}
+
 static bool
 remap(Slot *s, id_type id, size_t needed) {
     if (s->base) { munmap(s->base, s->mapped); s->base = NULL; s->mapped = 0; }
@@ -499,6 +569,7 @@ void
 cove_publish_frame(OSWindow *os_window) {
     if (!cove_enabled()) return;
     if (cove_window_is_detached(os_window->id)) return;  // it lives on the desktop now
+    if (cove_window_suspended(os_window->id)) return;    // keep the last frame; Godot can't see it
     unsigned w = (unsigned)os_window->viewport_width, h = (unsigned)os_window->viewport_height;
     if (!w || !h) return;
     Slot *s = slot_for(os_window->id);
@@ -572,6 +643,7 @@ cove_publish_frame(OSWindow *os_window) {
 void
 cove_remove_window(id_type id) {
     if (state != 1) return;
+    suspended_remove(id);
     // If it was out on the desktop, stop watching it (window closed for real).
     if (cove_window_is_detached(id)) {
         detached_remove(id);
