@@ -187,7 +187,9 @@ fi
 COVE_KITTY_PID=$!
 
 # The sessions kitty has a window for, one per line, read from each window's own
-# cmdline (ls is indented JSON, one element per line). kitty reports the live
+# cmdline (ls is indented JSON, one element per line: kitty prints it with
+# json.dumps(indent=2, sort_keys=True) in kitty/rc/ls.py, and kitten passes it
+# through; if that changes, every window here looks missing). kitty reports the live
 # argv, so that's `cove-reattach.sh cove-N` only until the script execs, then
 # `abduco -a cove-N` (or `-A`, for a cove-shell.sh window). Titles, user vars
 # and foreground_processes don't count: a shell where someone ran abduco by hand
@@ -233,18 +235,22 @@ echo "$COVE_KITTY_PID" > "$DIR/kitty.pid"
 # Reattach every session, each as its own OS window. Under load a
 # launch can time out, and a session that misses its window silently vanishes
 # from the board (26 of 70 did on 2026-09-25). A timed-out launch may still
-# land, so relaunch only what kitty's ls doesn't show after a grace period.
+# land, so relaunch only what kitty's ls doesn't show after a grace period:
+# 2 s, or 10 s when a launch this round timed out, since giving up on a launch
+# that lands late opens a second window for the same session.
 # The first session's window is kitty's own, already on its way, so the first
 # round launches only the rest.
 _missing=("${SESSIONS[@]+"${SESSIONS[@]}"}")
 _launch=("${SESSIONS[@]:1}")
 for _try in 1 2 3; do
     [ "${#_missing[@]}" -eq 0 ] && break
+    _polls=20
     for _s in "${_launch[@]+"${_launch[@]}"}"; do
-        "$KITTEN" @ --to "$SOCK" launch --type=os-window \
-            "$REATTACH" "$_s" >/dev/null 2>&1 || true
+        _err=$("$KITTEN" @ --to "$SOCK" launch --type=os-window \
+            "$REATTACH" "$_s" 2>&1 >/dev/null) ||
+            case "$_err" in *"Timed out"*) _polls=100 ;; esac   # tools/cmd/at/main.go
     done
-    for _ in $(seq 1 20); do
+    for _ in $(seq 1 "$_polls"); do
         _have=" $(kitty_sessions | tr '\n' ' ')"
         _still=()
         for _s in "${_missing[@]}"; do

@@ -101,7 +101,7 @@ class DevRestartRecoveryTest(unittest.TestCase):
         self, *, launch_times_out: bool = False, stays_attached: bool = False,
         kitty_broken: bool = False, first_session_dead: bool = False,
         stale_pid_file: bool = False, listing_fails_after_stop: bool = False,
-        ls_blinks: bool = False,
+        ls_blinks: bool = False, launch_lands_late: bool = False,
     ) -> None:
         with tempfile.TemporaryDirectory(prefix='cove-reload-test-') as tdir:
             root = Path(tdir)
@@ -195,6 +195,7 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 '    if kill -0 "$OLD_KITTY_PID" 2>/dev/null; then cat "$OLD_LS"; exit 0; fi\n'
                 '    [ -f "$KITTY_READY" ] || exit 1\n'
                 '    n=$(cat "$LS_COUNT" 2>/dev/null || echo 0); n=$((n + 1)); printf "%s\\n" "$n" > "$LS_COUNT"\n'
+                '    if [ -f "$LATE" ] && [ "$n" -ge "$(cut -d" " -f1 "$LATE")" ]; then : > "$LANDED/$(cut -d" " -f2 "$LATE")"; fi\n'
                 # Under load, right after the ready check (call 1), ls can fail
                 # or come back without the reattach windows yet.
                 '    if [ "$LS_BLINKS" = 1 ]; then case "$n" in 2) exit 1 ;; 3) echo "[]"; exit 0 ;; esac; fi\n'
@@ -205,7 +206,13 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 '    printf "%s\\n" "$*" >> "$LAUNCH_ARGS"\n'
                 '    eval "s=\\${$#}"\n'
                 '    if [ "$s" = cove-111 ] && [ "$FIRST_SESSION_DEAD" = 1 ]; then exit 1; fi\n'
-                # A launch that times out under load can still open its window.
+                # A launch that times out under load can still open its window,
+                # at once or (LAUNCH_LANDS_LATE) 30 ls polls after it gave up:
+                # counted in polls, not seconds, as each poll's time varies.
+                '    if [ "$LAUNCH_LANDS_LATE" = 1 ]; then\n'
+                '        n=$(cat "$LS_COUNT" 2>/dev/null || echo 0); printf "%s %s\\n" $((n + 30)) "$s" > "$LATE"\n'
+                '        echo "Timed out waiting for a response from kitty" >&2; exit 1\n'
+                '    fi\n'
                 '    : > "$LANDED/$s"; [ "$LAUNCH_TIMES_OUT" != 1 ] ;;\n'
                 'esac\n',
             )
@@ -285,6 +292,8 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 'OLD_KITTY_PID': str(old_kitty.pid),
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
                 'LAUNCH_TIMES_OUT': '1' if launch_times_out else '0',
+                'LAUNCH_LANDS_LATE': '1' if launch_lands_late else '0',
+                'LATE': str(root / 'late-launch'),
                 'NEW_KITTY_BROKEN': '1' if kitty_broken else '0',
                 'OLD_LS': str(old_ls),
                 'REATTACH': str(reattach),
@@ -408,6 +417,9 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
 
     def test_reload_does_not_relaunch_a_window_that_landed(self) -> None:
         self.exercise_reload(launch_times_out=True)
+
+    def test_reload_waits_for_a_timed_out_launch_that_lands_late(self) -> None:
+        self.exercise_reload(launch_lands_late=True)
 
 
 class ReattachTest(unittest.TestCase):
