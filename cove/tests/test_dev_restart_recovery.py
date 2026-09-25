@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -96,6 +99,152 @@ class DevRestartRecoveryTest(unittest.TestCase):
                     f'GODOT={godot}',
                 ],
             )
+
+    def run_cold_start(self, *, kitty_answers: bool, ready_polls: int | None = None) -> dict:
+        """Run dev.sh with no sessions, so it cold-starts a fake kitty.
+
+        pkill and ps are fakes, so nothing touches the live Cove. Returns the
+        dev.sh result and the paths the tests check.
+        """
+        root = Path(tempfile.mkdtemp(prefix='cove-dev-test-'))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        repo = root / 'repo'
+        runtime = root / 'runtime' / 'cove'
+        socket = Path(f'{runtime}-kitty')
+        fake_bin = root / 'bin'
+        launcher = self.copy_script('dev.sh', repo, runtime)
+        if ready_polls is not None:
+            source = launcher.read_text()
+            self.assertEqual(source.count('seq 1 300'), 1)
+            launcher.write_text(source.replace('seq 1 300', f'seq 1 {ready_polls}'))
+
+        kitty = repo / 'kitty' / 'launcher' / 'kitty'
+        kitten = repo / 'kitty' / 'launcher' / 'kitty.app' / 'Contents' / 'MacOS' / 'kitten'
+        kitty_pid = root / 'kitty-pid'
+        self.write_executable(
+            kitty,
+            f'''#!{sys.executable}
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+runtime = Path(os.environ['RUNTIME'])
+runtime.mkdir(parents=True, exist_ok=True)
+(runtime / 'kitty.pid').write_text('stale\\n')
+(runtime / 'dev-env').write_text('stale\\n')
+Path(os.environ['SOCKET']).write_text('stale\\n')
+Path(os.environ['KITTY_PID']).write_text(str(os.getpid()))
+def stop(*_):
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+while True:
+    time.sleep(0.01)
+''',
+        )
+        # Remote control answers once the fake kitty is up, or never.
+        self.write_executable(
+            kitten,
+            f'#!/bin/sh\n[ -s "{kitty_pid}" ]\n' if kitty_answers else '#!/bin/sh\nexit 1\n',
+        )
+        self.write_executable(
+            repo / 'cove' / 'bin' / 'abduco',
+            '#!/bin/sh\nprintf "%s\\n" "Active sessions (on host test)"\n',
+        )
+        godot_started = root / 'godot-started'
+        remote_started = root / 'remote-started'
+        godot = fake_bin / 'godot'
+        self.write_executable(godot, f'#!/bin/sh\n: > "{godot_started}"\n')
+        self.write_executable(repo / 'cove' / 'cove-remote-start.sh', f'#!/bin/sh\n: > "{remote_started}"\n')
+        self.write_executable(fake_bin / 'pkill', '#!/bin/sh\nexit 1\n')
+        self.write_executable(fake_bin / 'ps', '#!/bin/sh\nexit 0\n')
+        self.write_executable(fake_bin / 'sleep', '#!/bin/sh\nexec /bin/sleep 0.01\n')
+        (repo / 'cove' / '.godot').mkdir(parents=True)
+        (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('')
+        runtime.parent.mkdir(parents=True)
+
+        env = {
+            'GODOT': str(godot),
+            'HOME': str(root / 'home'),
+            'KITTY_PID': str(kitty_pid),
+            'PATH': f'{fake_bin}:/usr/bin:/bin',
+            'RUNTIME': str(runtime),
+            'SHELL': '/bin/zsh',
+            'SOCKET': str(socket),
+        }
+        # The fake kitty outlives dev.sh on success, and would on a failed
+        # cleanup: kill it whatever happens (before the rmtree above, as
+        # cleanups run last-in first-out). A generous timeout: the machine
+        # running these can be loaded.
+        self.addCleanup(self.kill_fake_kitty, kitty_pid)
+        result = subprocess.run(
+            ['/bin/bash', str(launcher)], cwd=repo, env=env,
+            text=True, capture_output=True, timeout=120, check=False,
+        )
+        return {
+            'result': result, 'repo': repo, 'runtime': runtime, 'socket': socket,
+            'kitty_pid': kitty_pid, 'godot': godot, 'kitten': kitten,
+            'godot_started': godot_started, 'remote_started': remote_started,
+        }
+
+    def kill_fake_kitty(self, kitty_pid: Path) -> None:
+        if kitty_pid.exists():
+            try:
+                os.kill(int(kitty_pid.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def kitty_alive(self, kitty_pid: Path) -> bool:
+        if not kitty_pid.exists():
+            return False
+        try:
+            os.kill(int(kitty_pid.read_text()), 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def test_dev_cleans_up_if_kitty_never_becomes_ready(self) -> None:
+        # Cleanup is under test, not the 30 s budget: poll less.
+        run = self.run_cold_start(kitty_answers=False, ready_polls=40)
+        result, runtime = run['result'], run['runtime']
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('kitty did not become ready', result.stderr)
+        self.assertFalse(self.kitty_alive(run['kitty_pid']))
+        self.assertFalse(run['socket'].exists())
+        self.assertFalse((runtime / 'kitty.pid').exists())
+        self.assertFalse((runtime / 'dev-env').exists())
+        self.assertFalse(run['godot_started'].exists())
+        self.assertFalse(run['remote_started'].exists())
+
+    def test_dev_cold_start_leaves_a_ready_kitty_running(self) -> None:
+        run = self.run_cold_start(kitty_answers=True)
+        result, runtime = run['result'], run['runtime']
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Cove dev up', result.stdout)
+        # dev.sh has exited: its cleanup trap must not have taken kitty.
+        self.assertTrue(self.kitty_alive(run['kitty_pid']))
+        pid = run['kitty_pid'].read_text()
+        self.assertEqual((runtime / 'kitty.pid').read_text(), f'{pid}\n')
+        self.assertEqual(
+            (runtime / 'dev-env').read_text().splitlines(),
+            [
+                f'COVE_KITTEN={run["kitten"]}',
+                f'COVE_KITTY_SOCKET=unix:{runtime}-kitty',
+                f'APP={run["repo"] / "cove"}',
+                f'GODOT={run["godot"]}',
+                f'COVE_KITTY_PID={pid}',
+            ],
+        )
+        self.assertTrue(run['remote_started'].exists())
+        # Godot is started in the background: give it a moment.
+        for _ in range(200):
+            if run['godot_started'].exists():
+                break
+            time.sleep(0.05)
+        self.assertTrue(run['godot_started'].exists())
 
     def exercise_reload(
         self, *, launch_times_out: bool = False, stays_attached: bool = False,
