@@ -28,6 +28,20 @@ LOCK_FILE="/tmp/cove-launch.lock"
 COVE_KITTY_PID=""
 STARTUP_COMPLETE=false
 
+# dev-env, with the running kitty's pid when there is one. Without a pid rather
+# than deleted: reload.sh and a retry of this script still need the rest, but a
+# dead (maybe reused) pid must not vouch for window ids (cove_mcp.py).
+write_dev_env() {
+    {
+        echo "COVE_KITTEN=$KITTEN"
+        echo "COVE_KITTY_SOCKET=$SOCK"
+        echo "APP=$APP"
+        echo "GODOT=$GODOT"
+        [ -z "${1:-}" ] || echo "COVE_KITTY_PID=$1"
+    } > "$DIR/dev-env.new"
+    mv "$DIR/dev-env.new" "$DIR/dev-env"
+}
+
 # If the new kitty never comes up, don't leave it half-started holding the
 # socket; the sessions stay in abduco for the next attempt.
 cleanup_startup() {
@@ -39,7 +53,8 @@ cleanup_startup() {
         done
         kill -9 "$COVE_KITTY_PID" 2>/dev/null || true
         wait "$COVE_KITTY_PID" 2>/dev/null || true
-        rm -f /tmp/cove-kitty "$DIR/kitty.pid" "$DIR/dev-env"
+        rm -f /tmp/cove-kitty "$DIR/kitty.pid"
+        write_dev_env
     fi
 }
 
@@ -140,7 +155,8 @@ for _f in "$DIR"/term-*.rgba; do
     case "$_n" in *[!0-9]*|"") continue ;; esac
     [ "$_n" -lt 1000000 ] && rm -f "$_f"
 done
-rm -f /tmp/cove-kitty "$DIR/kitty.pid" "$DIR/dev-env" 2>/dev/null || true
+rm -f /tmp/cove-kitty "$DIR/kitty.pid" 2>/dev/null || true
+write_dev_env
 
 export COVE=1 KITTY_COVE=1 KITTY_COVE_DIR="$DIR"
 [ "${COVE_IOSURFACE:-}" = "1" ] && export KITTY_COVE_IOSURFACE=1
@@ -210,13 +226,7 @@ for _s in "${_missing[@]+"${_missing[@]}"}"; do
 done
 
 # Refresh dev-env (new pid) and relaunch Godot.
-cat > "$DIR/dev-env" <<EOF
-COVE_KITTEN=$KITTEN
-COVE_KITTY_SOCKET=$SOCK
-APP=$APP
-GODOT=$GODOT
-COVE_KITTY_PID=$COVE_KITTY_PID
-EOF
+write_dev_env "$COVE_KITTY_PID"
 COVE_KITTEN="$KITTEN" COVE_KITTY_SOCKET="$SOCK" \
     nohup "$GODOT" --path "$APP" 9>&- >/tmp/cove-godot.log 2>&1 &
 STARTUP_COMPLETE=true

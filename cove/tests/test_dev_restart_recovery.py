@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -90,7 +91,10 @@ class DevRestartRecoveryTest(unittest.TestCase):
                 ],
             )
 
-    def exercise_reload(self, *, launch_times_out: bool = False, stays_attached: bool = False) -> None:
+    def exercise_reload(
+        self, *, launch_times_out: bool = False, stays_attached: bool = False,
+        kitty_broken: bool = False,
+    ) -> None:
         with tempfile.TemporaryDirectory(prefix='cove-reload-test-') as tdir:
             root = Path(tdir)
             repo = root / 'repo'
@@ -114,6 +118,7 @@ class DevRestartRecoveryTest(unittest.TestCase):
             kitty_exited = root / 'kitty-exited'
             kitty_args = root / 'kitty-args'
             launch_args = root / 'launch-args'
+            old_ls = root / 'old-ls.json'
 
             self.write_executable(
                 abduco,
@@ -133,7 +138,8 @@ import time
 from pathlib import Path
 
 Path(os.environ['KITTY_ARGS']).write_text('\\n'.join(sys.argv[1:]) + '\\n')
-Path(os.environ['KITTY_READY']).touch()
+if os.environ['NEW_KITTY_BROKEN'] != '1':
+    Path(os.environ['KITTY_READY']).touch()
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 while not Path(os.environ['GODOT_STARTED']).exists():
     time.sleep(0.01)
@@ -145,6 +151,7 @@ Path(os.environ['KITTY_EXITED']).touch()
                 '#!/bin/sh\n'
                 'case "${4:-}" in\n'
                 'ls)\n'
+                '    if kill -0 "$OLD_KITTY_PID" 2>/dev/null; then cat "$OLD_LS"; exit 0; fi\n'
                 '    [ -f "$KITTY_READY" ] || exit 1\n'
                 '    if [ -f "$SECOND_ATTACHED" ]; then\n'
                 '        printf \'%s\\n\' \'[{"title":"cove-111"},{"title":"cove-222"}]\'\n'
@@ -152,6 +159,7 @@ Path(os.environ['KITTY_EXITED']).touch()
                 '        printf \'%s\\n\' \'[{"title":"cove-111"}]\'\n'
                 '    fi\n'
                 '    ;;\n'
+                'get-text) printf "screen of %s\\n" "$6" ;;\n'
                 # A launch that times out under load can still open its window.
                 'launch) printf "%s\\n" "$*" >> "$LAUNCH_ARGS"; : > "$SECOND_ATTACHED"; [ "$LAUNCH_TIMES_OUT" != 1 ] ;;\n'
                 'esac\n',
@@ -188,6 +196,13 @@ Path(os.environ['KITTY_EXITED']).touch()
                 f'COVE_KITTEN={kitten}\nCOVE_KITTY_SOCKET=unix:{socket}\n'
                 f'APP={repo / "cove"}\nGODOT={godot}\nCOVE_KITTY_PID={old_kitty.pid}\n'
             )
+            # The old kitty's windows: a first-run session (-A), a reattached one
+            # (-a), and a window with no session, whose screen isn't saved.
+            old_ls.write_text(json.dumps([{'tabs': [{'windows': [
+                {'id': 1, 'foreground_processes': [{'cmdline': [str(abduco), '-A', 'cove-111', '/bin/zsh']}]},
+                {'id': 2, 'foreground_processes': [{'cmdline': [str(abduco), '-a', 'cove-222']}]},
+                {'id': 3, 'foreground_processes': [{'cmdline': ['/bin/zsh']}]},
+            ]}]}]))
             attached.write_text(
                 'Active sessions (on host test)\n'
                 '* Thu 2026-09-24 00:00:00 cove-111\n'
@@ -212,13 +227,15 @@ Path(os.environ['KITTY_EXITED']).touch()
                 'OLD_KITTY_PID': str(old_kitty.pid),
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
                 'LAUNCH_TIMES_OUT': '1' if launch_times_out else '0',
+                'NEW_KITTY_BROKEN': '1' if kitty_broken else '0',
+                'OLD_LS': str(old_ls),
                 'SECOND_ATTACHED': str(second_attached),
                 'SHELL': '/bin/zsh',
             }
             try:
                 result = subprocess.run(
                     ['/bin/bash', str(launcher)], cwd=repo, env=env,
-                    text=True, capture_output=True, timeout=20, check=False,
+                    text=True, capture_output=True, timeout=60, check=False,
                 )
             finally:
                 if reaper.is_alive():
@@ -231,6 +248,25 @@ Path(os.environ['KITTY_EXITED']).touch()
             deadline = time.monotonic() + 2
             while not kitty_exited.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
+            # Screens are saved from the old kitty before it's stopped.
+            scroll = runtime / 'scroll'
+            self.assertEqual(sorted(f.name for f in scroll.iterdir()), ['cove-111.ansi', 'cove-222.ansi'])
+            self.assertEqual((scroll / 'cove-111.ansi').read_text(), 'screen of id:1\n')
+            self.assertEqual((scroll / 'cove-222.ansi').read_text(), 'screen of id:2\n')
+            if kitty_broken:
+                # A failed reload keeps dev-env (reload.sh needs it) minus the
+                # dead kitty's pid, and doesn't start Godot.
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('kitty did not become ready', result.stderr)
+                self.assertEqual(
+                    (runtime / 'dev-env').read_text().splitlines(),
+                    [f'COVE_KITTEN={kitten}', f'COVE_KITTY_SOCKET=unix:{socket}',
+                     f'APP={repo / "cove"}', f'GODOT={godot}'],
+                )
+                self.assertFalse((runtime / 'kitty.pid').exists())
+                self.assertFalse(godot_started.exists())
+                self.assertEqual(state.read_text(), 'saved-layout\n')
+                return
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(counter.read_text(), '51\n' if stays_attached else '4\n')
             self.assertEqual(state.read_text(), 'saved-layout\n')
@@ -249,6 +285,8 @@ Path(os.environ['KITTY_EXITED']).touch()
             self.assertTrue((runtime / 'kitty.pid').read_text().strip().isdigit())
             self.assertNotEqual((runtime / 'kitty.pid').read_text().strip(), str(old_kitty.pid))
             self.assertIn(f'COVE_KITTY_SOCKET=unix:{socket}\n', (runtime / 'dev-env').read_text())
+            self.assertIn(f'COVE_KITTY_PID={(runtime / "kitty.pid").read_text().strip()}\n',
+                          (runtime / 'dev-env').read_text())
             self.assertEqual((root / 'godot-args').read_text().strip(), f'--path {repo / "cove"}')
             self.assertTrue(kitty_exited.exists())
 
@@ -258,8 +296,77 @@ Path(os.environ['KITTY_EXITED']).touch()
     def test_reload_keeps_sessions_that_stay_attached(self) -> None:
         self.exercise_reload(stays_attached=True)
 
+    def test_failed_reload_keeps_dev_env(self) -> None:
+        self.exercise_reload(kitty_broken=True)
+
+    def test_reload_sh_restarts_a_dead_kitty(self) -> None:
+        with tempfile.TemporaryDirectory(prefix='cove-reload-sh-test-') as tdir:
+            root = Path(tdir)
+            repo = root / 'repo'
+            runtime = root / 'runtime' / 'cove'
+            fake_bin = root / 'bin'
+            launcher = self.copy_script('reload.sh', repo, runtime)
+            called = root / 'reload-kitty-called'
+            self.write_executable(repo / 'cove' / 'reload-kitty.sh', f'#!/bin/sh\n: > "{called}"\n')
+            self.write_executable(fake_bin / 'ps', '#!/bin/sh\nexit 0\n')
+            godot = fake_bin / 'godot'
+            self.write_executable(godot, f'#!/bin/sh\n: > "{root / "godot-started"}"\n')
+            runtime.mkdir(parents=True)
+            (runtime / 'dev-env').write_text(
+                f'COVE_KITTEN=/nonexistent\nCOVE_KITTY_SOCKET=unix:{runtime}-kitty\n'
+                f'APP={repo / "cove"}\nGODOT={godot}\n'
+            )
+            result = subprocess.run(
+                ['/bin/bash', str(launcher)], cwd=repo,
+                env={'HOME': str(root / 'home'), 'PATH': f'{fake_bin}:/usr/bin:/bin'},
+                text=True, capture_output=True, timeout=10, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(called.exists())
+            self.assertFalse((root / 'godot-started').exists())
+
     def test_reload_does_not_relaunch_a_window_that_landed(self) -> None:
         self.exercise_reload(launch_times_out=True)
+
+
+class ReattachTest(unittest.TestCase):
+    def run_reattach(self, *, saved: str | None, patched: bool) -> tuple[subprocess.CompletedProcess[str], Path]:
+        temp = tempfile.TemporaryDirectory(prefix='cove-reattach-test-')
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        runtime = root / 'runtime'
+        script = root / 'repo' / 'cove' / 'cove-reattach.sh'
+        script.parent.mkdir(parents=True)
+        script.write_text((REPO_ROOT / 'cove' / 'cove-reattach.sh').read_text())
+        script.chmod(0o755)
+        # The patched abduco when built, else the one on PATH.
+        fake = (root / 'repo' / 'cove' / 'bin' / 'abduco') if patched else (root / 'bin' / 'abduco')
+        fake.parent.mkdir(parents=True)
+        fake.write_text(f'#!/bin/sh\nprintf "exec %s:" "{"patched" if patched else "path"}"; printf " %s" "$@"; echo\n')
+        fake.chmod(0o755)
+        (runtime / 'scroll').mkdir(parents=True)
+        if saved is not None:
+            (runtime / 'scroll' / 'cove-111.ansi').write_text(saved)
+        result = subprocess.run(
+            ['/bin/sh', str(script), 'cove-111'],
+            env={'KITTY_COVE_DIR': str(runtime), 'PATH': f'{root / "bin"}:/usr/bin:/bin'},
+            text=True, capture_output=True, timeout=10, check=False,
+        )
+        return result, runtime / 'scroll' / 'cove-111.ansi'
+
+    def test_prints_saved_screen_then_attaches_existing_session(self) -> None:
+        result, saved = self.run_reattach(saved='\x1b[31mold screen\x1b[0m\n', patched=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '\x1b[31mold screen\x1b[0m\nexec patched: -a cove-111\n')
+        self.assertFalse(saved.exists())
+
+    def test_attaches_without_a_saved_screen(self) -> None:
+        result, _ = self.run_reattach(saved=None, patched=True)
+        self.assertEqual(result.stdout, 'exec patched: -a cove-111\n')
+
+    def test_falls_back_to_abduco_on_path(self) -> None:
+        result, _ = self.run_reattach(saved='', patched=False)
+        self.assertEqual(result.stdout, 'exec path: -a cove-111\n')
 
 
 if __name__ == '__main__':
