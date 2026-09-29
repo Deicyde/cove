@@ -17,6 +17,9 @@ source "$DIR/dev-env"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KITTY="$REPO/kitty/launcher/kitty"
+# kitty holds ~5 fds per termling (pty, frame file, disk cache, pipes); the
+# 256 a login item inherits from launchd runs out near 50 termlings.
+ulimit -n 10240 2>/dev/null || true
 KITTEN="${COVE_KITTEN:-$REPO/kitty/launcher/kitty.app/Contents/MacOS/kitten}"
 WRAPPER="$REPO/cove/cove-shell.sh"
 REATTACH="$REPO/cove/cove-reattach.sh"   # prints the saved screen, then abduco -a

@@ -8,6 +8,9 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="$REPO/cove"
 KITTY="$REPO/kitty/launcher/kitty"
+# kitty holds ~5 fds per termling (pty, frame file, disk cache, pipes); the
+# 256 a login item inherits from launchd runs out near 50 termlings.
+ulimit -n 10240 2>/dev/null || true
 KITTEN="$REPO/kitty/launcher/kitty.app/Contents/MacOS/kitten"
 SOCK="unix:/tmp/cove-kitty"
 DIR="/tmp/cove"
