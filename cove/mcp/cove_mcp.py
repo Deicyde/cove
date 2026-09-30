@@ -104,8 +104,8 @@ def _append(path, obj):
         f.write(json.dumps(obj) + "\n")
 
 
-def _await_reply(req):
-    deadline = time.time() + REPLY_WAIT
+def _await_reply(req, wait=REPLY_WAIT, poll=0.1):
+    deadline = time.time() + wait
     while time.time() < deadline:
         try:
             with open(REPLIES) as f:
@@ -118,7 +118,7 @@ def _await_reply(req):
                         return r
         except OSError:
             pass
-        time.sleep(0.1)
+        time.sleep(poll)
     return None
 
 
@@ -672,7 +672,7 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"}, "frame": {"type": "string"}, "cwd": {"type": "string"},
          "command": {"type": "string"}, "prompt": {"type": "string"},
-         "host": {"type": "string", "description": "run it on this ssh host via cove-remote (e.g. kirans-macbook-pro)"},
+         "host": {"type": "string", "description": "run it on this ssh host via cove-remote (e.g. kirans-macbook-pro). From a remote agent it defaults to your own host; \"local\" runs it on the Mac"},
          "auto_mode": {"type": "boolean", "description": "claude children: shift+tab into auto mode (default true)"},
          "link": {"type": "boolean"},
          "link_text": {"type": "string"}},
@@ -740,7 +740,66 @@ def _child_view(sess, rec, terms_by_sess):
             "new_events": len(ev) - int(rec.get("seen", 0))}
 
 
+# --- relay: tools a remote agent runs on the Mac ------------------------------------
+#
+# Under cove-remote (COVE_REMOTE=1) this server runs on another machine: there's
+# no kitty to drive and no lineage file. So these tools are relayed: the call
+# goes out as a {"cmd": "rpc"} line in commands.jsonl, which the daemon ships to
+# the Mac like any other command. The cove-remote client there takes it out of
+# the stream (Godot never sees it) and runs it through this same file
+# (`cove_mcp.py --call`) as ITS termling's session, so a remote agent can only
+# drive its own descendants, and the answer comes back in replies.jsonl.
+# The client passes COVE_RELAY_HOST, so a remote agent's children run on its
+# host too unless it asks for host "local".
+
+RELAYED = {"whoami", "children", "spawn", "send", "read", "wait", "kill", "place", "link", "screenshot"}
+
+
+def _relayed():
+    return os.environ.get("COVE_REMOTE") == "1"
+
+
+def relay(name, args):
+    req = uuid.uuid4().hex[:12]
+    _append(CMDS, {"cmd": "rpc", "req": req, "session": my_session(), "tool": name, "args": args})
+    if name == "wait":
+        wait = min(float(args.get("timeout", 900)), 3600.0) + 120
+    elif name == "spawn":
+        wait = 300.0   # waking a hibernated host, then settling claude
+    else:
+        wait = 90.0
+    r = _await_reply(req, wait, 0.3)
+    if r is None:
+        raise ValueError("no answer from the Mac for %s after %ds (is the link up?)" % (name, wait))
+    if not r.get("ok", False):
+        err = r.get("error") or "failed on the Mac"
+        if str(err).startswith("unknown command"):
+            err = ("the cove-remote client on the Mac is too old to relay %s; rebuild it and "
+                   "`kill -USR2` the client (pid in /tmp/cove/remote/<session>.json)" % name)
+        raise ValueError(err)
+    res = r.get("result")
+    if isinstance(res, dict) and "__image__" in res:
+        return Image(base64.b64decode(res["__image__"]), res.get("meta"))
+    return res
+
+
+def run_relayed():
+    """`cove_mcp.py --call`: run one relayed tool call ({"tool", "args"} on
+    stdin) for the cove-remote client and print {"ok", "result"|"error"}."""
+    try:
+        req = json.load(sys.stdin)
+        res = call_tool(str(req["tool"]), req.get("args") or {})
+        if isinstance(res, Image):
+            res = {"__image__": base64.b64encode(res.png).decode(), "meta": res.meta}
+        out = {"ok": True, "result": res}
+    except Exception as e:
+        out = {"ok": False, "error": str(e)}
+    sys.stdout.write(json.dumps(out))
+
+
 def call_tool(name, args):
+    if name in RELAYED and _relayed():
+        return relay(name, args)
     if name == "whoami":
         t = me()
         if not t:
@@ -860,6 +919,9 @@ def call_tool(name, args):
             raise ValueError("no COVE_SESSION: a child needs an owner")
         child = "cove-%d" % random.randint(100000000, 999999999)
         cwd = os.path.expanduser(str(args.get("cwd") or t.get("cwd") or os.getcwd()))
+        host = str(args.get("host") or os.environ.get("COVE_RELAY_HOST") or "").strip()
+        if host == "local":
+            host = ""
         zone, pos, own_frame = "", None, None
         if args.get("frame"):
             zone, _ = _container_rect(str(args["frame"]))
@@ -875,7 +937,9 @@ def call_tool(name, args):
                         "color": "grey"})
             own_frame = zone
         wrapper = os.path.join(HERE, "..", "cove-shell.sh")
-        out = _kitten("launch", "--type=os-window", "--cwd", cwd,
+        # A remote child's folder is on its host; the local shell only runs cove-remote.
+        local_cwd = cwd if not host or os.path.isdir(cwd) else os.path.expanduser("~")
+        out = _kitten("launch", "--type=os-window", "--cwd", local_cwd,
                       "--env", "COVE_SPAWN_SESSION=" + child, "--env", "COVE_PARENT=" + sess,
                       os.path.abspath(wrapper))
         try:
@@ -909,7 +973,6 @@ def call_tool(name, args):
             with open(pf, "w") as f:
                 f.write(str(args["prompt"]))
             command += ' "$(cat %s)"' % pf
-        host = str(args.get("host") or "").strip()
         inner = command
         if host:
             # The local shell expands $(cat prompt) before cove-remote quotes it
@@ -1113,4 +1176,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--call"]:
+        run_relayed()
+    else:
+        main()
