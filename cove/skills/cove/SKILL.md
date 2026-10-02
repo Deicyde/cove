@@ -35,8 +35,9 @@ error if you aren't in one.
 - **`status(state, summary?)`**: `needs_you`, `blocked` or `done` puts a "!"
   badge on your termling and queues you for the user's attention. If the user
   isn't focused on anything, focus jumps to you; otherwise you wait in a queue,
-  and focus comes to you when they leave their current termling. Call it once;
-  don't repeat it. `working` clears it.
+  and focus comes to you when they leave their current termling. Do not repeat
+  the same state and summary; later state transitions are allowed. `working`
+  clears it.
 - The Stop/Notification hooks already ping when you finish or wait for input.
   Use `status` for something more specific ("blocked: need the API key").
 
@@ -78,6 +79,31 @@ watch every one on the board and step in. You own what you spawn (and what they
 spawn); only those can you drive. `cove-team` is the general workflow (tasks →
 frames → termlings → steer); `iterate-pr` is the PR version.
 
+### Own the child lifecycle
+
+Visible termlings are ongoing workstreams, not disposable command runners. The
+lead that spawns them owns their inventory and cleanup.
+
+- Use your own terminal for ordinary commands. Spawn a shell only when a
+  separate cwd, permission boundary, or genuinely long-running observable job
+  requires one. Batch related one-shot commands into one helper, then close it.
+- Before spawning, name the work item and its terminal condition. Use one child
+  per workstream and send follow-ups to that child instead of creating another
+  termling with the same job.
+- Spawn only as much work as you can actively supervise; queue the remainder.
+  A user authorizing a swarm does not require filling every available slot.
+- While orchestrating, reconcile `children` after waits, after interruptions or
+  changed user direction, and before you finish or hand off. Every live child
+  must be active on a named task, explicitly waiting for input, or intentionally
+  retained for inspection.
+- When a child finishes, capture its result and preserve any unique work (a
+  commit, patch, path, or report), then `kill` it immediately. Killing a
+  termling does not require deleting its worktree.
+- Never leave an idle prompt-only shell, duplicate helper, or abandoned task on
+  the board. If a child must remain across turns, tell the user its name and
+  purpose. If it is not yours, do not close it: report what you observed and
+  leave ownership to its parent or the user.
+
 - **`spawn(name, frame?, cwd?, command?, prompt?, link?, link_text?)`**:
   a new termling in `frame` (with no frame, it gets a small frame of its own in
   free space beside you), with a dashed grey arrow from your termling to it. `command` runs in
@@ -108,7 +134,8 @@ camera. Look after you lay things out, and fix overlaps with
 `update_note(id, x, y, w, h)`. A termling's screen is about 330×185 world units,
 and its crew stand below it, so a frame for three side by side is about 1300×480.
 
-No strays: every child goes in a frame, and you kill children whose job is done.
+No strays: every child goes in a frame, and a final `children` audit closes all
+completed helpers before you report completion.
 
 ## Notes
 
