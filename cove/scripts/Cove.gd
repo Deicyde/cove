@@ -2370,6 +2370,14 @@ func _bd_term_cache_put(cache: Dictionary, key: String, value: Dictionary) -> vo
 		for i in int(BD_TERM_FALLBACK_CACHE / 4):
 			cache.erase(oldest[i])
 
+
+func _bd_forget_term_fallbacks(shape_id: String) -> void:
+	for cache in [_bd_term_last, _bd_term_fallbacks]:
+		for slot in cache.keys():
+			var cached = cache[slot]
+			if typeof(cached) == TYPE_DICTIONARY and str(cached.get("id", "")) == shape_id:
+				cache.erase(slot)
+
 # pid -> cwd for many pids in a single lsof call (`p<pid>` then `n<path>` lines).
 func _cwds_of(pids: Array) -> Dictionary:
 	var res := {}
@@ -5347,8 +5355,11 @@ func _bd_new(type: String) -> Dictionary:
 
 func _bd_add(s: Dictionary) -> void:
 	_bd_dirty = true
+	var id := str(s["id"])
+	if not _bd_by_id.has(id):
+		_bd_forget_term_fallbacks(id)
 	_bd_shapes.append(s)
-	_bd_by_id[str(s["id"])] = s
+	_bd_by_id[id] = s
 	if str(s["type"]) == "bookmark":
 		_bd_bm_apply(s)
 

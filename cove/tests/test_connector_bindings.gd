@@ -595,6 +595,39 @@ func _test_deleted_connector_history_keeps_latest_term_fallback() -> void:
 	cove.free()
 
 
+func _test_reused_connector_id_does_not_inherit_term_fallback() -> void:
+	var cove := _new_cove()
+	var group := DummyGroup.new()
+	group.position = Vector2(200, 200)
+	cove.add_child(group)
+	cove._groups[77] = group
+	cove._sessions[77] = "binding-test"
+	var old_line := _add_line(cove, [Vector2(250, 200), Vector2(500, 200)])
+	old_line["bind_a"] = "term:binding-test"
+	old_line["bind_a_uv"] = [1.0, 0.5]
+	var reused_id := str(old_line["id"])
+	cove._bd_freeze_term_bindings(77)
+	var old_slot: String = cove._bd_term_fallback_slot(reused_id, "a", "term:binding-test")
+	_check(cove._bd_term_last.has(old_slot) and cove._bd_term_fallbacks.has(old_slot),
+		"freezing a connector should cache both its live and missing-term fallback")
+	cove._groups.erase(77)
+	cove._bd_remove([reused_id])
+
+	var replacement: Dictionary = cove._bd_new("line")
+	replacement["id"] = reused_id
+	replacement["points"] = [cove._bd_a(Vector2(700, 600)), cove._bd_a(Vector2(900, 600))]
+	replacement["bind_a"] = "term:binding-test"
+	replacement["bind_a_uv"] = [1.0, 0.5]
+	cove._bd_add(replacement)
+	_check(not cove._bd_term_last.has(old_slot) and not cove._bd_term_fallbacks.has(old_slot),
+		"adding a replacement connector should discard the old connector's fallback caches")
+	cove._bd_restore(cove._bd_snapshot())
+	replacement = cove._bd_by_id[reused_id]
+	_check_vec(cove._bd_pts(replacement)[0], Vector2(700, 600),
+		"a replacement connector must not inherit a deleted connector's term fallback")
+	cove.free()
+
+
 func _test_term_loss_during_gesture_keeps_history_semantics() -> void:
 	var cove := _new_cove()
 	var group := DummyGroup.new()
@@ -716,6 +749,7 @@ func _run() -> void:
 	_test_bound_connectors_flip_with_targets()
 	_test_missing_termling_uses_latest_fallback()
 	_test_deleted_connector_history_keeps_latest_term_fallback()
+	_test_reused_connector_id_does_not_inherit_term_fallback()
 	_test_term_loss_during_gesture_keeps_history_semantics()
 	_test_term_fallbacks_are_kept_per_target()
 	_test_legacy_unbound_connectors()
