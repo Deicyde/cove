@@ -45,6 +45,37 @@ func baseDir() string {
 
 func sessionDir(s string) string { return filepath.Join(baseDir(), s) }
 
+func acquireSessionLock(sess string, timeout time.Duration) (*os.File, error) {
+	if err := os.MkdirAll(baseDir(), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(baseDir(), "."+sess+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return f, nil
+		}
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
+			f.Close()
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			f.Close()
+			return nil, fmt.Errorf("session %s is already starting or running", sess)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func releaseSessionLock(f *os.File) {
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
+}
+
 // --- bridge ------------------------------------------------------------------
 
 func runBridge() error {
@@ -166,24 +197,17 @@ func runServe(arg string) error {
 	if err := json.Unmarshal(raw, &h); err != nil {
 		return err
 	}
+	lock, err := acquireSessionLock(h.Session, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer releaseSessionLock(lock)
 	d := &daemon{dir: sessionDir(h.Session)}
 	d.cond = sync.NewCond(&d.mu)
 	d.coveDir = filepath.Join(d.dir, "cove")
 	for _, sub := range []string{"events", "mail", "prompts", "shots"} {
 		os.MkdirAll(filepath.Join(d.coveDir, sub), 0o700)
 	}
-	lock, err := os.OpenFile(filepath.Join(d.dir, "lock"), os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return err
-	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		lock.Close()
-		return errors.New("session already starting or running")
-	}
-	defer func() {
-		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-		_ = lock.Close()
-	}()
 	sock := filepath.Join(d.dir, "sock")
 	if c, err := net.Dial("unix", sock); err == nil {
 		c.Close()

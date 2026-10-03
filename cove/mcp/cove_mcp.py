@@ -442,7 +442,7 @@ def _pids_of_session(sess):
 
 def _process_snapshot():
     try:
-        r = subprocess.run(["/bin/ps", "-Ao", "pid=,ppid=,lstart=,ucomm=,command="],
+        r = subprocess.run(["/bin/ps", "-Ao", "pid=,ppid=,lstart=,state=,ucomm=,command="],
                            capture_output=True, text=True)
     except OSError:
         return None
@@ -450,15 +450,15 @@ def _process_snapshot():
         return None
     procs, kids = {}, {}
     for line in r.stdout.splitlines():
-        sp = line.split(None, 8)
-        if len(sp) < 9:
+        sp = line.split(None, 9)
+        if len(sp) < 10:
             continue
         try:
             pid, ppid = int(sp[0]), int(sp[1])
         except ValueError:
             continue
         procs[pid] = {"ppid": ppid, "start": " ".join(sp[2:7]),
-                      "comm": sp[7], "cmd": sp[8]}
+                      "state": sp[7], "comm": sp[8], "cmd": sp[9]}
         kids.setdefault(ppid, []).append(pid)
     return procs, kids
 
@@ -502,7 +502,8 @@ def _live_refs(refs):
     if snapshot is None:
         return None
     procs, _kids = snapshot
-    return [ref for ref in refs if ref[0] in procs and procs[ref[0]]["start"] == ref[1]]
+    return [ref for ref in refs if ref[0] in procs and procs[ref[0]]["start"] == ref[1]
+            and not str(procs[ref[0]].get("state", "")).startswith("Z")]
 
 
 def _signal_refs(refs, sig, best_effort=True):

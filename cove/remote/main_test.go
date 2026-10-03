@@ -230,3 +230,44 @@ func TestRunServeKillControlEndToEnd(t *testing.T) {
 		t.Fatalf("retired session directory remains: %v", err)
 	}
 }
+
+func TestRunServeWaitsForTransientCleanupLock(t *testing.T) {
+	setShortHome(t)
+	t.Setenv("COVE_REMOTE_NO_CAFFEINATE", "1")
+	sess := "cove-lock-race"
+	lock, err := acquireSessionLock(sess, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := hello{Session: sess, Client: "test", Resume: -1, Rows: 24, Cols: 80,
+		Cwd: os.Getenv("HOME"), Cmd: "sleep 60"}
+	b, _ := json.Marshal(h)
+	done := make(chan error, 1)
+	go func() { done <- runServe(base64.StdEncoding.EncodeToString(b)) }()
+	time.Sleep(100 * time.Millisecond)
+	releaseSessionLock(lock)
+	t.Cleanup(func() { _ = localKill(sess) })
+
+	sock := filepath.Join(sessionDir(sess), "sock")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(sock); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server lost the startup race with transient cleanup")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := localKill(sess); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session daemon did not exit")
+	}
+}

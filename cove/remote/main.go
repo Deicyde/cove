@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
 )
 
@@ -180,15 +179,11 @@ func localKill(sess string) error {
 }
 
 func killStaleSession(sess, dir string) error {
-	lock, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	lock, err := acquireSessionLock(sess, 0)
 	if err != nil {
-		return err
-	}
-	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return fmt.Errorf("session %s is starting or running but its control socket is unavailable", sess)
 	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	defer releaseSessionLock(lock)
 	if c, err := net.DialTimeout("unix", filepath.Join(dir, "sock"), 200*time.Millisecond); err == nil {
 		c.Close()
 		return fmt.Errorf("session %s control became available; retry", sess)

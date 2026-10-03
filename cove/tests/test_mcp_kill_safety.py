@@ -7,6 +7,8 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -160,6 +162,43 @@ class KillSessionTest(unittest.TestCase):
         with mock.patch.object(cove_mcp, "_process_snapshot", return_value=(procs, kids)):
             self.assertEqual(cove_mcp._session_refs("cove-123"),
                              ((100, "master"), [(102, "agent"), (101, "shell")]))
+
+    def test_zombie_child_does_not_block_parent_teardown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "child.pid"
+            code = (
+                "import pathlib,subprocess,sys; "
+                "p=subprocess.Popen(['sleep','60']); "
+                "pathlib.Path(sys.argv[1]).write_text(str(p.pid)); p.wait()"
+            )
+            parent = subprocess.Popen(
+                [sys.executable, "-c", code, str(marker)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            child_pid = None
+            try:
+                deadline = time.time() + 2
+                while not marker.exists() and time.time() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(marker.exists(), "child pid was not published")
+                child_pid = int(marker.read_text())
+                snapshot = cove_mcp._process_snapshot()
+                self.assertIsNotNone(snapshot)
+                procs, _kids = snapshot
+                master = (parent.pid, procs[parent.pid]["start"])
+                child = (child_pid, procs[child_pid]["start"])
+                with mock.patch.object(cove_mcp, "_session_refs",
+                                       return_value=(master, [child])):
+                    self.assertTrue(cove_mcp._kill_session("cove-test"))
+                parent.wait(timeout=2)
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait()
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_remote_failure_does_not_kill_local_control_session(self) -> None:
         failed = subprocess.CompletedProcess([], 1, "", "host unreachable")
