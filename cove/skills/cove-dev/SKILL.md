@@ -15,7 +15,8 @@ It's usually already cloned at `~/Documents/code/kitty` (app in `cove/`). If it
 isn't, clone the fork and check out the `cove` branch:
 
 ```
-git clone -b cove https://github.com/kiranandcode/cove ~/Documents/code/cove
+git clone -b cove https://github.com/Deicyde/cove ~/Documents/code/cove
+git -C ~/Documents/code/cove remote add upstream https://github.com/kiranandcode/cove
 ```
 
 kitty itself must be built once (`cove/README.md` has the steps); the app needs
