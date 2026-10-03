@@ -639,6 +639,13 @@ def _kill_session(sess):
             _signal_refs(stopped, signal.SIGCONT)
 
 
+def _kill_session_cli(args):
+    if len(args) != 2 or args[0] != "--kill-session" or not re.fullmatch(r"cove-[0-9]+", args[1]):
+        print("usage: cove_mcp.py --kill-session cove-<digits>", file=sys.stderr)
+        return 2
+    return 0 if _kill_session(args[1]) else 1
+
+
 def _terminate_child_session(sess, rec):
     host = str(rec.get("host") or "")
     if host:
@@ -1463,8 +1470,13 @@ def main():
             reply_error(rid, -32601, "method not found: " + str(method))
 
 
+def _dispatch(args):
+    if args == ["--call"]:
+        return run_relayed()
+    if args[:1] == ["--kill-session"]:
+        return _kill_session_cli(args)
+    return main()
+
+
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--call"]:
-        run_relayed()
-    else:
-        main()
+    raise SystemExit(_dispatch(sys.argv[1:]))
