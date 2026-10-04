@@ -154,6 +154,7 @@ var _deleting_sessions := {} # term_id -> {session, until}: pending permanent de
 const DELETE_PENDING_MS := 10000
 var _pos_by_session := {}    # session -> [x,y], to restore across a kitty restart
 var _name_by_session := {}   # session -> custom name, ditto
+var _name_pending_session := {} # term_id -> explicitly assigned before its session was learned
 var _pos_restored := {}      # term_id -> true once its position has been restored
 var _win_rect := {}          # last-known *windowed* os-window rect {pos,size} (not while maximized)
 
@@ -650,6 +651,10 @@ func _remove_group(id: int) -> void:
 		_bd_freeze_term_bindings(id)
 		_groups[id].queue_free()
 		_groups.erase(id)
+	# Kitty can reuse an os-window id for another termling. Sessioned names restore
+	# by their stable key; a pre-session assignment has no safe owner after removal.
+	if sess != "" or _name_pending_session.has(id):
+		_names.erase(id)
 	_sessions.erase(id)   # a reused kitty id must not inherit a dead session
 	var deleting = _deleting_sessions.get(id, null)
 	if deleting is Dictionary and str(deleting.get("session", "")) == sess:
@@ -659,6 +664,7 @@ func _remove_group(id: int) -> void:
 		_names.erase(id)
 		_pos_restored.erase(id)
 		_zone_saved.erase(id)
+	_name_pending_session.erase(id)
 	_deleting_sessions.erase(id)
 	_page_meta.erase(id)
 	_zone_of.erase(id)
@@ -1985,6 +1991,12 @@ func _find(id: int) -> Node2D:
 
 # --- layout persistence (hot-reload keeps positions/names/camera) -----------
 
+func _restore_id_name(id: int, name: String, pending_session: bool) -> void:
+	if pending_session:
+		_name_pending_session[id] = true
+	if name != "" or pending_session:
+		_names[id] = name
+
 func _load_layout() -> void:
 	# Durable session-keyed names/positions first (this survives a cold start, which
 	# wipes /tmp/cove); state.json below then overrides with the freshest values.
@@ -2020,8 +2032,9 @@ func _load_layout() -> void:
 			pos[id] = t.get("pos", [0, 0])
 		# Names with a session are restored by session (_learn_session), never by
 		# id: ids are reissued when kitty restarts.
-		if str(t.get("name", "")) != "" and str(t.get("session", "")) == "":
-			_names[id] = str(t["name"])
+		if str(t.get("session", "")) == "":
+			_restore_id_name(id, str(t.get("name", "")),
+				bool(t.get("name_pending_session", false)))
 		if t.get("following", null) != null:
 			follows[id] = int(t["following"])
 		# Zone membership: "container" (a board shape id, "" = loose), or an older
@@ -2752,6 +2765,21 @@ func _bg_restore_all() -> void:
 	DirAccess.remove_absolute(DIR + "/bg-pids.json")
 
 
+# Keep every live/id/session name store in sync. A name assigned before the ls
+# poll learns its stable session is marked so _learn_session does not replay an
+# older saved name over it.
+func _set_term_name(id: int, name: String) -> void:
+	_names[id] = name
+	if _groups.has(id):
+		_groups[id].terminal.set_custom_name(name)
+	var session := str(_sessions.get(id, ""))
+	if session != "":
+		_name_by_session[session] = name
+		_name_pending_session.erase(id)
+	else:
+		_name_pending_session[id] = true
+
+
 # A remote shadow pane (from cove-remote-auto.sh) carries the title
 # "◈ <name> @ <peer>". Parse that and toggle the termling's remote treatment;
 # any other title clears it. Also seeds the nameplate name once.
@@ -2771,7 +2799,7 @@ func _apply_remote_marker(g: Node2D, title: String) -> void:
 		peer = body.substr(at + 3).strip_edges()
 	g.terminal.set_remote(true, peer)
 	if name != "" and g.terminal.custom_name == "":
-		g.terminal.set_custom_name(name)
+		_set_term_name(g.term_id, name)
 
 
 # Once we learn a termling's abduco session (from the ls poll) remember it for
@@ -2780,18 +2808,21 @@ func _apply_remote_marker(g: Node2D, title: String) -> void:
 func _learn_session(id: int, g: Node2D, session: String) -> void:
 	if session == "":
 		return
+	var previous := str(_sessions.get(id, ""))
 	_sessions[id] = session
+	if previous != session:
+		if _name_pending_session.has(id):
+			_name_by_session[session] = g.terminal.custom_name
+			_name_pending_session.erase(id)
+		elif _name_by_session.has(session):
+			_names[id] = _name_by_session[session]
+			g.terminal.set_custom_name(_name_by_session[session])
 	if _pos_restored.has(id):
 		return
 	_pos_restored[id] = true
 	if _pos_by_session.has(session):
 		var p = _pos_by_session[session]
 		g.position = Vector2(p[0], p[1])
-	# The session name beats whatever the id-keyed restore applied: after a kitty
-	# restart the ids are fresh, so an id-keyed name belongs to some other termling.
-	if _name_by_session.has(session):
-		_names[id] = _name_by_session[session]
-		g.terminal.set_custom_name(_name_by_session[session])
 
 
 func _apply_follows() -> void:
@@ -2861,8 +2892,7 @@ func _apply_zones() -> void:
 			if g.zone_rect() != null:
 				g.clear_zone()
 			continue
-		if g.terminal.custom_name == "":
-			_name_from_zone(id, cur)   # an unnamed termling takes its zone's name
+		_maybe_name_from_zone(id, cur)
 		var r = _bd_container_rect(cur)
 		if r == null:
 			_zone_of[id] = ""   # its shape was deleted: loose again
@@ -2908,7 +2938,7 @@ func _reconfine(id: int) -> void:
 
 
 # On drop, membership follows the drop point: land inside a frame or box on the
-# board to live there (and take its name), on open ground to be loose.
+# board to live there; an unnamed termling also takes its name.
 func _reassign_zone_on_drop(g: Node2D) -> void:
 	var sid := _bd_container_at(g.get_ground_pos())
 	_zone_of[g.term_id] = sid
@@ -2916,8 +2946,13 @@ func _reassign_zone_on_drop(g: Node2D) -> void:
 		g.clear_zone()
 	else:
 		g.assign_zone(_bd_container_rect(sid))
-		_name_from_zone(g.term_id, sid)
+		_maybe_name_from_zone(g.term_id, sid)
 		_fs_zone_cd(g, sid)
+
+
+func _maybe_name_from_zone(id: int, sid: String) -> void:
+	if _groups.has(id) and _groups[id].terminal.custom_name == "":
+		_name_from_zone(id, sid)
 
 
 # A termling in a named frame/box is called by that name: "Radial menu", then
@@ -2936,8 +2971,7 @@ func _name_from_zone(id: int, sid: String) -> void:
 		nm = "%s %d" % [label, n]
 		n += 1
 	if _groups[id].terminal.custom_name != nm:
-		_names[id] = nm
-		_groups[id].terminal.set_custom_name(nm)
+		_set_term_name(id, nm)
 
 
 # --- control channel --------------------------------------------------------
@@ -2993,8 +3027,7 @@ func _apply_spawn_places() -> void:
 			continue
 		_spawn_place.erase(g.terminal.pane_id)
 		if str(want["name"]) != "":
-			_names[id] = str(want["name"])
-			g.terminal.set_custom_name(str(want["name"]))
+			_set_term_name(id, str(want["name"]))
 		_place_group(g, str(want["zone"]), want["pos"], true)
 		_pos_restored[id] = true
 	var now := Time.get_ticks_msec()
@@ -3093,8 +3126,7 @@ func _exec_command(c: Dictionary) -> String:
 			if g == null:
 				return "no such terminal"
 			var nm := str(c.get("name", ""))
-			_names[g.term_id] = nm
-			g.terminal.set_custom_name(nm)
+			_set_term_name(g.term_id, nm)
 		"assign":
 			# Put a termling in a named frame/box on the board (a frame is drawn around
 			# it if none has that name), or zone "" to set it loose. The MCP only lets
@@ -3520,6 +3552,7 @@ func _write_state() -> void:
 			"pane_id": g.terminal.pane_id,
 			"session": _sessions.get(id, ""),
 			"name": g.terminal.custom_name,
+			"name_pending_session": _name_pending_session.has(id),
 			"pos": [snappedf(g.position.x, 0.1), snappedf(g.position.y, 0.1)],
 			"cols": g.terminal.cols,
 			"rows": g.terminal.rows,
@@ -3849,12 +3882,7 @@ func _open_rename(g: Node2D) -> void:
 func _apply_rename() -> void:
 	if _rename_id != -1:
 		var nm := _rename_edit.text.strip_edges()
-		_names[_rename_id] = nm
-		var sess := str(_sessions.get(_rename_id, ""))
-		if sess != "":
-			_name_by_session[sess] = nm   # capture now so a restart restores it
-		if _groups.has(_rename_id):
-			_groups[_rename_id].terminal.set_custom_name(nm)
+		_set_term_name(_rename_id, nm)
 	_close_rename()
 
 
@@ -4139,8 +4167,7 @@ func _poll_quick(delta: float) -> void:
 func _quick_apply(g: Node2D, res: Dictionary) -> void:
 	var nm := str(res.get("name", ""))
 	if nm != "":
-		_names[g.term_id] = nm
-		g.terminal.set_custom_name(nm)
+		_set_term_name(g.term_id, nm)
 	var zone := str(res.get("zone", ""))
 	var nf = res.get("new_frame", null)
 	if typeof(nf) == TYPE_DICTIONARY:
@@ -4203,8 +4230,7 @@ func _quick_await_place(g: Node2D, token: String, qk: Dictionary) -> void:
 	var res: Dictionary = qk["res"]
 	var nm := str(res.get("name", ""))
 	if nm != "" and g.terminal.custom_name == "":
-		_names[g.term_id] = nm
-		g.terminal.set_custom_name(nm)
+		_set_term_name(g.term_id, nm)
 	_quick_ask[g.term_id] = {"token": token, "q": qk["q"], "ask": str(res.get("ask", "")),
 		"options": res.get("options", [])}
 	if _focused_id == g.term_id:
