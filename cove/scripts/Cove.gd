@@ -438,9 +438,9 @@ func _process(delta: float) -> void:
 		# flying onto holds still instead of juddering against a camera a frame behind.
 		_fly_step.call_deferred(delta)   # owns pan *and* zoom until it lands; then tracking (or the preview) takes over
 	elif _previewing():
-		_cam.position = _cam.position.lerp(_groups[_preview_id].terminal.global_position, 8.0 * delta)
+		_ease_cam(_groups[_preview_id].terminal.global_position, 8.0 * delta)
 	elif _avy_open:
-		_cam.position = _cam.position.lerp(_avy_cam, 8.0 * delta)
+		_ease_cam(_avy_cam, 8.0 * delta)
 	elif _present_id != -1 and _groups.has(_present_id):
 		_present_lock = minf(_present_lock + 3.0 * delta, 1.0)
 		_snap_present_cam.call_deferred(delta)   # after this frame's bob is applied
@@ -453,7 +453,7 @@ func _process(delta: float) -> void:
 		_track_lock = minf(_track_lock + 3.0 * delta, 1.0)
 		_snap_track_cam.call_deferred(delta)   # after this frame's bob is applied
 	elif _cam_return:
-		_cam.position = _cam.position.lerp(_preview_return_cam, 8.0 * delta)
+		_ease_cam(_preview_return_cam, 8.0 * delta)
 		if _cam.position.distance_to(_preview_return_cam) < 2.0:
 			_cam_return = false
 	# Present ("fill the window") mode: zoom the camera so the presented termling
@@ -1757,6 +1757,13 @@ func _ease_zoom(goal: float, delta: float) -> void:
 	_cam.zoom = Vector2(z, z)
 
 
+# Pan the camera toward target. Weights are rate * delta, so a stalled frame asks
+# for more than 1: clamp it, or the camera overshoots, and a run of slow frames
+# compounds the overshoot until it flings the camera off the board.
+func _ease_cam(target: Vector2, weight: float) -> void:
+	_cam.position = _cam.position.lerp(target, clampf(weight, 0.0, 1.0))
+
+
 func _leave_present() -> void:
 	if _present_id == -1:
 		return
@@ -1775,14 +1782,14 @@ func _snap_track_cam(delta: float) -> void:
 	if _tracking_id == -1 or not _groups.has(_tracking_id):
 		return
 	var target: Vector2 = _groups[_tracking_id].terminal.global_position
-	_cam.position = _cam.position.lerp(target, maxf(_track_lock, 6.0 * delta))
+	_ease_cam(target, maxf(_track_lock, 6.0 * delta))
 
 
 func _snap_present_cam(delta: float) -> void:
 	if _present_id == -1 or not _groups.has(_present_id):
 		return
 	var target: Vector2 = _groups[_present_id].terminal.global_position
-	_cam.position = _cam.position.lerp(target, maxf(_present_lock, 6.0 * delta))
+	_ease_cam(target, maxf(_present_lock, 6.0 * delta))
 
 
 # Camera zoom at which g's terminal spans VIEW_FILL of the window. onscreen_size()
@@ -2366,7 +2373,7 @@ func _apply_agent_state() -> void:
 	# one-shot camera pan to a terminal that needs input (only if not following)
 	if _pan_once != -1 and _tracking_id == -1 and _groups.has(_pan_once):
 		var tp: Vector2 = _groups[_pan_once].terminal.global_position
-		_cam.position = _cam.position.lerp(tp, 5.0 * get_process_delta_time())
+		_ease_cam(tp, 5.0 * get_process_delta_time())
 		if _cam.position.distance_to(tp) < 24.0:
 			_pan_once = -1
 
