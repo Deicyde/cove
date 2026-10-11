@@ -29,8 +29,15 @@ Terminal plus mosh, built for the Cove:
   `COVE_SESSION` and a `KITTY_COVE_DIR` that the daemon mirrors to the local
   `/tmp/cove`. So a remote Claude's Stop/Notification hooks badge the termling,
   and its cove MCP `status` / `rename` / `add_note` / `report` / `whoami` /
-  `board` work. `spawn` / `send` / `read` from a remote agent don't work (they
-  drive the local kitty). The local Cove reads `/tmp/cove/remote/<session>.json`
+  `board` work. So do `spawn` / `send` / `read` / `wait` / `kill` / `place` /
+  `children` / `link` / `screenshot`: the remote MCP relays them as `{"cmd": "rpc"}`
+  lines in `commands.jsonl`, and the Mac's cove-remote client runs them
+  (`cove_mcp.py --call`) as this termling's session, so the usual rule holds
+  (only your own descendants), and answers in `replies.jsonl`. A remote
+  agent's children run on its host by default (`host: "local"` for the Mac).
+  Needs the current client (`kill -USR2` older ones) and the current
+  `cove/mcp/cove_mcp.py` on the host (scp it; a running agent needs `/mcp`
+  reconnect). The local Cove reads `/tmp/cove/remote/<session>.json`
   for the real agent/cwd and shows `name @ host` on the nameplate.
 - **Transport.** `ssh -tt host cove-remote bridge` (the `-tt` makes sshd set
   TCP_NODELAY, so keystrokes aren't Nagle-delayed). It uses the usual key auth

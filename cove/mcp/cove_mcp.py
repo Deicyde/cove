@@ -43,6 +43,7 @@ GAP = 40.0   # clearance find_space keeps around everything already on the board
 
 STATUSES = ["working", "needs_you", "blocked", "done"]
 NOTE_TYPES = ["note", "todo", "text"]
+SHARED_TODO_FIELDS = {"add_items", "check", "uncheck", "remove"}
 
 
 def _load(path, default):
@@ -65,6 +66,20 @@ def read_state():
 
 def read_board():
     return _load(BOARD, {"shapes": []})
+
+
+def read_board_checked():
+    for attempt in range(5):
+        try:
+            with open(BOARD) as f:
+                board = json.load(f)
+            if not isinstance(board, dict) or not isinstance(board.get("shapes"), list):
+                raise ValueError("invalid board state")
+            return board
+        except (OSError, ValueError) as e:
+            if attempt == 4:
+                raise ValueError("board state unavailable: %s" % e)
+            time.sleep(0.05)
 
 
 def my_session():
@@ -104,8 +119,8 @@ def _append(path, obj):
         f.write(json.dumps(obj) + "\n")
 
 
-def _await_reply(req):
-    deadline = time.time() + REPLY_WAIT
+def _await_reply(req, wait=REPLY_WAIT, poll=0.1):
+    deadline = time.time() + wait
     while time.time() < deadline:
         try:
             with open(REPLIES) as f:
@@ -118,7 +133,7 @@ def _await_reply(req):
                         return r
         except OSError:
             pass
-        time.sleep(0.1)
+        time.sleep(poll)
     return None
 
 
@@ -155,6 +170,49 @@ def require_own(shape_id):
         raise ValueError("no shape %r on the board" % shape_id)
     if s.get("owner") != sess:
         raise ValueError("shape %r isn't yours; you can only change shapes you created" % shape_id)
+
+
+def _require_note_update(shape_id, fields):
+    """Owner gets full access; a todo editor gets content-only access."""
+    sess = my_session()
+    if not sess:
+        raise ValueError("no COVE_SESSION: can't prove ownership of board shapes")
+    shape = _shape(shape_id)
+    if shape is None:
+        if str(shape_id).startswith(sess + "."):
+            return None
+        raise ValueError("no shape %r on the board" % shape_id)
+    if shape.get("owner") == sess:
+        return shape
+    editors = shape.get("editors", [])
+    shared = (shape.get("type") == "todo" and isinstance(editors, list)
+              and sess in [str(editor) for editor in editors])
+    if not shared:
+        raise ValueError("shape %r isn't yours; you can only change shapes you created" % shape_id)
+    forbidden = sorted(set(fields) - SHARED_TODO_FIELDS)
+    if forbidden:
+        raise ValueError("shared editors can only change todo content, not %s" % ", ".join(forbidden))
+    return shape
+
+
+def _term_session(ref):
+    """Resolve a live termling reference to its stable session; names must be unique."""
+    terms = _terms()
+    needle = str(ref)
+    exact = [t for t in terms if needle != "" and str(t.get("session", "")) == needle]
+    if exact:
+        return needle
+    matches = [t for t in terms if needle != "" and any(
+        str(t.get(key, "")) == needle for key in ("id", "pane_id", "name"))]
+    sessions = {str(t.get("session", "")) for t in matches}
+    if len(sessions) > 1:
+        raise ValueError("termling reference %r is ambiguous; use its session" % ref)
+    if len(matches) >= 1:
+        session = next(iter(sessions))
+        if session:
+            return session
+        raise ValueError("termling %r has no stable session yet" % ref)
+    raise ValueError("no termling %r (by id, session or name)" % ref)
 
 
 def _frames():
@@ -274,6 +332,26 @@ def require_child(ref):
     if not sess or not _is_descendant(t.get("session", ""), sess):
         raise ValueError("termling %r isn't one you spawned; you can only drive your own children" % ref)
     return t
+
+
+def _killable_child_session(ref, lin):
+    """Owned live child, or an exited lineage record retained for cleanup retry."""
+    t = _term(ref)
+    sess = my_session()
+    if t is not None:
+        child = str(t.get("session", ""))
+        if sess and _is_descendant(child, sess, lin):
+            return child
+        raise ValueError("termling %r isn't one you spawned; you can only drive your own children" % ref)
+    needle = str(ref)
+    matches = [s for s, rec in lin.items() if not rec.get("dead")
+               and _is_descendant(s, sess, lin)
+               and needle in (s, str(rec.get("name", "")))]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError("child name %r is ambiguous; use its session" % ref)
+    raise ValueError("no live child or pending cleanup %r" % ref)
 
 
 def _events(sess):
@@ -398,46 +476,224 @@ def _wait_for_pane(pane, session, zone, timeout=15.0):
 
 
 def _pids_of_session(sess):
-    """(abduco master pid, [descendant pids]) for an abduco session."""
-    out = subprocess.run(["/bin/ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    """Session process tree, or None when the process listing itself failed."""
+    refs = _session_refs(sess)
+    if refs is None:
+        return None
+    master, desc = refs
+    return (master[0] if master else None, [ref[0] for ref in desc])
+
+
+def _process_snapshot():
+    try:
+        r = subprocess.run(["/bin/ps", "-Ao", "pid=,ppid=,lstart=,state=,ucomm=,command="],
+                           capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
     procs, kids = {}, {}
-    for line in out.splitlines():
-        sp = line.split(None, 2)
-        if len(sp) < 3:
+    for line in r.stdout.splitlines():
+        sp = line.split(None, 9)
+        if len(sp) < 10:
             continue
-        pid, ppid = int(sp[0]), int(sp[1])
-        procs[pid] = sp[2]
+        try:
+            pid, ppid = int(sp[0]), int(sp[1])
+        except ValueError:
+            continue
+        procs[pid] = {"ppid": ppid, "start": " ".join(sp[2:7]),
+                      "state": sp[7], "comm": sp[8], "cmd": sp[9]}
         kids.setdefault(ppid, []).append(pid)
-    for pid, cmd in procs.items():
-        if "abduco" in cmd and re.search(r"(^|\s)%s(\s|$)" % re.escape(sess), cmd) and kids.get(pid):
-            desc, q = [], list(kids[pid])
-            while q:
-                c = q.pop()
-                desc.append(c)
-                q.extend(kids.get(c, []))
-            return pid, desc
+    return procs, kids
+
+
+def _session_refs(sess):
+    snapshot = _process_snapshot()
+    if snapshot is None:
+        return None
+    procs, kids = snapshot
+    for pid, proc in procs.items():
+        owns_session = re.search(r"(?:^|\s)-[Aa]\s+%s(?:\s|$)" % re.escape(sess), proc["cmd"])
+        if proc["comm"] != "abduco" or not owns_session or not kids.get(pid):
+            continue
+        desc, seen = [], set()
+
+        def collect(parent):
+            for child in kids.get(parent, []):
+                if child in seen or child not in procs:
+                    continue
+                seen.add(child)
+                collect(child)
+                desc.append((child, procs[child]["start"]))
+
+        # Deepest-first, so parents survive a failed leaf kill.
+        collect(pid)
+        return (pid, proc["start"]), desc
     return None, []
 
 
-def _kill_session(sess):
-    master, desc = _pids_of_session(sess)
-    if master is None:
-        return False
-    for sig in (signal.SIGHUP, signal.SIGTERM):
-        for p in desc:
-            try:
-                os.kill(p, sig)
-            except OSError:
-                pass
-        time.sleep(0.8)
-        if _pids_of_session(sess)[0] is None:
-            return True
-    for p in desc + [master]:
+def _merge_refs(base, extra):
+    seen, out = set(), []
+    for ref in list(base) + list(extra):
+        if ref not in seen:
+            seen.add(ref)
+            out.append(ref)
+    return out
+
+
+def _live_refs(refs):
+    snapshot = _process_snapshot()
+    if snapshot is None:
+        return None
+    procs, _kids = snapshot
+    return [ref for ref in refs if ref[0] in procs and procs[ref[0]]["start"] == ref[1]
+            and not str(procs[ref[0]].get("state", "")).startswith("Z")]
+
+
+def _signal_refs(refs, sig, best_effort=True):
+    signaled = []
+    ok = True
+    for ref in refs:
+        live = _live_refs([ref])
+        if live is None:
+            ok = False
+            if not best_effort:
+                break
+            continue
+        if not live:
+            continue
+        pid, start = ref
         try:
-            os.kill(p, signal.SIGKILL)
+            os.kill(pid, sig)
+            signaled.append((pid, start))
+        except ProcessLookupError:
+            continue
         except OSError:
-            pass
-    return True
+            ok = False
+            if not best_effort:
+                break
+    return signaled, ok
+
+
+def _wait_refs_gone(refs, timeout):
+    deadline = time.time() + timeout
+    while True:
+        live = _live_refs(refs)
+        if live == []:
+            return True
+        if live is None:
+            return False
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _kill_session(sess):
+    tree = _session_refs(sess)
+    if tree is None:
+        return False
+    master, desc = tree
+    if master is None:
+        return True
+    owned = [master] + desc
+    stopped = []
+    success = False
+    try:
+        newly_stopped, ok = _signal_refs(owned, signal.SIGSTOP)
+        stopped = _merge_refs(stopped, newly_stopped)
+        if not ok:
+            return False
+        stable = False
+        for _round in range(4):
+            latest = _session_refs(sess)
+            if latest is None:
+                return False
+            latest_master, latest_desc = latest
+            if latest_master is not None and latest_master != master:
+                return False
+            latest_set = set(latest_desc)
+            stale = [ref for ref in owned if ref != master and ref not in latest_set]
+            expanded = [master] + _merge_refs(stale, latest_desc)
+            if len(expanded) == len(owned):
+                stable = True
+                break
+            owned = expanded
+            newly_stopped, ok = _signal_refs(owned, signal.SIGSTOP)
+            stopped = _merge_refs(stopped, newly_stopped)
+            if not ok:
+                return False
+        if not stable:
+            return False
+        descendants = [ref for ref in owned if ref != master]
+        for ref in descendants:
+            _signaled, ok = _signal_refs([ref], signal.SIGKILL, False)
+            if not ok or not _wait_refs_gone([ref], 2.0):
+                return False
+        _signaled, ok = _signal_refs([master], signal.SIGKILL, False)
+        if not ok:
+            return False
+        success = _wait_refs_gone(owned, 2.0)
+        return success
+    finally:
+        if not success:
+            _signal_refs(stopped, signal.SIGCONT)
+
+
+def _kill_session_cli(args):
+    if len(args) != 2 or args[0] != "--kill-session" or not re.fullmatch(r"cove-[0-9]+", args[1]):
+        print("usage: cove_mcp.py --kill-session cove-<digits>", file=sys.stderr)
+        return 2
+    return 0 if _kill_session(args[1]) else 1
+
+
+def _terminate_child_session(sess, rec):
+    host = str(rec.get("host") or "")
+    if host:
+        try:
+            r = subprocess.run([os.path.join(HERE, "..", "bin", "cove-remote"), "kill", host, sess],
+                               capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, "remote termination failed: %s" % e
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout or "exit %d" % r.returncode).strip()[:300]
+            return False, "remote termination failed: %s" % detail
+    if not _kill_session(sess):
+        return False, "local session did not exit"
+    return True, ""
+
+
+def _kill_order(root, lin):
+    victims = [root] + [s for s, rec in lin.items()
+                        if not rec.get("dead") and _is_descendant(s, root, lin)]
+
+    def depth(sess):
+        n, seen = 0, set()
+        while sess != root and sess not in seen:
+            seen.add(sess)
+            sess = (lin.get(sess) or {}).get("parent")
+            n += 1
+        return n
+
+    return sorted(victims, key=lambda s: (-depth(s), s))
+
+
+def _killed_shape_ids(killed, authorized, lin, board):
+    owners = set(authorized)
+    recorded = set()
+    for sess in killed:
+        for key in ("arrow", "frame"):
+            if (lin.get(sess) or {}).get(key):
+                recorded.add(str(lin[sess][key]))
+    gone = {"term:" + sess for sess in killed}
+    ids = []
+    for shape in board.get("shapes", []):
+        owned = str(shape.get("owner", "")) in owners
+        if owned and str(shape.get("id", "")) in recorded:
+            ids.append(str(shape["id"]))
+        if owned and shape.get("type") == "arrow" \
+                and (shape.get("bind_a") in gone or shape.get("bind_b") in gone):
+            ids.append(str(shape["id"]))
+    return sorted(set(ids))
 
 
 # --- board geometry: where things are, and where there's room --------------------
@@ -601,7 +857,7 @@ TOOLS = [
      "description": "Your own termling: id, session, name, frame (container), agent, position. Errors if you're not running inside the Cove.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "list_terminals",
-     "description": "Every termling in the Cove: id, session, name, agent (claude/codex/opencode/shell), busy/attention, the frame it belongs to (container), cwd, project, title. Also the board's frames ('zones': id, name, rect). Read-only.",
+     "description": "Every termling in the Cove: id, session, name, agent (claude/codex/muse/opencode/shell), busy/attention, the frame it belongs to (container), cwd, project, title. Also the board's frames ('zones': id, name, rect). Read-only.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "board",
      "description": "Read the shapes on the Cove's board: the user's frames, boxes, text and arrows, plus agents' notes. mine=true returns only the shapes you own. Read-only.",
@@ -624,7 +880,7 @@ TOOLS = [
      "description": "Take your own termling out of its frame onto open ground.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "add_note",
-     "description": "Put a note, todo list or text label on the board next to your termling, e.g. your plan as a todo list. You own it: only you (and the user) can change it. Returns its id for update_note/link/delete_notes.",
+     "description": "Put a note, todo list or text label on the board next to your termling. You own it and, by default, only you and the user can change it; share_todo can grant incremental checklist access. Returns its id.",
      "inputSchema": {"type": "object", "properties": {
          "type": {"type": "string", "enum": NOTE_TYPES},
          "text": {"type": "string"},
@@ -635,7 +891,7 @@ TOOLS = [
      "description": "Put a link on the board next to your termling as a bookmark card (title, preview image, favicon), as pasting a URL into tldraw does. GitHub pull requests and issues show their live state (open/draft/merged/closed) and +/- lines, re-checked every few minutes, so this is the way to hand the user a PR you opened. You own the card (delete it with delete_notes). Returns its id.",
      "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
     {"name": "update_note",
-     "description": "Change one of your own board shapes: replace text/color/items, append add_items, check/uncheck/remove a todo item (by index or text), or move/resize it (x, y, w, h).",
+     "description": "Change one of your own board shapes. A shared todo editor may use only incremental checklist fields (add_items, check, uncheck, remove); its owner retains title, layout, style, full-list replacement and deletion.",
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}, "text": {"type": "string"}, "color": {"type": "string"},
          "x": {"type": "number"}, "y": {"type": "number"}, "w": {"type": "number"}, "h": {"type": "number"},
@@ -643,6 +899,13 @@ TOOLS = [
          "add_items": {"type": "array", "items": {"type": "string"}},
          "check": {}, "uncheck": {}, "remove": {}},
          "required": ["id"]}},
+    {"name": "share_todo",
+     "description": "Owner-only: replace a todo board's shared editor list with live termlings resolved to stable sessions. An empty list revokes all shared access. Editors can incrementally add/check/uncheck/remove items but cannot rename, move, restyle, replace, delete or reshare the todo.",
+     "inputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"},
+         "editors": {"type": "array", "items": {"type": "string"},
+                     "description": "termling ids, sessions, pane ids or unique names"}},
+         "required": ["id", "editors"]}},
     {"name": "link",
      "description": "Draw an arrow from one of your own shapes, one of your children, or 'me' (your termling) to a termling (its id) or a board shape (its id). The arrow is yours. dash: draw (default) / solid / dashed / dotted.",
      "inputSchema": {"type": "object", "properties": {
@@ -672,7 +935,7 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"}, "frame": {"type": "string"}, "cwd": {"type": "string"},
          "command": {"type": "string"}, "prompt": {"type": "string"},
-         "host": {"type": "string", "description": "run it on this ssh host via cove-remote (e.g. kirans-macbook-pro)"},
+         "host": {"type": "string", "description": "run it on this ssh host via cove-remote (e.g. kirans-macbook-pro). From a remote agent it defaults to your own host; \"local\" runs it on the Mac"},
          "auto_mode": {"type": "boolean", "description": "claude children: shift+tab into auto mode (default true)"},
          "link": {"type": "boolean"},
          "link_text": {"type": "string"}},
@@ -709,7 +972,7 @@ TOOLS = [
          "teleport": {"type": "boolean"}},
          "required": ["id"]}},
     {"name": "kill",
-     "description": "Close one of YOUR children: ends its shell and agent and removes its termling (and its descendants, and the arrows you drew to it).",
+     "description": "Recursively close one of YOUR children and its descendants. Returns only verified closures in killed; failed/retained remain live. A cleanup_error keeps exited lineage retryable by session. Removes only board artifacts owned by your authorized subtree.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
     {"name": "delete_notes",
      "description": "Delete board shapes you own, by id.",
@@ -732,15 +995,76 @@ def _arrow(t, src, dst, text=None, dash=None, color=None):
 def _child_view(sess, rec, terms_by_sess):
     t = terms_by_sess.get(sess)
     ev = _events(sess)
+    procs = _pids_of_session(sess)
     return {"session": sess, "name": rec.get("name"), "parent": rec.get("parent"),
-            "alive": t is not None or _pids_of_session(sess)[0] is not None,
+            # A failed process scan is unknown, never evidence that a child died.
+            "alive": t is not None or procs is None or procs[0] is not None,
             "id": t.get("id") if t else None,
             "frame": t.get("zone") if t else None, "agent": t.get("agent") if t else None,
             "last_event": ev[-1]["event"] if ev else None,
             "new_events": len(ev) - int(rec.get("seen", 0))}
 
 
+# --- relay: tools a remote agent runs on the Mac ------------------------------------
+#
+# Under cove-remote (COVE_REMOTE=1) this server runs on another machine: there's
+# no kitty to drive and no lineage file. So these tools are relayed: the call
+# goes out as a {"cmd": "rpc"} line in commands.jsonl, which the daemon ships to
+# the Mac like any other command. The cove-remote client there takes it out of
+# the stream (Godot never sees it) and runs it through this same file
+# (`cove_mcp.py --call`) as ITS termling's session, so a remote agent can only
+# drive its own descendants, and the answer comes back in replies.jsonl.
+# The client passes COVE_RELAY_HOST, so a remote agent's children run on its
+# host too unless it asks for host "local".
+
+RELAYED = {"whoami", "children", "spawn", "send", "read", "wait", "kill", "place", "link", "screenshot"}
+
+
+def _relayed():
+    return os.environ.get("COVE_REMOTE") == "1"
+
+
+def relay(name, args):
+    req = uuid.uuid4().hex[:12]
+    _append(CMDS, {"cmd": "rpc", "req": req, "session": my_session(), "tool": name, "args": args})
+    if name == "wait":
+        wait = min(float(args.get("timeout", 900)), 3600.0) + 120
+    elif name == "spawn":
+        wait = 300.0   # waking a hibernated host, then settling claude
+    else:
+        wait = 90.0
+    r = _await_reply(req, wait, 0.3)
+    if r is None:
+        raise ValueError("no answer from the Mac for %s after %ds (is the link up?)" % (name, wait))
+    if not r.get("ok", False):
+        err = r.get("error") or "failed on the Mac"
+        if str(err).startswith("unknown command"):
+            err = ("the cove-remote client on the Mac is too old to relay %s; rebuild it and "
+                   "`kill -USR2` the client (pid in /tmp/cove/remote/<session>.json)" % name)
+        raise ValueError(err)
+    res = r.get("result")
+    if isinstance(res, dict) and "__image__" in res:
+        return Image(base64.b64decode(res["__image__"]), res.get("meta"))
+    return res
+
+
+def run_relayed():
+    """`cove_mcp.py --call`: run one relayed tool call ({"tool", "args"} on
+    stdin) for the cove-remote client and print {"ok", "result"|"error"}."""
+    try:
+        req = json.load(sys.stdin)
+        res = call_tool(str(req["tool"]), req.get("args") or {})
+        if isinstance(res, Image):
+            res = {"__image__": base64.b64encode(res.png).decode(), "meta": res.meta}
+        out = {"ok": True, "result": res}
+    except Exception as e:
+        out = {"ok": False, "error": str(e)}
+    sys.stdout.write(json.dumps(out))
+
+
 def call_tool(name, args):
+    if name in RELAYED and _relayed():
+        return relay(name, args)
     if name == "whoami":
         t = me()
         if not t:
@@ -813,12 +1137,32 @@ def call_tool(name, args):
                "owner": sess, "url": url}
         return dict(send(CMDS, cmd), id=sid)
     if name == "update_note":
-        require_own(args["id"])
+        fields = [key for key in args if key != "id"]
+        _require_note_update(args["id"], fields)
         cmd = {"cmd": "board", "op": "update", "id": args["id"]}
         for k in ("text", "color", "items", "add_items", "check", "uncheck", "remove", "x", "y", "w", "h"):
             if k in args:
                 cmd[k] = args[k]
         return send(CMDS, cmd)
+    if name == "share_todo":
+        require_own(args["id"])
+        shape = _shape(args["id"])
+        if shape is None:
+            raise ValueError("todo %r is not mirrored on the board yet" % args["id"])
+        if shape.get("type") != "todo":
+            raise ValueError("only todo boards can have shared editors")
+        owner = str(shape.get("owner", ""))
+        refs = args.get("editors")
+        if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref.strip()
+                                             for ref in refs):
+            raise ValueError("editors must be a list of nonempty termling references")
+        editors = []
+        for ref in refs:
+            session = _term_session(ref.strip())
+            if session != owner and session not in editors:
+                editors.append(session)
+        cmd = {"cmd": "board", "op": "update", "id": args["id"], "editors": editors}
+        return dict(send(CMDS, cmd), id=args["id"], editors=editors)
     if name == "link":
         t = require_me()
         sess = my_session()
@@ -860,6 +1204,9 @@ def call_tool(name, args):
             raise ValueError("no COVE_SESSION: a child needs an owner")
         child = "cove-%d" % random.randint(100000000, 999999999)
         cwd = os.path.expanduser(str(args.get("cwd") or t.get("cwd") or os.getcwd()))
+        host = str(args.get("host") or os.environ.get("COVE_RELAY_HOST") or "").strip()
+        if host == "local":
+            host = ""
         zone, pos, own_frame = "", None, None
         if args.get("frame"):
             zone, _ = _container_rect(str(args["frame"]))
@@ -875,7 +1222,9 @@ def call_tool(name, args):
                         "color": "grey"})
             own_frame = zone
         wrapper = os.path.join(HERE, "..", "cove-shell.sh")
-        out = _kitten("launch", "--type=os-window", "--cwd", cwd,
+        # A remote child's folder is on its host; the local shell only runs cove-remote.
+        local_cwd = cwd if not host or os.path.isdir(cwd) else os.path.expanduser("~")
+        out = _kitten("launch", "--type=os-window", "--cwd", local_cwd,
                       "--env", "COVE_SPAWN_SESSION=" + child, "--env", "COVE_PARENT=" + sess,
                       os.path.abspath(wrapper))
         try:
@@ -909,7 +1258,6 @@ def call_tool(name, args):
             with open(pf, "w") as f:
                 f.write(str(args["prompt"]))
             command += ' "$(cat %s)"' % pf
-        host = str(args.get("host") or "").strip()
         inner = command
         if host:
             # The local shell expands $(cat prompt) before cove-remote quotes it
@@ -990,7 +1338,8 @@ def call_tool(name, args):
             for s in targets:
                 ev = _events(s)[int((lin.get(s) or {}).get("seen", 0)):]
                 reps = [m for m in mail if m.get("from") == s]
-                if s not in live and _pids_of_session(s)[0] is None:
+                procs = _pids_of_session(s)
+                if s not in live and procs is not None and procs[0] is None:
                     # Gone for real: its abduco session has ended. (Missing from
                     # state.json alone isn't enough: right after a reload the Cove
                     # hasn't relearned sessions yet.)
@@ -1021,43 +1370,52 @@ def call_tool(name, args):
             cmd["pos"] = args["pos"]
         return send(CMDS, cmd)
     if name == "kill":
-        c = require_child(args["id"])
         lin = read_lineage()
-        victims = [c["session"]] + [s for s in lin if _is_descendant(s, c["session"], lin)]
-        arrows = []
-        for s in victims:
-            if (lin.get(s) or {}).get("host"):
-                # Closing the termling only detaches cove-remote; end the session.
-                try:
-                    subprocess.run([os.path.join(HERE, "..", "bin", "cove-remote"), "kill",
-                                    lin[s]["host"], s], capture_output=True, timeout=15)
-                except (OSError, subprocess.SubprocessError):
-                    pass
-            _kill_session(s)
-            if s in lin:
-                lin[s]["dead"] = int(time.time())
-                for k in ("arrow", "frame"):
-                    if lin[s].get(k):
-                        arrows.append(lin[s][k])
-        write_lineage(lin)
-        # Everything that belonged to the killed termlings goes: the arrow and
-        # frame we made for each (keyed by its owner's session: ours for the
-        # child, the child's for its own children), plus any arrow still tied to
-        # one of them. Only deleting ids with *our* prefix left the child's
-        # arrows to its children dangling on the board.
-        owners = tuple(s + "." for s in [my_session()] + victims)
-        gone = {"term:" + s for s in victims}
-        ids = [a for a in arrows if str(a).startswith(owners)]
-        for sh in read_board().get("shapes", []):
-            if sh.get("type") == "arrow" and (sh.get("bind_a") in gone or sh.get("bind_b") in gone):
-                ids.append(str(sh["id"]))
-        ids = sorted(set(ids))
+        root = _killable_child_session(args["id"], lin)
+        victims = _kill_order(root, lin)
+        killed, failed, retained = [], {}, {}
+        for sess in victims:
+            blockers = [s for s in failed if _is_descendant(s, sess, lin)]
+            if blockers:
+                retained[sess] = "descendant %s is still alive" % sorted(blockers)[0]
+                continue
+            ok, why = _terminate_child_session(sess, lin.get(sess) or {})
+            if ok:
+                killed.append(sess)
+            else:
+                failed[sess] = why
+
+        # Remove only artifacts owned by this authorized subtree. User and
+        # unrelated-agent arrows bound to a closed termling remain on the board.
+        caller = my_session()
+        authorized = [caller] + [s for s in lin if _is_descendant(s, caller, lin)]
+        cleanup_error = ""
+        try:
+            board = read_board_checked()
+        except ValueError as e:
+            board, cleanup_error = {"shapes": []}, str(e)
+        ids = _killed_shape_ids(killed, authorized, lin, board)
         if ids:
             try:
-                send(CMDS, {"cmd": "board", "op": "delete", "ids": ids})
-            except ValueError:
-                pass
-        return {"ok": True, "killed": victims}
+                reply = send(CMDS, {"cmd": "board", "op": "delete", "ids": ids})
+                if not reply.get("confirmed", False):
+                    cleanup_error = "board cleanup was not confirmed"
+            except (OSError, ValueError) as e:
+                cleanup_error = str(e)
+        if killed and not cleanup_error:
+            now = int(time.time())
+            for sess in killed:
+                if sess in lin:
+                    lin[sess]["dead"] = now
+            write_lineage(lin)
+        result = {"ok": not failed and not retained and not cleanup_error, "killed": killed}
+        if failed:
+            result["failed"] = failed
+        if retained:
+            result["retained"] = retained
+        if cleanup_error:
+            result["cleanup_error"] = cleanup_error
+        return result
 
     if name == "delete_notes":
         ids = [str(i) for i in args["ids"]]
@@ -1112,5 +1470,13 @@ def main():
             reply_error(rid, -32601, "method not found: " + str(method))
 
 
+def _dispatch(args):
+    if args == ["--call"]:
+        return run_relayed()
+    if args[:1] == ["--kill-session"]:
+        return _kill_session_cli(args)
+    return main()
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(_dispatch(sys.argv[1:]))

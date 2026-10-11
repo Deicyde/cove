@@ -58,50 +58,67 @@ as soon as the command or observable job ends.
 
 ## 4. Steer
 
-Loop on `wait(mode="any")`:
+Loop on `wait(mode="any")`. Process every entry in `finished`, even when the
+same result has `timed_out: true`; those events and reports are already consumed.
 
 - **Turn ended**: `read(id, lines=200)` and judge it.
   - Done and good: replace its todo item with
-    `<task> — <one-line outcome>`, check it, preserve the result, and `kill`
-    the child. Spawn the next queued task into its frame.
+    `<task> — <one-line outcome>`, check it, and preserve the result. Reconcile
+    `children`; if its subtree has no active or retained work, `kill` the live
+    child by id or finalize an exited child by session, requiring `ok: true`.
+    Spawn the next queued task only after closure is confirmed.
   - Needs more: `send` one short follow-up ("Please also cover X", "Please fix
     that and commit").
-  - Went wrong: `kill` it and respawn fresh with a sharper prompt. Once only.
-    After that, leave it up and `status(blocked, "<task>: <why>")`.
+  - Went wrong: preserve anything useful, audit its subtree, then `kill` it and
+    require `ok: true` before respawning with a sharper prompt. Once only. After
+    that, leave it up for user action or inspection and
+    `status(blocked, "<task>: <why>")`.
 - **Asking a question or a permission prompt**: answer it with `send` if the
   answer is in the task. Otherwise `status(needs_you, "<task> asks …")` and keep
   waiting on the others.
-- **Timed out**: `wait` again.
+- **Timed out**: after processing any `finished` entries, wait again on
+  `still_running`.
 - **`trust_prompt: true` from spawn**: the user accepts the folder.
   `status(needs_you, ...)`.
 
-After each completion or change of direction, call `children` and reconcile the
-live set with the todo. Close finished helpers immediately; do not wait until
-the end of the whole swarm.
+After every state-changing wait or change of direction, call `children` and
+reconcile the set with the todo. `alive: false` means the termling exited; call
+`kill(session)` to finalize its owned board artifacts and lineage. Never kill a
+child lead while its subtree contains active or retained work.
+If `kill` returns `ok: false`, process its `killed`, `failed` and `retained`
+entries and reconcile `children`. `cleanup_error` means owned board artifacts
+for sessions in `killed` still need cleanup; it does not close `failed` or
+`retained`. Do not reuse the frame or claim successful completion while either
+live work or cleanup remains.
 
 ## 5. Finish
 
 When the todo is all ticked:
 
-- Call `children` once more. Preserve any unique uncommitted work, kill every
-  completed or idle child, and explicitly name any blocked child intentionally
-  left for the user. A worktree may remain after its termling is closed.
+- Call `children` once more. Preserve unique work, kill every completed live
+  child, and finalize every exited child by session, except one the user
+  explicitly asked to retain. Do not kill an ancestor of blocked or retained
+  work. Name every retained child, reason and next action in the handoff. Verify
+  every cleanup returned `ok: true`; otherwise the team is blocked, not
+  complete. A worktree may remain after its termling is closed.
 - Combine the results in your own reply (a table or a short list, one line per
   task). For N-copies tasks, merge them: say where they agree and pick the
   strongest.
-- `report(...)` to your parent if you have one, then `status(done, "<one
-  line>")`.
+- If you have a parent, call `report(state="done", ...)` as your last
+  state-changing action. Otherwise finish with `status(done, "<one line>")`.
 - Leave the completed team frames and todo for the user to clear; this
   team-specific handoff overrides the base skill's optional note cleanup.
   Remove worktrees only when their work is merged or not needed.
 
 ## Rules
 
-- Every termling goes in a frame, and every finished one is killed. No strays.
-- A successful completion report leaves zero finished team children alive.
-  Unrelated and user-owned termlings remain untouched.
-- No duplicate task termlings and no idle prompt-only shells. A live child must
-  have a named current purpose visible to the lead.
+- Every termling goes in a frame, and every unretained completed child is killed
+  or finalized by session. No strays.
+- A successful completion report leaves no completed team child alive unless
+  the user explicitly asked to retain it. Unrelated and user-owned termlings
+  remain untouched.
+- No duplicate live task termlings and no idle prompt-only shells. A live child
+  must have a named current purpose visible to the lead.
 - Only drive your own children.
 - A task that is itself a team can go to a child lead: spawn it with "Use
   cove-team: <task>" and it builds its own frames inside the one you gave it.

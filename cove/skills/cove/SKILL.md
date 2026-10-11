@@ -52,14 +52,20 @@ error if you aren't in one.
 
 ## Your notes on the board
 
-You can keep your own shapes on the board, placed next to your termling. Only
-you (and the user) can change them.
+You can keep your own shapes on the board, placed next to your termling. By
+default only you (and the user) can change them; todo owners may grant other
+termlings incremental checklist access.
 
 - **`add_note(type, text?, items?, color?)`**: `type` is `note`, `todo` or `text`.
   A `todo` with `items` makes a checklist, which is good for showing your plan.
   Returns the shape id.
-- **`update_note(id, ...)`**: replace `text` / `color` / `items`, append
-  `add_items`, or `check` / `uncheck` / `remove` an item (by index or text).
+- **`update_note(id, ...)`**: change one of your shapes. A shared todo editor may
+  only `add_items`, `check`, `uncheck` or `remove`; the owner retains title,
+  full-list, style, layout and deletion control.
+- **`share_todo(id, editors)`**: owner-only; replace a todo's editors with live
+  termlings resolved to stable sessions. An empty list revokes shared access.
+  Shared editors should address items by exact text, since concurrent changes
+  can shift numeric indices.
 - **`link(to, from?, text?)`**: an arrow from one of your shapes (or `me`, your
   termling) to a termling id or shape id.
 - **`add_link(url)`**: a bookmark card for a link (title, preview image,
@@ -81,28 +87,38 @@ frames → termlings → steer); `iterate-pr` is the PR version.
 
 ### Own the child lifecycle
 
-Visible termlings are ongoing workstreams, not disposable command runners. The
+Visible children are ongoing workstreams, not disposable command runners. The
 lead that spawns them owns their inventory and cleanup.
 
 - Use your own terminal for ordinary commands. Spawn a shell only when a
   separate cwd, permission boundary, or genuinely long-running observable job
   requires one. Batch related one-shot commands into one helper, then close it.
-- Before spawning, name the work item and its terminal condition. Use one child
-  per workstream and send follow-ups to that child instead of creating another
-  termling with the same job.
+- Before spawning, name the work item and its terminal condition. Use one live
+  child per workstream and send it follow-ups. A specialized workflow may rotate
+  fresh-context reviewers, but close one before starting its replacement unless
+  parallel review is intentional.
 - Spawn only as much work as you can actively supervise; queue the remainder.
   A user authorizing a swarm does not require filling every available slot.
-- While orchestrating, reconcile `children` after waits, after interruptions or
-  changed user direction, and before you finish or hand off. Every live child
-  must be active on a named task, explicitly waiting for input, or intentionally
-  retained for inspection.
-- When a child finishes, capture its result and preserve any unique work (a
-  commit, patch, path, or report), then `kill` it immediately. Killing a
-  termling does not require deleting its worktree.
-- Never leave an idle prompt-only shell, duplicate helper, or abandoned task on
-  the board. If a child must remain across turns, tell the user its name and
-  purpose. If it is not yours, do not close it: report what you observed and
-  leave ownership to its parent or the user.
+- Reconcile `children` after each state-changing `wait`, completion,
+  interruption or change of direction, and before you finish or hand off.
+  `alive: true` means a termling is still open; `alive: false` is an exited
+  lineage record. Finalize an exited child with `kill(session)` so its owned
+  board artifacts and lineage are cleaned up.
+- Before `kill`, capture the result, preserve unique work, and inspect the whole
+  descendant subtree. `kill` is recursive: never kill an ancestor of active or
+  retained work. A blocked child may remain for user action or inspection; name
+  it, the reason, and the next action in your handoff.
+- Inspect every `kill` result. Only sessions listed in `killed` are confirmed
+  closed. If `ok: false`, reconcile `failed` and `retained` against `children`
+  and handle any `cleanup_error`; that field means board artifacts for sessions
+  listed in `killed` still need cleanup, not that `failed` or `retained` closed.
+  Do not claim completion while either remains.
+- If you have a parent, make a final `report(state="done"|"failed", ...)` your
+  last state-changing action; the parent may kill your whole subtree as soon as
+  it arrives. A child uses `status` only when it needs user attention. A
+  top-level lead instead finishes with `status(done, ...)`.
+- Never leave an idle prompt-only shell, duplicate live helper, or abandoned
+  task. Never close a non-owned termling; report it to its parent or the user.
 
 - **`spawn(name, frame?, cwd?, command?, prompt?, link?, link_text?)`**:
   a new termling in `frame` (with no frame, it gets a small frame of its own in
@@ -118,12 +134,15 @@ lead that spawns them owns their inventory and cleanup.
 - **`wait(ids?, mode?, timeout?)`**: block until a child ends a turn (its Stop
   hook), needs input (Notification), `report`s, or exits, counting only what
   happened since your last `send`. Returns the event, reports and screen tail.
-  `timed_out` means call it again.
+  Events and reports returned in `finished` are consumed even when
+  `timed_out: true`; process them before waiting again on `still_running`.
 - **`report(text, state?)`**: a child tells its parent how it went. Lead with
-  the verdict (`APPROVED: …`).
+  the verdict (`APPROVED: …`). A final done/failed report is your last
+  state-changing action; use `progress` for non-final updates.
 - **`children`**: your descendants (alive, frame, last event) and reports.
+  Finalize an exited `alive: false` record with `kill(session)`.
 - **`place(id, frame? | pos?, teleport?)`** / **`kill(id)`**: move a child into
-  a frame; close it (and its descendants and your arrow to it).
+  a frame; recursively close it and its descendants after a subtree audit.
 
 Laying out: **`add_frame(title, w, h, x?, y?, near?, inside?)`** draws a titled
 frame you own, in free space when you omit x/y (`inside` nests it in another
@@ -134,8 +153,9 @@ camera. Look after you lay things out, and fix overlaps with
 `update_note(id, x, y, w, h)`. A termling's screen is about 330×185 world units,
 and its crew stand below it, so a frame for three side by side is about 1300×480.
 
-No strays: every child goes in a frame, and a final `children` audit closes all
-completed helpers before you report completion.
+No strays: every child goes in a frame. A final `children` audit closes every
+completed live child and finalizes every exited child you own unless the user
+explicitly asked to retain it.
 
 ## Notes
 

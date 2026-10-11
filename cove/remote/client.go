@@ -850,6 +850,11 @@ func (c *client) appendLocal(m fileMsg) {
 	if c.coveDir == "" || !appendRe.MatchString(m.Path) {
 		return
 	}
+	if m.Path == "commands.jsonl" {
+		if m.Data = c.takeRPC(m.Data); len(m.Data) == 0 {
+			return
+		}
+	}
 	p := filepath.Join(c.coveDir, m.Path)
 	os.MkdirAll(filepath.Dir(p), 0o755)
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -962,6 +967,9 @@ func (c *client) mirrorLoop() {
 			mirror.mu.Lock()
 			mirror.replies = off + int64(n)
 			mirror.mu.Unlock()
+			if replace {
+				c.resendRPC()
+			}
 		}
 	}
 }

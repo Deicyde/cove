@@ -10,10 +10,16 @@
 # kitty running and only relaunches Godot.
 set -euo pipefail
 
+_COVE_IOSURFACE_OVERRIDE_SET=${COVE_IOSURFACE+x}
+_COVE_IOSURFACE_OVERRIDE=${COVE_IOSURFACE-}
+
 DIR="/tmp/cove"
 [ -f "$DIR/dev-env" ] || { echo "Not in dev mode (no $DIR/dev-env). Start with cove/dev.sh." >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$DIR/dev-env"
+if [ "$_COVE_IOSURFACE_OVERRIDE_SET" = x ]; then
+    COVE_IOSURFACE=$_COVE_IOSURFACE_OVERRIDE
+fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KITTY="$REPO/kitty/launcher/kitty"
@@ -26,6 +32,8 @@ REATTACH="$REPO/cove/cove-reattach.sh"   # prints the saved screen, then abduco 
 SOCK="${COVE_KITTY_SOCKET:-unix:/tmp/cove-kitty}"
 ABDUCO="$REPO/cove/bin/abduco"   # patched: no alt screen (build-abduco.sh)
 [ -x "$ABDUCO" ] || ABDUCO="$(command -v abduco 2>/dev/null || echo /opt/homebrew/bin/abduco)"
+# shellcheck disable=SC1091
+source "$REPO/cove/cove-iosurface.sh"
 
 LOCK_FILE="/tmp/cove-launch.lock"
 COVE_KITTY_PID=""
@@ -40,6 +48,7 @@ write_dev_env() {
         echo "COVE_KITTY_SOCKET=$SOCK"
         echo "APP=$APP"
         echo "GODOT=$GODOT"
+        cove_write_iosurface_env
         [ -z "${1:-}" ] || echo "COVE_KITTY_PID=$1"
     } > "$DIR/dev-env.new"
     mv "$DIR/dev-env.new" "$DIR/dev-env"
@@ -85,6 +94,7 @@ if ! "$ABDUCO" >/dev/null 2>&1; then
     echo "failed to list abduco sessions" >&2
     exit 1
 fi
+cove_resolve_iosurface
 
 # Save each termling's screen + scrollback (with colours) while this kitty still
 # has it: abduco keeps the processes, not the screen, so without this every
@@ -117,13 +127,29 @@ with ThreadPoolExecutor(8) as ex:
 echo "saved $(ls "$DIR/scroll" 2>/dev/null | wc -l | tr -d ' ') termling screen(s)"
 
 # Stop Godot + kitty. The abduco masters (and the shells/agents they hold) keep
-# running, detached, so nothing inside the termlings is lost.
-pkill -if "godot --path $APP" 2>/dev/null || pkill -if 'godot --path' 2>/dev/null || true
+# running, detached, so nothing inside the termlings is lost. Match --path as
+# an argument pair: Godot may have flags such as --max-fps before it.
+GODOT_PIDS="$(ps -Ao pid=,command= | APP_PATH="$APP" awk '
+    {
+        is_godot = 0; has_app_path = 0
+        for (i = 2; i <= NF; i++) {
+            if (tolower($i) ~ /(^|\/)godot$/) is_godot = 1
+            if ($i == "--path" && i < NF && $(i + 1) == ENVIRON["APP_PATH"]) has_app_path = 1
+        }
+        if (is_godot && has_app_path) print $1
+    }
+')"
+for _p in $GODOT_PIDS; do kill "$_p" 2>/dev/null || true; done
 # Wait for Godot to be gone before touching kitty: a Godot still running while
 # the frame files vanish and reappear under new ids re-places those termlings
 # and saves the wrong spots to state.json (seen 2026-09-25 under heavy load).
-for _ in $(seq 1 50); do pgrep -if "godot --path $APP" >/dev/null || break; sleep 0.1; done
-pkill -9 -if "godot --path $APP" 2>/dev/null || true
+for _ in $(seq 1 50); do
+    _alive=0
+    for _p in $GODOT_PIDS; do kill -0 "$_p" 2>/dev/null && _alive=1; done
+    [ "$_alive" = 0 ] && break
+    sleep 0.1
+done
+for _p in $GODOT_PIDS; do kill -9 "$_p" 2>/dev/null || true; done
 # kitty.pid can outlive its kitty (a crash), and the pid be reused: only kill
 # it if it's still a Cove kitty.
 KPIDS="$(ps -Ao pid=,command= | awk '/[l]auncher\/kitty --title cove/ {print $1}')"
@@ -176,10 +202,9 @@ done
 rm -f /tmp/cove-kitty 2>/dev/null || true
 
 export COVE=1 KITTY_COVE=1 KITTY_COVE_DIR="$DIR"
-[ "${COVE_IOSURFACE:-}" = "1" ] && export KITTY_COVE_IOSURFACE=1
 
 COMMON=(--title cove --listen-on "$SOCK"
-    -o allow_remote_control=yes -o sync_to_monitor=no -o font_size=16
+    -o allow_remote_control=yes -o sync_to_monitor=no -o repaint_delay=16 -o font_size=16
     -o remember_window_size=no -o initial_window_width=110c -o initial_window_height=32c
     -o "map cmd+n cove_new_os_window"
     -o shell="$WRAPPER")
@@ -276,7 +301,7 @@ done
 # Refresh dev-env (new pid) and relaunch Godot.
 write_dev_env "$COVE_KITTY_PID"
 COVE_KITTEN="$KITTEN" COVE_KITTY_SOCKET="$SOCK" \
-    nohup "$GODOT" --path "$APP" 9>&- >/tmp/cove-godot.log 2>&1 &
+	nohup "$GODOT" --path "$APP" --max-fps 60 9>&- >/tmp/cove-godot.log 2>&1 &
 STARTUP_COMPLETE=true
 exec 9>&-
 echo "warm reload done: kitty restarted (new code), ${#SESSIONS[@]} termling(s) reattached."
