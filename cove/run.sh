@@ -6,6 +6,9 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KITTY="$REPO/kitty/launcher/kitty"
+# kitty holds ~5 fds per termling (pty, frame file, disk cache, pipes); the
+# 256 a login item inherits from launchd runs out near 50 termlings.
+ulimit -n 10240 2>/dev/null || true
 KITTEN="$REPO/kitty/launcher/kitty.app/Contents/MacOS/kitten"
 SOCK="unix:/tmp/cove-kitty"
 DIR="/tmp/cove"
@@ -72,6 +75,12 @@ if [ -n "$STUCK_KITTY" ]; then
     echo "kill -9 it (its termlings survive in abduco) and run this again." >&2
     exit 1
 fi
+
+# No live kitty can be reused from here on; this path will create one. Refuse
+# before session/frame cleanup when the caller already has a Seatbelt profile.
+# shellcheck disable=SC1091
+source "$REPO/cove/launch-context.sh"
+cove_require_clean_launch_context "$REPO" "cove/run.sh"
 
 # The abduco masters outlive a crashed Cove. Reattach detached sessions instead
 # of deleting their saved layout and starting one empty replacement terminal.

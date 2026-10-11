@@ -8,6 +8,9 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="$REPO/cove"
 KITTY="$REPO/kitty/launcher/kitty"
+# kitty holds ~5 fds per termling (pty, frame file, disk cache, pipes); the
+# 256 a login item inherits from launchd runs out near 50 termlings.
+ulimit -n 10240 2>/dev/null || true
 KITTEN="$REPO/kitty/launcher/kitty.app/Contents/MacOS/kitten"
 SOCK="unix:/tmp/cove-kitty"
 DIR="/tmp/cove"
@@ -19,6 +22,9 @@ ABDUCO="$APP/bin/abduco"
 [ -x "$KITTEN" ] || { echo "kitten not built ($KITTEN)" >&2; exit 1; }
 command -v "$GODOT" >/dev/null 2>&1 || { echo "godot not found; set GODOT=/path/to/godot" >&2; exit 1; }
 [ -x "$ABDUCO" ] || { echo "abduco not found at $ABDUCO" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "$APP/launch-context.sh"
+cove_require_clean_launch_context "$REPO" "cove/dev.sh"
 exec 9>/tmp/cove-launch.lock
 if ! /usr/bin/lockf -s -t 0 9; then
     echo "another Cove launch is already in progress" >&2

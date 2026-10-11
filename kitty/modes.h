@@ -65,6 +65,9 @@
 #define FOCUS_TRACKING (1004 << 5)
 #define MOUSE_UTF8_MODE (1005 << 5)
 #define MOUSE_SGR_MODE (1006 << 5)
+// xterm alternate-scroll mode. kitty already maps wheel events to cursor keys
+// on the alternate screen, so this is accepted as a compatibility no-op.
+#define ALTERNATE_SCROLL (1007 << 5)
 #define MOUSE_URXVT_MODE (1015 << 5)
 #define MOUSE_SGR_PIXEL_MODE (1016 << 5)
 

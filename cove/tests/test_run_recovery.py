@@ -27,6 +27,7 @@ class RunRecoveryTest(unittest.TestCase):
         self, sessions: list[str], *, attached: list[str] = (),
         lock_held: bool = False, kitty_alive: bool = False,
         godot_alive: bool = False, stuck_kitty: bool = False,
+        sandbox_rejected: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp = tempfile.TemporaryDirectory(prefix='cove-run-test-')
         self.addCleanup(temp.cleanup)
@@ -39,6 +40,10 @@ class RunRecoveryTest(unittest.TestCase):
         source = (REPO_ROOT / 'cove' / 'run.sh').read_text().replace('/tmp/cove', str(runtime))
         launcher = repo / 'cove' / 'run.sh'
         self.write_executable(launcher, source)
+        self.write_executable(
+            repo / 'cove' / 'launch-context.sh',
+            (REPO_ROOT / 'cove' / 'launch-context.sh').read_text(),
+        )
         (repo / 'cove' / '.godot').mkdir(parents=True)
         (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('')
 
@@ -71,6 +76,13 @@ class RunRecoveryTest(unittest.TestCase):
         self.write_executable(repo / 'cove' / 'cove-remote-start.sh', '#!/bin/sh\nexit 0\n')
         godot = fake_bin / 'godot'
         self.write_executable(godot, '#!/bin/sh\n: > "$GODOT_DONE"\n')
+        sandbox_exec = '/usr/bin/true'
+        if sandbox_rejected:
+            sandbox_exec = str(fake_bin / 'sandbox-exec')
+            self.write_executable(
+                Path(sandbox_exec),
+                '#!/bin/sh\necho "sandbox-exec: sandbox_apply: Operation not permitted" >&2\nexit 71\n',
+            )
 
         runtime.mkdir(parents=True)
         (runtime / 'state.json').write_text('saved-layout\n')
@@ -94,6 +106,7 @@ class RunRecoveryTest(unittest.TestCase):
             'KITTY_READY': str(root / 'kitty-ready'),
             'LAUNCH_ARGS': str(root / 'launch-args'),
             'PATH': f'{fake_bin}:/usr/bin:/bin',
+            'COVE_SANDBOX_EXEC': sandbox_exec,
             'RESIZE_ARGS': str(root / 'resize-args'),
             'SHELL': '/bin/zsh',
         }
@@ -123,6 +136,26 @@ class RunRecoveryTest(unittest.TestCase):
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
                 lock_file.close()
         return result, root
+
+    def test_cold_start_refuses_nested_sandbox_without_cleanup(self) -> None:
+        result, root = self.run_launcher([], sandbox_rejected=True)
+        runtime = root / 'runtime' / 'cove'
+
+        self.assertEqual(result.returncode, 71)
+        self.assertIn('refusing to launch kitty', result.stderr)
+        self.assertIn('Nothing was stopped', result.stderr)
+        self.assertFalse((root / 'kitty-args').exists())
+        self.assertEqual((runtime / 'state.json').read_text(), 'saved-layout\n')
+        self.assertEqual((runtime / 'term-7.rgba').read_text(), 'stale-kitty-frame\n')
+        self.assertEqual((root / 'runtime/cove-kitty').read_text(), 'stale-socket\n')
+
+    def test_live_kitty_can_relaunch_only_godot_from_nested_sandbox(self) -> None:
+        result, root = self.run_launcher(['cove-111'], kitty_alive=True, sandbox_rejected=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('relaunching Godot', result.stdout)
+        self.assertTrue((root / 'godot-done').exists())
+        self.assertFalse((root / 'kitty-args').exists())
 
     def test_concurrent_launcher_is_rejected(self) -> None:
         result, root = self.run_launcher([], lock_held=True)

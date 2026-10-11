@@ -376,6 +376,7 @@ void set_mouse_cursor(MouseShape);
 void enter_event(int modifiers, bool cursor_moved);
 void leave_event(int modifiers);
 void mouse_event(const int, int, int);
+bool cove_scrollbar_event(id_type, uint8_t, uint32_t, uint32_t);
 void focus_in_event(void);
 void scroll_event(const GLFWScrollEvent *ev);
 void on_key_input(const GLFWkeyevent *ev);

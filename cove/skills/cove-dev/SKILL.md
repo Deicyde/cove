@@ -15,7 +15,8 @@ It's usually already cloned at `~/Documents/code/kitty` (app in `cove/`). If it
 isn't, clone the fork and check out the `cove` branch:
 
 ```
-git clone -b cove https://github.com/kiranandcode/cove ~/Documents/code/cove
+git clone -b cove https://github.com/Deicyde/cove ~/Documents/code/cove
+git -C ~/Documents/code/cove remote add upstream https://github.com/kiranandcode/cove
 ```
 
 kitty itself must be built once (`cove/README.md` has the steps); the app needs
@@ -33,6 +34,13 @@ cove/dev.sh        # kitty (detached) + Godot
 cove/reload.sh     # relaunch Godot only; terminals + positions stay
 cove/stop.sh       # quit both
 ```
+
+On macOS, `dev.sh`, `run.sh`, and `reload-kitty.sh` refuse to create kitty
+when their caller already has a Seatbelt sandbox. Do not bypass that check:
+kitty would pass the inherited sandbox to every new termling, and Claude/Codex
+could not install their own sandbox. `reload.sh` is safe from an agent because
+it restarts only Godot. For a kitty/native-code restart, ask the user to run the
+printed command once from a normal Terminal/iTerm window.
 
 Positions come back because Godot writes `/tmp/cove/state.json` continuously and
 `Cove.gd::_load_layout()` reads it before the first frame, restoring each

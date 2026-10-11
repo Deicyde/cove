@@ -12,7 +12,7 @@
  *   [ 0] uint32 magic  = 0x4B4D454E ('KMEN')
  *   [ 4] uint32 width
  *   [ 8] uint32 height
- *   [12] uint32 seq            (bumped last, after pixels are written)
+ *   [12] uint32 seq            (odd while publishing, even when complete)
  *   [16] uint32 bytes_per_px   (always 4, RGBA)
  *   [20] uint32 flags          (bit0: rows are bottom-to-top / GL order)
  *   [24] uint32 pane_id_lo     (kitty window/pane id, for `@ --match id:`)
@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -99,6 +100,9 @@ resolve_dir(void) {
 //   [kind u8][id u64 LE] then, by kind:
 //     kind 0 (pty write): [len u32 LE][len bytes]  -> written to pane `id`
 //     kind 1 (resize):    [cols u32 LE][rows u32 LE] -> resize OS window `id`
+//     kind 7 (scroll):    [lines i32 LE] -> coalesced kitty history scroll
+//     kind 8 (scrollbar): [phase u8][x,y u32 LE] -> native scrollbar only
+//     kind 9 (pointer):   [phase u8][x,y,mods u32 LE] -> native kitty mouse path
 // pty writes go straight in (schedule_write_to_child is thread-safe + self-waking);
 // resizes touch global state so they're queued for the main render thread.
 
@@ -109,6 +113,9 @@ resolve_dir(void) {
 #define MSG_DETACH 4
 #define MSG_ADOPT 5
 #define MSG_SUSPEND 6   // [on u8]: stop/resume rendering a termling nobody can see
+#define MSG_SCROLL 7    // [lines i32]: positive scrolls toward older history
+#define MSG_SCROLLBAR 8 // [phase u8][x u32][y u32]: native scrollbar only
+#define MSG_POINTER 9   // [phase u8][x u32][y u32][mods u32]: native pixel pointer
 
 typedef struct { id_type id; uint32_t cols, rows; } PendingResize;
 static PendingResize resize_queue[COVE_MAX];
@@ -143,6 +150,20 @@ static int suspended_n = 0;
 typedef struct { id_type id; uint8_t phase; uint8_t in_left_half; uint32_t x, y; } PendingMouse;
 static PendingMouse mouse_queue[COVE_MOUSE_MAX];
 static int mouse_count = 0;
+
+// Relative scroll lines coalesce until the main thread drains them.
+typedef struct { id_type id; int32_t lines; } PendingScroll;
+static PendingScroll scroll_queue[COVE_MAX];
+static int scroll_count = 0;
+
+// Pixel pointer events are replayed through kitty's native mouse path, which
+// owns scrollbar hit-testing, selection and application mouse protocols.
+#define COVE_POINTER_MAX 256
+typedef struct { id_type id; uint8_t phase; uint32_t x, y, modifiers; } PendingPointer;
+static PendingPointer pointer_queue[COVE_POINTER_MAX];
+static int pointer_count = 0;
+static PendingPointer scrollbar_queue[COVE_POINTER_MAX];
+static int scrollbar_count = 0;
 
 static pthread_mutex_t resize_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -191,10 +212,67 @@ enqueue_mouse(id_type id, uint8_t phase, uint32_t x, uint32_t y, uint8_t in_left
     wakeup_main_loop();
 }
 
+static void
+enqueue_scroll(id_type id, uint32_t value) {
+    pthread_mutex_lock(&resize_lock);
+    PendingScroll *p = NULL;
+    for (int i = 0; i < scroll_count; i++) {
+        if (scroll_queue[i].id == id) { p = scroll_queue + i; break; }
+    }
+    if (!p && scroll_count < COVE_MAX) {
+        p = scroll_queue + scroll_count++;
+        *p = (PendingScroll){ .id = id };
+    }
+    if (p) {
+        int64_t total = (int64_t)p->lines + (int32_t)value;
+        p->lines = (int32_t)MAX((int64_t)INT32_MIN, MIN((int64_t)INT32_MAX, total));
+    }
+    pthread_mutex_unlock(&resize_lock);
+    wakeup_main_loop();
+}
+
+static void
+enqueue_pointer(id_type id, uint8_t phase, uint32_t x, uint32_t y, uint32_t modifiers) {
+    pthread_mutex_lock(&resize_lock);
+    if (phase == 1 && pointer_count > 0) {
+        PendingPointer *last = pointer_queue + pointer_count - 1;
+        if (last->id == id && last->phase == 1) {
+            last->x = x; last->y = y; last->modifiers = modifiers;
+            pthread_mutex_unlock(&resize_lock);
+            wakeup_main_loop();
+            return;
+        }
+    }
+    if (pointer_count < COVE_POINTER_MAX) {
+        pointer_queue[pointer_count++] = (PendingPointer){ id, phase, x, y, modifiers };
+    }
+    pthread_mutex_unlock(&resize_lock);
+    wakeup_main_loop();
+}
+
+static void
+enqueue_scrollbar(id_type id, uint8_t phase, uint32_t x, uint32_t y) {
+    pthread_mutex_lock(&resize_lock);
+    if (phase == 1 && scrollbar_count > 0) {
+        PendingPointer *last = scrollbar_queue + scrollbar_count - 1;
+        if (last->id == id && last->phase == 1) {
+            last->x = x; last->y = y;
+            pthread_mutex_unlock(&resize_lock);
+            wakeup_main_loop();
+            return;
+        }
+    }
+    if (scrollbar_count < COVE_POINTER_MAX) {
+        scrollbar_queue[scrollbar_count++] = (PendingPointer){ id, phase, x, y, 0 };
+    }
+    pthread_mutex_unlock(&resize_lock);
+    wakeup_main_loop();
+}
+
 bool
 cove_has_pending_control(void) {
     pthread_mutex_lock(&resize_lock);
-    bool any = resize_count > 0 || pending_spawns > 0 || mouse_count > 0 || detach_count > 0 || adopt_count > 0 || suspend_count > 0;
+    bool any = resize_count > 0 || pending_spawns > 0 || mouse_count > 0 || detach_count > 0 || adopt_count > 0 || suspend_count > 0 || scroll_count > 0 || pointer_count > 0 || scrollbar_count > 0;
     pthread_mutex_unlock(&resize_lock);
     return any;
 }
@@ -288,6 +366,22 @@ handle_input_client(int cfd) {
             if (suspend_count < COVE_MAX) suspend_queue[suspend_count++] = (PendingSuspend){ (id_type)id, on };
             pthread_mutex_unlock(&resize_lock);
             wakeup_main_loop();
+        } else if (kind == MSG_SCROLL) {
+            uint32_t lines;
+            if (!read_all(cfd, &lines, sizeof lines)) return;
+            enqueue_scroll((id_type)id, lines);
+        } else if (kind == MSG_SCROLLBAR) {
+            unsigned char phase;
+            uint32_t xy[2];
+            if (!read_all(cfd, &phase, 1) || phase > 2) return;
+            if (!read_all(cfd, xy, sizeof xy)) return;
+            enqueue_scrollbar((id_type)id, phase, xy[0], xy[1]);
+        } else if (kind == MSG_POINTER) {
+            unsigned char phase;
+            uint32_t data[3];
+            if (!read_all(cfd, &phase, 1) || phase > 3) return;
+            if (!read_all(cfd, data, sizeof data)) return;
+            enqueue_pointer((id_type)id, phase, data[0], data[1], data[2]);
         } else return;  // unknown kind: drop the connection
     }
 }
@@ -314,6 +408,82 @@ apply_mouse(const PendingMouse *m) {
             call_boss(cove_copy_selection, "K", m->id);
             break;
     }
+}
+
+static void
+apply_scroll(const PendingScroll *p) {
+    Window *w = window_for_window_id(p->id);
+    if (!w || !w->render_data.screen) return;
+    Screen *screen = w->render_data.screen;
+    if (screen->linebuf != screen->main_linebuf) return;
+    if (screen->callbacks != Py_None) {
+        PyObject *ret = PyObject_CallMethod(screen->callbacks, "finish_scroll_animation", NULL);
+        if (!ret) PyErr_Print();
+        else Py_DECREF(ret);
+    }
+    if (p->lines) {
+        int64_t amount = p->lines;
+        bool upwards = amount > 0;
+        if (amount < 0) amount = -amount;
+        screen_history_scroll(screen, (int)MIN((int64_t)INT_MAX, amount), upwards);
+    }
+}
+
+static void
+apply_pointer(const PendingPointer *p) {
+    OSWindow *osw = os_window_for_id(p->id);
+    if (!osw || !osw->num_tabs) return;
+    Tab *tab = osw->tabs + osw->active_tab;
+    if (!tab->num_windows) return;
+    Window *w = tab->windows + tab->active_window;
+    if (!w->render_data.screen) return;
+    OSWindow *previous = global_state.callback_os_window;
+    global_state.callback_os_window = osw;
+    osw->mouse_x = MIN((double)p->x, MAX(0.0, (double)osw->viewport_width - 1.0));
+    osw->mouse_y = MIN((double)p->y, MAX(0.0, (double)osw->viewport_height - 1.0));
+    osw->has_received_cursor_pos_event = true;
+    global_state.mods_at_last_key_or_button_event = (int)p->modifiers;
+    id_type drag_window_id = global_state.active_drag_in_window;
+    Window *drag_window = drag_window_id ? window_for_window_id(drag_window_id) : w;
+    bool was_scrollbar_drag = drag_window && drag_window->scrollbar.is_dragging;
+    switch (p->phase) {
+        case 0:
+            osw->mouse_button_pressed[GLFW_MOUSE_BUTTON_LEFT] = true;
+            osw->mouse_left_press_x = osw->mouse_x;
+            osw->mouse_left_press_y = osw->mouse_y;
+            mouse_event(GLFW_MOUSE_BUTTON_LEFT, (int)p->modifiers, GLFW_PRESS);
+            break;
+        case 1: mouse_event(-1, (int)p->modifiers, -1); break;
+        case 2:
+        case 3:
+            osw->mouse_button_pressed[GLFW_MOUSE_BUTTON_LEFT] = false;
+            mouse_event(GLFW_MOUSE_BUTTON_LEFT, (int)p->modifiers, GLFW_RELEASE);
+            break;
+    }
+    if (p->phase == 3) {
+        w = drag_window_id ? window_for_window_id(drag_window_id) : NULL;
+        if (w && w->render_data.screen && w->render_data.screen->callbacks != Py_None) {
+            PyObject *ret = PyObject_CallMethod(w->render_data.screen->callbacks, "clear_selection", NULL);
+            if (!ret) PyErr_Print();
+            else Py_DECREF(ret);
+        }
+    }
+    if (p->phase == 2 && !was_scrollbar_drag) {
+        w = drag_window_id ? window_for_window_id(drag_window_id) : NULL;
+        if (w && w->render_data.screen && w->render_data.screen->selections.count) {
+            call_boss(cove_copy_selection, "K", drag_window_id);
+        }
+    }
+    if (p->phase >= 2 && drag_window_id && !window_for_window_id(drag_window_id)) {
+        global_state.active_drag_in_window = 0;
+        global_state.active_drag_button = -1;
+    }
+    global_state.callback_os_window = previous;
+}
+
+static void
+apply_scrollbar(const PendingPointer *p) {
+    cove_scrollbar_event(p->id, p->phase, p->x, p->y);
 }
 
 // Drag-out: hide-the-termling becomes show-the-window. Stop exporting the
@@ -376,6 +546,8 @@ suspended_remove(id_type id) {
 }
 
 static Slot* slot_if_any(id_type id);
+static void publish_begin(Slot*, uint32_t*);
+static void publish_end(Slot*, uint32_t*);
 
 // Main thread. On: stop rendering it and free the spare IOSurface (under the
 // window's own GL context: FBOs are per-context), publishing a header with that
@@ -396,13 +568,13 @@ apply_suspend(id_type id, bool on) {
     if (!s || !s->base || !cove_iosurface_on()) return;
     int spare = s->io_current ^ 1;
     if (!s->iosurf[spare].surface) return;
+    uint32_t *hdr = (uint32_t*)s->base;
+    publish_begin(s, hdr);
     void *prev = make_os_window_context_current(osw);
     cove_macos_free(&s->iosurf[spare]);
     if (prev) glfwMakeContextCurrent((GLFWwindow*)prev);
-    uint32_t *hdr = (uint32_t*)s->base;
     hdr[12 + spare] = 0;
-    __sync_synchronize();
-    hdr[3] = ++s->seq;
+    publish_end(s, hdr);
 #endif
 }
 
@@ -414,7 +586,10 @@ cove_drain_control(void) {
     PendingDetach dlocal[COVE_MAX];
     id_type alocal[COVE_MAX];
     PendingSuspend slocal[COVE_MAX];
-    int n, spawns, mn, dn, an, sn;
+    PendingScroll scroll_local[COVE_MAX];
+    PendingPointer pointer_local[COVE_POINTER_MAX];
+    PendingPointer scrollbar_local[COVE_POINTER_MAX];
+    int n, spawns, mn, dn, an, sn, scroll_n, pointer_n, scrollbar_n;
     pthread_mutex_lock(&resize_lock);
     n = resize_count;
     memcpy(local, resize_queue, (size_t)n * sizeof(PendingResize));
@@ -433,6 +608,15 @@ cove_drain_control(void) {
     sn = suspend_count;
     memcpy(slocal, suspend_queue, (size_t)sn * sizeof(PendingSuspend));
     suspend_count = 0;
+    scroll_n = scroll_count;
+    memcpy(scroll_local, scroll_queue, (size_t)scroll_n * sizeof(PendingScroll));
+    scroll_count = 0;
+    pointer_n = pointer_count;
+    memcpy(pointer_local, pointer_queue, (size_t)pointer_n * sizeof(PendingPointer));
+    pointer_count = 0;
+    scrollbar_n = scrollbar_count;
+    memcpy(scrollbar_local, scrollbar_queue, (size_t)scrollbar_n * sizeof(PendingPointer));
+    scrollbar_count = 0;
     pthread_mutex_unlock(&resize_lock);
     for (int i = 0; i < n; i++) {
         call_boss(resize_os_window, "Kiis", local[i].id, (int)local[i].cols, (int)local[i].rows, "cells");
@@ -444,6 +628,9 @@ cove_drain_control(void) {
     for (int i = 0; i < dn; i++) apply_detach(&dlocal[i]);
     for (int i = 0; i < an; i++) apply_adopt(alocal[i]);
     for (int i = 0; i < sn; i++) apply_suspend(slocal[i].id, slocal[i].on != 0);
+    for (int i = 0; i < scroll_n; i++) apply_scroll(&scroll_local[i]);
+    for (int i = 0; i < scrollbar_n; i++) apply_scrollbar(&scrollbar_local[i]);
+    for (int i = 0; i < pointer_n; i++) apply_pointer(&pointer_local[i]);
 }
 
 // One thread per client: Godot holds a persistent connection, but short-lived
@@ -528,9 +715,29 @@ slot_if_any(id_type id) {
     return NULL;
 }
 
+// The mmap transport is a seqlock: odd means the producer is mutating pixels
+// or metadata, even means readers may copy and verify the same value afterward.
+static void
+publish_begin(Slot *s, uint32_t *hdr) {
+    if (!(s->seq & 1u)) s->seq++;
+    hdr[3] = s->seq;
+    __sync_synchronize();
+}
+
+static void
+publish_end(Slot *s, uint32_t *hdr) {
+    __sync_synchronize();
+    if (s->seq & 1u) s->seq++;
+    else s->seq += 2u;
+    hdr[3] = s->seq;
+}
+
 static bool
 remap(Slot *s, id_type id, size_t needed) {
-    if (s->base) { munmap(s->base, s->mapped); s->base = NULL; s->mapped = 0; }
+    if (s->base) {
+        if (s->mapped >= COVE_HEADER_BYTES) publish_begin(s, (uint32_t*)s->base);
+        munmap(s->base, s->mapped); s->base = NULL; s->mapped = 0;
+    }
     if (s->fd < 0) {
         char path[4096];
         path_for(id, path, sizeof path);
@@ -581,6 +788,9 @@ cove_publish_frame(OSWindow *os_window) {
         if (!remap(s, os_window->id, needed)) { s->id = 0; return; }
         s->w = w; s->h = h;
     }
+    unsigned char *bytes = (unsigned char*)s->base;
+    uint32_t *hdr = (uint32_t*)bytes;
+    publish_begin(s, hdr);
 
     uint32_t iosurface_id = 0, iosurface_id_b = 0, ready_index = 0;
 #ifdef __APPLE__
@@ -619,9 +829,7 @@ cove_publish_frame(OSWindow *os_window) {
             }
         }
     }
-    unsigned char *bytes = (unsigned char*)s->base;
     if (!zero_copy) readback(os_window, w, h, bytes + COVE_HEADER_BYTES);
-    uint32_t *hdr = (uint32_t*)bytes;
     hdr[0] = COVE_MAGIC;
     hdr[1] = w;
     hdr[2] = h;
@@ -636,8 +844,7 @@ cove_publish_frame(OSWindow *os_window) {
     hdr[12] = iosurface_id;    // buffer A id (0 = pixels are in this file)
     hdr[13] = iosurface_id_b;  // buffer B id (double-buffering)
     hdr[14] = ready_index;     // which of A/B holds the latest complete frame
-    __sync_synchronize();  // ensure pixels + dims are visible before seq bump
-    hdr[3] = ++s->seq;
+    publish_end(s, hdr);
 }
 
 void

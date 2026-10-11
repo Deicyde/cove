@@ -1907,7 +1907,8 @@ set_mode_from_const(Screen *self, unsigned int mode, bool val) {
         MOUSE_MODE(MOUSE_URXVT_MODE, mouse_tracking_protocol, URXVT_PROTOCOL)
 
         case DECSCLM:
-        case DECNRCM: break; // we ignore these modes
+        case DECNRCM:
+        case ALTERNATE_SCROLL: break; // we ignore these modes
         case DECCKM: self->modes.mDECCKM = val; break;
         case DECTCEM: self->modes.mDECTCEM = val; break;
         case DECSCNM:
@@ -1943,9 +1944,9 @@ set_mode_from_const(Screen *self, unsigned int mode, bool val) {
             break;
         case 7727 << 5: log_error("Application escape mode is not supported, the extended keyboard protocol should be used instead"); break;
         case PENDING_MODE << 5:
-            if (!screen_pause_rendering(self, val, 0)) {
-                log_error("Pending mode change to already current mode (%d) requested. Either pending mode expired or there is an application bug.", val);
-            }
+            // DECSET/DECRST are idempotent. Claude and other TUIs can repeat a
+            // synchronized-update boundary, especially while reattaching.
+            screen_pause_rendering(self, val, 0);
             break;
         case INBAND_RESIZE_NOTIFICATION:
             self->modes.mINBAND_RESIZE_NOTIFICATION = val;

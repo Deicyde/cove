@@ -93,11 +93,14 @@ func safe_eval_symlinks(path string) string {
 func get_set_of_config_files(config_paths []string) *utils.Set[string] {
 	cp := config.ConfigParser{
 		AllIncludedFiles: utils.NewSet[string](), LineHandler: func(k, v string) error { return nil }}
-	config_paths = utils.Filter(config_paths, func(path string) bool {
+	// Parse only files that exist, but keep every explicit root in the returned
+	// watch set. In particular, kitty.conf may not exist on a first launch; its
+	// parent must still be watched so creating it can trigger a reload.
+	parse_paths := utils.Filter(config_paths, func(path string) bool {
 		_, err := os.Stat(path)
 		return err == nil
 	})
-	cp.ParseFiles(config_paths...)
+	cp.ParseFiles(parse_paths...)
 	// Resolve symlinks in all paths collected by the parser (important on macOS
 	// where /tmp -> /private/tmp causes mismatches with FSEvents-reported paths).
 	result := utils.NewSet[string](cp.AllIncludedFiles.Len() + len(config_paths)*4)

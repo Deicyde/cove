@@ -712,6 +712,8 @@ class TestParser(BaseTest):
         pb('\033[h')
         pb('\033[20;4h', ('screen_set_mode', 20, 0), ('screen_set_mode', 4, 0))
         pb('\033[?1000;1004h', ('screen_set_mode', 1000, 1), ('screen_set_mode', 1004, 1))
+        pb('\033[?1007h', ('screen_set_mode', 1007, 1))
+        pb('\033[?1007l', ('screen_reset_mode', 1007, 1))
         pb('\033[20;4;20l', ('screen_reset_mode', 20, 0), ('screen_reset_mode', 4, 0), ('screen_reset_mode', 20, 0))
         pb('\033[=c', ('report_device_attributes', 0, 61))
         s.reset()
@@ -794,9 +796,11 @@ class TestParser(BaseTest):
         self.ae(c.wtcbuf, b'\x1b[?2026;2$y')
         c.clear()
         pb('\033[?2026h', ('screen_set_mode', 2026, 1))
+        pb('\033[?2026h', ('screen_set_mode', 2026, 1))  # duplicate DECSET is harmless
         pb('\033[?2026$p', ('report_mode_status', 2026, 1))
         self.ae(c.wtcbuf, b'\x1b[?2026;1$y')
         pb('\033[?2026l', ('screen_reset_mode', 2026, 1))
+        pb('\033[?2026l', ('screen_reset_mode', 2026, 1))  # duplicate DECRST is harmless
         c.clear()
         pb('\033[?2026$p', ('report_mode_status', 2026, 1))
         self.ae(c.wtcbuf, b'\x1b[?2026;2$y')

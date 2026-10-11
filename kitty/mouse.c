@@ -1451,6 +1451,66 @@ mouse_event(const int button, int modifiers, int action) {
     if (mouse_cursor_shape != old_cursor) set_mouse_cursor(mouse_cursor_shape);
 }
 
+// Cove renders hidden kitty windows inside Godot. Let it probe/drive only the
+// native scrollbar without turning an ordinary terminal press into a click or
+// selection before Cove's lift/drag deadzone has resolved.
+bool
+cove_scrollbar_event(id_type os_window_id, uint8_t phase, uint32_t x, uint32_t y) {
+    OSWindow *osw = os_window_for_id(os_window_id);
+    if (!osw || !osw->num_tabs || phase > 2) return false;
+    Window *w = NULL;
+    if (phase > 0 && global_state.active_drag_in_window) {
+        w = window_for_id(global_state.active_drag_in_window);
+        if (w && os_window_for_kitty_window(w->id) != osw) w = NULL;
+    } else {
+        Tab *tab = osw->tabs + osw->active_tab;
+        if (tab->num_windows) w = tab->windows + tab->active_window;
+    }
+    if (!w || !w->render_data.screen) {
+        if (phase == 2) {
+            osw->mouse_button_pressed[GLFW_MOUSE_BUTTON_LEFT] = false;
+            if (global_state.active_drag_in_window && !window_for_id(global_state.active_drag_in_window)) {
+                global_state.active_drag_in_window = 0;
+                global_state.active_drag_button = -1;
+            }
+        }
+        return false;
+    }
+    if (phase == 0 && global_state.active_drag_in_window) return false;
+
+    OSWindow *previous = global_state.callback_os_window;
+    global_state.callback_os_window = osw;
+    osw->mouse_x = MIN((double)x, MAX(0.0, (double)osw->viewport_width - 1.0));
+    osw->mouse_y = MIN((double)y, MAX(0.0, (double)osw->viewport_height - 1.0));
+    osw->has_received_cursor_pos_event = true;
+    bool handled = false;
+    switch (phase) {
+        case 0:
+            handled = handle_scrollbar_mouse(w, GLFW_MOUSE_BUTTON_LEFT, PRESS, 0);
+            if (handled) osw->mouse_button_pressed[GLFW_MOUSE_BUTTON_LEFT] = true;
+            break;
+        case 1:
+            if (osw->mouse_button_pressed[GLFW_MOUSE_BUTTON_LEFT]) {
+                handled = handle_scrollbar_mouse(w, -1, MOVE, 0);
+            }
+            break;
+        case 2: {
+            bool pressed = osw->mouse_button_pressed[GLFW_MOUSE_BUTTON_LEFT];
+            osw->mouse_button_pressed[GLFW_MOUSE_BUTTON_LEFT] = false;
+            if (!pressed) break;
+            if (w->scrollbar.is_dragging) {
+                end_drag(w);
+                handled = true;
+            } else {
+                handled = handle_scrollbar_mouse(w, GLFW_MOUSE_BUTTON_LEFT, RELEASE, 0);
+            }
+            break;
+        }
+    }
+    global_state.callback_os_window = previous;
+    return handled;
+}
+
 static int
 scale_scroll(
     MouseTrackingMode mouse_tracking_mode, double offset, GLFWOffsetType offset_type, double *pending_scroll_pixels, int cell_size, int *last_v120_dir) {

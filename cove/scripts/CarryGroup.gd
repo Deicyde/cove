@@ -49,6 +49,9 @@ var _busy := false
 var _attention := false
 var _goal = null          # Vector2 commanded target, or null = wander
 var _dragging := false    # the user is sliding this termling around by the mouse
+var _interacting := false # freeze wander/bob while its terminal owns a pointer drag
+var _interaction_rig_y := 0.0
+var _interaction_terminal_y := 0.0
 var _home := Vector2.ZERO  # centre of the idle-wander neighbourhood
 var _home_set := false     # anchored once position is final (first _process tick)
 var _zone = null           # Rect2 the termling is confined to, or null = free wander
@@ -156,6 +159,16 @@ func end_drag_move() -> void:
 	_goal = position   # hold where it was dropped rather than wandering straight off
 
 
+func begin_pointer_interaction() -> void:
+	_interacting = true
+	_interaction_rig_y = _rig.position.y
+	_interaction_terminal_y = terminal.position.y
+
+
+func end_pointer_interaction() -> void:
+	_interacting = false
+
+
 func _pick_target() -> void:
 	if _zone != null:
 		# Confined to a zone: pick a ground point that keeps the whole termling
@@ -257,10 +270,17 @@ func _process(delta: float) -> void:
 				_home = position
 				_home_set = true
 				_pick_target()
-			_rig.position.y = lerp(_rig.position.y, 0.0, 12.0 * delta)
+			if _interacting:
+				_rig.position.y = _interaction_rig_y
+			else:
+				_rig.position.y = lerp(_rig.position.y, 0.0, 12.0 * delta)
 			if _dragging:
 				# The mouse owns the position; carriers just hustle to keep up.
 				_left.set_state("walk"); _right.set_state("walk")
+			elif _interacting:
+				# Stable geometry matters for text/scrollbar drags: even a 3 px bob
+				# maps to several history lines on a long scrollbar.
+				_left.set_state("idle"); _right.set_state("idle")
 			else:
 				if _recover > 0.0:
 					_recover -= delta
@@ -347,10 +367,13 @@ func _layout(_delta: float) -> void:
 	# so only write what moved.)
 	_set_pos(_left, Vector2(-sep, 0))
 	_set_pos(_right, Vector2(sep, 0))
-	var bob := 0.0
-	if _state == "wander" and _recover <= 0.0 and (_target - position).length() > 6.0 and _goal == null:
-		bob = sin(_t * 9.0) * 3.0
-	_set_pos(terminal, Vector2(0, -carry_h + bob))
+	if _interacting:
+		_set_pos(terminal, Vector2(0, _interaction_terminal_y))
+	else:
+		var bob := 0.0
+		if _state == "wander" and _recover <= 0.0 and (_target - position).length() > 6.0 and _goal == null:
+			bob = sin(_t * 9.0) * 3.0
+		_set_pos(terminal, Vector2(0, -carry_h + bob))
 	# tag under the terminal, bang above it
 	_set_pos(_tag, Vector2(-ts.x * 0.5, 6.0))
 	_set_pos(_bang, Vector2(-8, -carry_h - ts.y * 0.5 - 40.0))

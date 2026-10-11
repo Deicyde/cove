@@ -45,6 +45,8 @@ var _cam: Camera2D
 var _panning := false
 var _gesture_accum := 0.0     # trackpad pan-gesture steps accumulated for resize
 var _scroll_accum := 0.0      # trackpad pan-gesture steps accumulated for terminal scroll
+var _scroll_target := -1      # term id owning that fractional accumulator
+var _scroll_sign := 0         # reset residue immediately when direction reverses
 var _tracking_id := -1       # term id the camera is following (double-click), or -1
 var _occ_fading := false     # occluder fade is active (fading termlings in front of the tracked one)
 var _press_group: Node2D = null
@@ -57,7 +59,10 @@ var _move_grab := Vector2.ZERO # cursor->ground offset so the grabbed point stay
 # Drag-select on the focused terminal: text selection instead of lifting it.
 var _selecting := false        # this press should select, not lift
 var _sel_started := false      # the selection has actually begun (dragged past the deadzone)
+var _pointer_active := false   # native terminal press sent; must receive release/cancel
+var _scrollbar_active := false # right-edge press routed only to kitty's scrollbar
 var _sel_shift := false        # Shift was held at the press: kitty selects even under mouse tracking
+var _pointer_mods := 0         # GLFW modifier bits captured with the press
 var _hold_armed := false       # a select-press held still for HOLD_MS lifts the termling instead
 var _press_ms := 0
 const HOLD_MS := 250
@@ -86,7 +91,7 @@ var _durable_accum := 0.0
 
 # input transport
 var _sock: RefCounted = null
-var _input_tries := 0
+var _input_retry := 0.0       # seconds until the next input-socket reconnect attempt
 
 # cross-Mac termling handoff (native OS drag over Universal Control)
 var _drag: RefCounted = null   # CoveDrag extension
@@ -121,6 +126,8 @@ var _state_rename_dir: DirAccess   # that task's own DirAccess
 var _ls_run := true
 var _child_mutex := Mutex.new()
 var _child_pids: Array[int] = []
+var _pty_fallback_files := {} # fallback kitten pid -> raw input file to remove on exit
+var _pty_fallback_seq := 0
 var _state_accum := 0.0
 var _cmd_accum := 0.0
 var _follows := {}           # follower term_id -> target term_id
@@ -311,6 +318,12 @@ func _set_window_icon() -> void:
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_APPLICATION_FOCUS_IN or what == NOTIFICATION_APPLICATION_FOCUS_OUT:
 		_app_focused = what == NOTIFICATION_APPLICATION_FOCUS_IN
+		if not _app_focused and (_selecting or _pointer_active or _scrollbar_active):
+			_stop_terminal_pointer(true)
+			_press_group = null
+			_selecting = false
+			_sel_started = false
+			_hold_armed = false
 	elif what == NOTIFICATION_WM_CLOSE_REQUEST:
 		if _emacs_focused():
 			_emacs_cmd_key(KEY_Q)
@@ -404,8 +417,7 @@ func _process(delta: float) -> void:
 		_reconcile_async()
 		_apply_spawn_places()
 		_apply_zones()
-	if _sock != null and not _sock.call("is_connected") and _input_tries < 100:
-		_try_connect_sock()
+	_poll_input_socket(delta)
 	_reconcile_poll()
 	_tick_vibefox(delta)
 	_sync_page_focus()
@@ -505,14 +517,14 @@ func _process(delta: float) -> void:
 
 # kitty MSG_SUSPEND (6): [kind u8][os-window id u64 LE][on u8]. See TermCritter.
 func _send_suspend(on: bool, id: int) -> void:
-	if _sock == null or not _sock.has_method("send_raw") or not _sock.call("is_connected"):
+	if _sock == null:
 		return
 	var msg := PackedByteArray()
 	msg.resize(10)
 	msg[0] = 6
 	msg.encode_u64(1, id)
 	msg[9] = 1 if on else 0
-	_sock.call("send_raw", msg)
+	_call_input("send_raw", [msg])
 
 
 func _reconcile() -> void:
@@ -640,6 +652,12 @@ func _is_page_file(id: int) -> bool:
 
 
 func _remove_group(id: int) -> void:
+	if _press_group != null and _press_group.term_id == id:
+		_stop_terminal_pointer(true)
+		_press_group = null
+		_selecting = false
+		_sel_started = false
+		_hold_armed = false
 	if _groups.has(id):
 		_groups[id].queue_free()
 		_groups.erase(id)
@@ -850,8 +868,7 @@ func _detach_inflight(ended: Dictionary) -> void:
 	var id := _inflight_id
 	if id == -1:
 		return
-	if _sock == null or not _sock.call("is_connected") \
-			or not _sock.call("send_detach", id, int(ended.get("sx", 0.0)), int(ended.get("sy", 0.0))):
+	if not _call_input("send_detach", [id, int(ended.get("sx", 0.0)), int(ended.get("sy", 0.0))]):
 		push_warning("cove: detach of termling %d failed (no input socket?)" % id)
 		_cancel_inflight()
 		return
@@ -1172,12 +1189,36 @@ func _begin_move(can_send: bool) -> void:
 # A select-press held still for HOLD_MS lifts the termling: the drag that
 # follows moves it instead of selecting. Motion never arrives while the mouse
 # is still, so this runs from _process.
+func _stop_terminal_pointer(cancel: bool) -> void:
+	if _press_group != null:
+		if _scrollbar_active:
+			_send_scrollbar(_press_group.terminal, _press_group.term_id, _world_mouse(), 2)
+		if _pointer_active:
+			_send_select(_press_group, _world_mouse(), 3 if cancel else 2)
+		_press_group.end_pointer_interaction()
+	_pointer_active = false
+	_scrollbar_active = false
+
+
+func _send_terminal_click_if_needed() -> bool:
+	if not _selecting or _sel_started or _pointer_active or _scrollbar_active \
+			or _press_group == null or _press_group.term_id != _focused_id \
+			or _press_group.terminal.page or _press_dbl:
+		return false
+	# Keep press/release on the same native pixel. The Godot deadzone is in
+	# screen pixels and can exceed kitty's click radius when the Cove is zoomed.
+	_send_select(_press_group, _press_world, 0)
+	_send_select(_press_group, _press_world, 2)
+	return true
+
+
 func _poll_hold() -> void:
 	if not _hold_armed or _press_group == null or _sel_started:
 		return
 	if Time.get_ticks_msec() - _press_ms < HOLD_MS:
 		return
 	_hold_armed = false
+	_stop_terminal_pointer(true)
 	_selecting = false
 	_begin_move(true)
 	_press_group.pickup_hop()
@@ -1185,17 +1226,60 @@ func _poll_hold() -> void:
 
 # Drive kitty's own text selection on the focused terminal. phase: 0 start,
 # 1 drag-update, 2 end (kitty copies the selection to the clipboard on end).
-# Only the fast socket carries this; there's no kitten fallback for selection.
+# Pixel coordinates go through kitty's native mouse path, so its scrollbar,
+# selection rules and every negotiated application mouse protocol stay exact.
+func _send_pointer(t, term_id: int, world: Vector2, phase: int) -> bool:
+	if _sock == null or not _input_has_method("send_raw"):
+		return false
+	var px: Vector2 = t.pixel_at(world)
+	var msg := PackedByteArray()
+	msg.resize(22)
+	msg[0] = 9   # kitty/cove.c MSG_POINTER (targets the OS-window/termling id)
+	msg.encode_u64(1, term_id)
+	msg[9] = phase
+	msg.encode_u32(10, roundi(px.x))
+	msg.encode_u32(14, roundi(px.y))
+	msg.encode_u32(18, _pointer_mods)
+	return _call_input("send_raw", [msg])
+
+
+func _scrollbar_candidate(t, world: Vector2) -> bool:
+	var size: Vector2i = t.native_size()
+	if t.page or size.x <= 0 or t.cols <= 0:
+		return false
+	var px: Vector2 = t.pixel_at(world)
+	var cell_w := float(size.x) / float(t.cols)
+	return px.x >= float(size.x) - maxf(8.0, cell_w * 1.5)
+
+
+func _send_scrollbar(t, term_id: int, world: Vector2, phase: int) -> bool:
+	if _sock == null or not _input_has_method("send_raw"):
+		return false
+	var px: Vector2 = t.pixel_at(world)
+	var msg := PackedByteArray()
+	msg.resize(18)
+	msg[0] = 8   # kitty/cove.c MSG_SCROLLBAR
+	msg.encode_u64(1, term_id)
+	msg[9] = phase
+	msg.encode_u32(10, roundi(px.x))
+	msg.encode_u32(14, roundi(px.y))
+	return _call_input("send_raw", [msg])
+
+
 func _send_select(g: Node2D, world: Vector2, phase: int) -> void:
 	if g != null and g.terminal.godot:
 		_godot_drag(g, world, phase)   # a Godot panel: the editor's own drag, not a text selection
 		return
-	if g == null or g.terminal.page or _sock == null or not _sock.call("is_connected"):
+	if g == null or g.terminal.page or _sock == null:
 		return
 	var t = g.terminal
 	var pane: int = t.pane_id
 	if pane == 0:
 		return
+	if _send_pointer(t, g.term_id, world, phase):
+		return
+	# Compatibility with an older CoveInput/kitty pair during a rolling upgrade.
+	var compat_phase := mini(phase, 2)   # phase 3 is native cancel; legacy only has release
 	var ch: Dictionary = t.cell_and_half(world)
 	var cell: Vector2i = ch["cell"]
 	# An app tracking the mouse (Claude Code's fullscreen TUI, vim, htop) gets the
@@ -1204,9 +1288,9 @@ func _send_select(g: Node2D, world: Vector2, phase: int) -> void:
 	# copy on release. Claude selects and copies on its own. Shift+drag still
 	# makes a kitty selection.
 	if t.mouse_mode != 0 and not _sel_shift:
-		_pty(pane, _drag_bytes(t, cell, phase))
+		_pty(pane, _drag_bytes(t, cell, compat_phase))
 		return
-	_sock.call("send_mouse", pane, phase, cell.x, cell.y, ch["left"])
+	_call_input("send_mouse", [pane, compat_phase, cell.x, cell.y, ch["left"]])
 
 
 # One left-button mouse report for a drag: press (phase 0), motion with the
@@ -1246,6 +1330,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		# Wheel over a terminal: plain scroll goes *into* the terminal; Cmd/Ctrl+
 		# scroll resizes it. Over empty ground: zoom the camera.
 		if event.pressed and event.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN]:
+			_reset_scroll_accumulator()
 			var up: bool = event.button_index == MOUSE_BUTTON_WHEEL_UP
 			var g := _group_at(wpos)
 			if g == null and not event.meta_pressed and _fs_scroll_at(wpos, -66.0 if up else 66.0):
@@ -1291,11 +1376,16 @@ func _unhandled_input(event: InputEvent) -> void:
 				_bd_pointer_up(wpos, event)
 				return
 			if event.pressed:
+				if _selecting or _pointer_active or _scrollbar_active:
+					_stop_terminal_pointer(true)
 				_press_group = _group_at(wpos)
 				_press_pos = event.position
 				_press_world = wpos
 				_sel_started = false
 				_sel_shift = event.shift_pressed
+				_pointer_mods = (1 if event.shift_pressed else 0) \
+					| (2 if event.ctrl_pressed else 0) | (4 if event.alt_pressed else 0) \
+					| (8 if event.meta_pressed else 0)
 				# Drag semantics on a termling: on the focused (or tracked) one a drag
 				# selects its text, but press-and-hold still for HOLD_MS lifts it so the
 				# drag moves it instead. A drag on any other termling moves it straight
@@ -1304,7 +1394,14 @@ func _unhandled_input(event: InputEvent) -> void:
 					and (_press_group.term_id == _focused_id or _press_group.term_id == _tracking_id)
 				if _press_group != null and _press_group.terminal.page and not _press_group.terminal.godot:
 					_selecting = false   # a page has no text selection: a drag moves it, a click clicks the page
-				_hold_armed = _selecting and _press_group.term_id != _present_id  # a presented one stays put
+				_pointer_active = false
+				_scrollbar_active = _selecting and _scrollbar_candidate(_press_group.terminal, _press_world)
+				if _selecting:
+					_press_group.begin_pointer_interaction()
+				if _scrollbar_active:
+					_send_scrollbar(_press_group.terminal, _press_group.term_id, _press_world, 0)
+				_hold_armed = _selecting and not _scrollbar_active \
+					and _press_group.term_id != _present_id  # a presented one stays put
 				_press_dbl = event.double_click
 				_press_ms = Time.get_ticks_msec()
 				_lifting = false
@@ -1330,15 +1427,21 @@ func _unhandled_input(event: InputEvent) -> void:
 				_click_last_id = gid
 				_click_last_ms = now_ms
 				if gid != -1 and _click_streak >= 3:
+					_stop_terminal_pointer(true)
+					_selecting = false
 					_toggle_present(_press_group)
 					_click_streak = 0
 					_hold_armed = false
 				elif gid == -1 and _present_id != -1:
 					_leave_present()
 			else:
-				if _sel_started and _press_group != null:
-					_send_select(_press_group, _world_mouse(), 2)  # end drag -> copy selection
-				elif _press_group != null and _lifting:
+				# A focused terminal still owns ordinary clicks. Delay its native
+				# press until release so Cove can distinguish click from hold-to-move;
+				# kitty then runs its normal link/prompt mouse mappings.
+				_send_terminal_click_if_needed()
+				if _selecting:
+					_stop_terminal_pointer(false)
+				if _press_group != null and _lifting:
 					_press_group.drop()
 				elif _press_group != null and _moving:
 					_press_group.end_drag_move()
@@ -1358,14 +1461,15 @@ func _unhandled_input(event: InputEvent) -> void:
 		if _bd_gesture:
 			_bd_pointer_move(_world_mouse(), event)
 		elif _selecting and _press_group != null:
-			# Begin selecting once past the deadzone so a plain click still just
-			# focuses; anchor at the press cell, then track the cursor as we drag.
-			if not _sel_started and event.position.distance_to(_press_pos) > SELECT_DEADZONE:
+			if _scrollbar_active:
+				_send_scrollbar(_press_group.terminal, _press_group.term_id, _world_mouse(), 1)
+			elif not _sel_started and event.position.distance_to(_press_pos) > SELECT_DEADZONE:
 				_sel_started = true
 				_hold_armed = false
-				_send_select(_press_group, _press_world, 0)  # start at the anchor cell
-			if _sel_started:
-				_send_select(_press_group, _world_mouse(), 1)  # drag update
+				_pointer_active = true
+				_send_select(_press_group, _press_world, 0)
+			if _pointer_active:
+				_send_select(_press_group, _world_mouse(), 1)
 		elif _press_group != null:
 			# A drag slides the termling along the ground. A plain drag can fling
 			# it off the window edge to the other Mac (Universal Control carries
@@ -1386,6 +1490,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		# scroll path on macOS.
 		var g := _group_at(_world_mouse())
 		if g == null:
+			_reset_scroll_accumulator()
 			if event.meta_pressed or event.ctrl_pressed:
 				_zoom_by(pow(1.08, -event.delta.y))
 			elif absf(event.delta.y) > absf(event.delta.x) and _fs_scroll_at(_world_mouse(), event.delta.y * 18.0):
@@ -1394,6 +1499,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				_cam.position += event.delta * 18.0 / _cam.zoom.x
 				_bd_camera_changed()
 		elif event.meta_pressed or event.ctrl_pressed:
+			_reset_scroll_accumulator()
 			_gesture_accum += event.delta.y
 			while _gesture_accum >= 1.5:
 				_resize_group(g, -1); _gesture_accum -= 1.5
@@ -1401,11 +1507,9 @@ func _unhandled_input(event: InputEvent) -> void:
 				_resize_group(g, 1); _gesture_accum += 1.5
 		else:
 			# delta.y > 0 = swipe content up = scroll down (wheel-down / newer).
-			_scroll_accum += event.delta.y
-			var n := int(_scroll_accum)
+			var n := _scroll_steps(g.term_id, event.delta.y)
 			if n != 0:
 				_scroll_terminal(g, n < 0, absi(n))
-				_scroll_accum -= n
 	elif event is InputEventMagnifyGesture:
 		# trackpad pinch (event.factor > 1 = fingers spreading = zoom in)
 		_zoom_by(event.factor)
@@ -1523,18 +1627,76 @@ func _encode_key(event: InputEventKey) -> PackedByteArray:
 # --- pty write channel: persistent socket, else kitten fallback -------------
 
 func _try_connect_sock() -> void:
-	_input_tries += 1
-	_sock.call("connect_to", "%s/input.sock" % DIR)
+	# A kitty restart can leave the socket absent for several seconds. Keep
+	# retrying for the life of Cove; a cumulative attempt cap left input on the
+	# slow fallback forever after a sufficiently long reattach.
+	var connected := _connect_input_socket()
+	_input_retry = 0.0 if connected else 0.25
+
+
+func _poll_input_socket(delta: float) -> void:
+	if _sock == null or _input_socket_connected():
+		return
+	_input_retry -= delta
+	if _input_retry <= 0.0:
+		_try_connect_sock()
+
+
+func _connect_input_socket() -> bool:
+	return bool(_sock.call("connect_to", "%s/input.sock" % DIR))
+
+
+func _input_socket_connected() -> bool:
+	return bool(_sock.call("is_connected"))
+
+
+func _input_has_method(method: StringName) -> bool:
+	return _sock.has_method(method)
+
+
+func _call_input_once(method: StringName, args: Array) -> bool:
+	return bool(_sock.callv(method, args))
+
+
+func _call_input(method: StringName, args: Array = []) -> bool:
+	if _sock == null or not _input_has_method(method):
+		return false
+	if _input_socket_connected() and _call_input_once(method, args):
+		return true
+	# is_connected() only knows that it owns an fd; the peer can have gone away.
+	# A failed write closes that stale fd, so reconnect and retry the action once.
+	_try_connect_sock()
+	return _input_socket_connected() and _call_input_once(method, args)
+
+
+func _pty_fallback(pane: int, data: PackedByteArray) -> void:
+	# Legacy X10 mouse reports contain arbitrary bytes (including 0xff), so they
+	# cannot pass through a Godot String or argv. A temporary file also avoids a
+	# partial non-blocking pipe write for a large paste or file-drop payload.
+	_pty_fallback_seq += 1
+	var path := "%s/pty-input-%d-%d.bin" % [DIR, OS.get_process_id(), _pty_fallback_seq]
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return
+	f.store_buffer(data)
+	f.close()
+	var pid := _create_process(kitten_exe, ["@", "--to", kitty_socket,
+		"send-text", "--match", "id:%d" % pane, "--from-file", path], false)
+	if pid <= 0:
+		DirAccess.remove_absolute(path)
+		return
+	_child_mutex.lock()
+	_pty_fallback_files[pid] = path
+	_child_mutex.unlock()
 
 
 func _pty(pane: int, data: PackedByteArray) -> void:
 	if data.is_empty():
 		return
-	if _sock != null and _sock.call("is_connected"):
-		_sock.call("send_bytes", pane, data)
-	elif kitten_exe != "":
-		_create_process(kitten_exe, ["@", "--to", kitty_socket, "send-text",
-			"--match", "id:%d" % pane, data.get_string_from_utf8()], false)
+	if _call_input("send_bytes", [pane, data]):
+		return
+	if kitten_exe != "":
+		_pty_fallback(pane, data)
 
 
 func _focused_pane() -> int:
@@ -1581,8 +1743,7 @@ func _paste_focused() -> void:
 
 func _spawn_terminal() -> void:
 	# Prefer the persistent socket (no kitten process -> much snappier).
-	if _sock != null and _sock.call("is_connected"):
-		_sock.call("spawn")
+	if _call_input("spawn"):
 		return
 	if kitten_exe == "":
 		return
@@ -1824,9 +1985,9 @@ func _resize_group(g: Node2D, dir: int) -> void:
 	var nr := clampi(t.rows + dir * 3, 6, 200)
 	if nc == t.cols and nr == t.rows:
 		return
-	if _sock != null and _sock.call("is_connected"):
-		_sock.call("send_resize", g.term_id, nc, nr)
-	elif kitten_exe != "":
+	if _call_input("send_resize", [g.term_id, nc, nr]):
+		return
+	if kitten_exe != "":
 		_create_process(kitten_exe, ["@", "--to", kitty_socket, "resize-os-window",
 			"--match", "id:%d" % t.pane_id, "--unit", "cells",
 			"--width", str(nc), "--height", str(nr)], false)
@@ -1835,7 +1996,38 @@ func _resize_group(g: Node2D, dir: int) -> void:
 # Send `lines` of scroll to a terminal. If the app is grabbing the mouse (vim,
 # less, htop, most agent TUIs) forward wheel events over the fast pty socket so
 # it scrolls its own view. Otherwise scroll kitty's scrollback buffer via remote
-# control (slower, but this is the only path that moves shell history).
+# control. The persistent socket keeps high-resolution gestures ordered and
+# coalesces them on kitty's main thread.
+func _reset_scroll_accumulator() -> void:
+	_scroll_accum = 0.0
+	_scroll_target = -1
+	_scroll_sign = 0
+
+
+func _scroll_steps(target: int, delta: float) -> int:
+	var direction := int(signf(delta))
+	if target != _scroll_target or (direction != 0 and direction != _scroll_sign):
+		_scroll_accum = 0.0
+	_scroll_target = target
+	if direction != 0:
+		_scroll_sign = direction
+	_scroll_accum += delta
+	var steps := int(_scroll_accum)
+	_scroll_accum -= steps
+	return steps
+
+
+func _send_history_scroll(pane: int, lines: int) -> bool:
+	if lines == 0 or _sock == null or not _input_has_method("send_raw"):
+		return false
+	var msg := PackedByteArray()
+	msg.resize(13)
+	msg[0] = 7   # kitty/cove.c MSG_SCROLL
+	msg.encode_u64(1, pane)
+	msg.encode_s32(9, lines)
+	return _call_input("send_raw", [msg])
+
+
 func _scroll_terminal(g: Node2D, up: bool, lines: int) -> void:
 	var t = g.terminal
 	var pane: int = t.pane_id
@@ -1861,6 +2053,8 @@ func _scroll_terminal(g: Node2D, up: bool, lines: int) -> void:
 		for _i in mini(lines, 10):   # cap the burst a fast flick can emit
 			out.append_array(wheel)
 		_pty(pane, out)
+	elif _send_history_scroll(pane, (1 if up else -1) * mini(lines, 10)):
+		return
 	elif kitten_exe != "":
 		# `<n>l` scrolls down, `<n>l-` scrolls up (toward older lines).
 		var amount := "%dl%s" % [mini(lines, 10), "-" if up else ""]
@@ -2093,7 +2287,11 @@ func _create_process(path: String, args: PackedStringArray, open_console: bool =
 func _reap_children() -> void:
 	_child_mutex.lock()
 	for i in range(_child_pids.size() - 1, -1, -1):
-		if not OS.is_process_running(_child_pids[i]):
+		var pid: int = _child_pids[i]
+		if not OS.is_process_running(pid):
+			if _pty_fallback_files.has(pid):
+				DirAccess.remove_absolute(str(_pty_fallback_files[pid]))
+				_pty_fallback_files.erase(pid)
 			_child_pids.remove_at(i)
 	_child_mutex.unlock()
 
@@ -2124,14 +2322,14 @@ func _ls_loop() -> void:
 		OS.execute(kitten_exe, ["@", "--to", kitty_socket, "ls"], out, false)
 		var txt: String = out[0] if out.size() > 0 else ""
 		var pout := []
-		OS.execute("/bin/ps", ["-Ao", "pid=,ppid=,command="], pout, false)
+		# Process argv is an arbitrary byte vector on Unix. In the C locale macOS
+		# ps escapes non-ASCII bytes (M-.../^...) instead of passing them through
+		# to OS.execute's UTF-8 String conversion.
+		OS.execute("/usr/bin/env", ["LC_ALL=C", "/bin/ps", "-Ao",
+			"pid=,ppid=,command="], pout, false)
 		var ptxt: String = pout[0] if pout.size() > 0 else ""
 		var sess_info := _scan_sessions(ptxt)
-		var data := _parse_ls(txt, sess_info)
-		_ls_mutex.lock()
-		_ls_data = data
-		_ls_gen += 1
-		_ls_mutex.unlock()
+		_update_ls_data(txt, sess_info)
 		OS.delay_msec(1000)
 
 
@@ -2319,11 +2517,29 @@ func _session_from_procs(procs) -> String:
 	return ""
 
 
-func _parse_ls(txt: String, sess_info: Dictionary) -> Dictionary:
-	var arr = JSON.parse_string(txt)
+func _update_ls_data(txt: String, sess_info: Dictionary) -> bool:
+	var data = _parse_ls(txt, sess_info)
+	# Kitty can briefly return no listing while it restarts. Keep the last
+	# good snapshot until remote control produces a complete JSON array.
+	if data == null:
+		return false
+	_ls_mutex.lock()
+	_ls_data = data
+	_ls_gen += 1
+	_ls_mutex.unlock()
+	return true
+
+
+func _parse_ls(txt: String, sess_info: Dictionary) -> Variant:
+	if txt.strip_edges().is_empty():
+		return null
+	var json := JSON.new()
+	if json.parse(txt) != OK:
+		return null
+	var arr = json.data
 	var res := {}
 	if typeof(arr) != TYPE_ARRAY:
-		return res
+		return null
 	for osw in arr:
 		for tab in osw.get("tabs", []):
 			for w in tab.get("windows", []):

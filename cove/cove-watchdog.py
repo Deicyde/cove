@@ -53,9 +53,12 @@ def log(msg):
 
 
 def ps_snapshot():
-    out = subprocess.run(
+    raw = subprocess.run(
         ["/bin/ps", "-Ao", "pid=,ppid=,tty=,%cpu=,time=,command="],
-        capture_output=True, text=True).stdout
+        capture_output=True, env=dict(os.environ, LC_ALL="C")).stdout
+    # argv is arbitrary bytes on Unix; one malformed argument must not disable
+    # health checks for every termling on that watchdog tick.
+    out = raw.decode("utf-8", errors="replace")
     procs = {}
     for raw in out.splitlines():
         parts = raw.split(None, 5)
