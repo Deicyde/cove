@@ -153,8 +153,11 @@ fi
     -o shell="$WRAPPER" \
     "${CHILD[@]}" 9>&- &
 KITTY_PID=$!
-cleanup() { kill "$KITTY_PID" 2>/dev/null || true; }
+GODOT_PID=""
+cleanup() { kill ${KITTY_PID:+"$KITTY_PID"} ${GODOT_PID:+"$GODOT_PID"} 2>/dev/null || true; }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 # Wait for remote control before asking kitty to create recovered windows.
 kitty_ready=false
@@ -205,4 +208,64 @@ exec 9>&-
 # Auto-start remote termlings (relay + peer auto-viewer) before the Godot host.
 "$REPO/cove/cove-remote-start.sh" || true
 
-"$GODOT" --path "$REPO/cove" --max-fps 60
+# Godot runs in the background so this shell notices if kitty dies under it:
+# every termling vanishes and nothing can spawn until a restart. Say how kitty
+# died (also in ~/Library/Logs/cove.log), then restart the way you would by
+# hand: stop Godot and run this script again, which reattaches every abduco
+# session in a fresh kitty. Three deaths in ten minutes means something is
+# broken at startup, so stop restarting and leave Godot up.
+"$GODOT" --path "$REPO/cove" --max-fps 60 &
+GODOT_PID=$!
+# jobs -pr lists only running children of this shell, so a reused pid never
+# counts (plain -p keeps listing a job that exited normally until it is reported).
+running() { local j; for j in $(jobs -pr); do [ "$j" = "$1" ] && return 0; done; return 1; }
+log_event() {
+    local msg
+    msg="cove: $(date '+%Y-%m-%d %H:%M:%S') $*"
+    echo "$msg" >&2
+    { mkdir -p "$HOME/Library/Logs" && echo "$msg" >> "$HOME/Library/Logs/cove.log"; } 2>/dev/null || true
+}
+watch_kitty=true
+while :; do
+    sleep 1
+    if ! running "$GODOT_PID"; then
+        status=0
+        wait "$GODOT_PID" || status=$?
+        GODOT_PID=""
+        exit "$status"
+    fi
+    if [ "$watch_kitty" != true ] || running "$KITTY_PID"; then
+        continue
+    fi
+    status=0
+    wait "$KITTY_PID" || status=$?
+    how="exit status $status"
+    [ "$status" -gt 128 ] && how="signal $((status - 128)) ($(kill -l $((status - 128))))"
+    log_event "kitty (pid $KITTY_PID) died: $how"
+    KITTY_PID=""
+    now=$(date +%s)
+    recent=""
+    count=0
+    for t in ${COVE_KITTY_RESTARTS:-}; do
+        if [ $((now - t)) -lt 600 ]; then
+            recent="$recent $t"
+            count=$((count + 1))
+        fi
+    done
+    if [ "$count" -ge 2 ]; then
+        log_event "kitty died 3 times in 10 minutes; not restarting it. Quit the Cove and run it again."
+        watch_kitty=false
+        continue
+    fi
+    log_event "restarting kitty and Godot to reattach the termlings"
+    kill "$GODOT_PID" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+        running "$GODOT_PID" || break
+        sleep 0.1
+    done
+    running "$GODOT_PID" && { kill -9 "$GODOT_PID" 2>/dev/null || true; }
+    wait "$GODOT_PID" 2>/dev/null || true
+    trap - EXIT INT TERM HUP
+    export COVE_KITTY_RESTARTS="$recent $now"
+    exec "$BASH" "$REPO/cove/run.sh"
+done

@@ -31,6 +31,7 @@ class RunRecoveryTest(unittest.TestCase):
         iosurface: str | None = None, probe_ok: bool = True,
         inherited_kitty_iosurface: bool = False,
         extension_registered: bool = True,
+        kitty_deaths: int = 0, timeout: float = 30,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp = tempfile.TemporaryDirectory(prefix='cove-run-test-')
         self.addCleanup(temp.cleanup)
@@ -68,7 +69,15 @@ class RunRecoveryTest(unittest.TestCase):
             'mkdir -p "$KITTY_COVE_DIR"\n'
             ': > "$KITTY_COVE_DIR/term-9.rgba"\n'
             ': > "$KITTY_READY"\n'
-            'while [ ! -f "$GODOT_DONE" ]; do sleep 0.01; done\n',
+            # The first KITTY_DEATHS kitties die once their Godot is up.
+            'echo start >> "$KITTY_STARTS"\n'
+            'if [ "$(wc -l < "$KITTY_STARTS" | tr -d " ")" -le "$KITTY_DEATHS" ]; then\n'
+            '    while [ ! -f "$GODOT_UP" ]; do sleep 0.01; done\n'
+            '    rm -f "$KITTY_READY" "$GODOT_UP"\n'
+            '    kill -KILL $$\n'
+            'fi\n'
+            # Like kitty, outlive Godot: the launcher's cleanup stops us.
+            'while kill -0 $PPID 2>/dev/null; do sleep 0.05; done\n',
         )
         self.write_executable(
             repo / 'kitty' / 'launcher' / 'kitty.app' / 'Contents' / 'MacOS' / 'kitten',
@@ -88,6 +97,9 @@ class RunRecoveryTest(unittest.TestCase):
         self.write_executable(repo / 'cove' / 'cove-shell.sh', '#!/bin/sh\nexit 0\n')
         self.write_executable(repo / 'cove' / 'cove-remote-start.sh', '#!/bin/sh\nexit 0\n')
         godot = fake_bin / 'godot'
+        # Import and probe runs exit at once. A Godot whose kitty is going to die
+        # stays up until the launcher stops it, or (third death) until the
+        # launcher gives up restarting.
         self.write_executable(
             godot,
             '#!/bin/sh\n'
@@ -98,6 +110,16 @@ class RunRecoveryTest(unittest.TestCase):
             '[ "$PROBE_OK" = 1 ] && echo COVE_IOSURFACE_PROBE=1; exit 0 ;;\n'
             '  *" --script "*) exit 0 ;;\n'
             'esac\n'
+            'echo start >> "$GODOT_STARTS"\n'
+            'n=$(wc -l < "$GODOT_STARTS" | tr -d " ")\n'
+            'if [ "$n" -le "$KITTY_DEATHS" ]; then\n'
+            '    : > "$GODOT_UP"\n'
+            '    if [ "$n" -ge 3 ]; then\n'
+            '        until grep -q "not restarting" "$HOME/Library/Logs/cove.log" 2>/dev/null; do sleep 0.05; done\n'
+            '    else\n'
+            '        while :; do sleep 0.05; done\n'
+            '    fi\n'
+            'fi\n'
             ': > "$GODOT_DONE"\n',
         )
         sandbox_exec = '/usr/bin/true'
@@ -126,11 +148,15 @@ class RunRecoveryTest(unittest.TestCase):
             'GODOT': str(godot),
             'GODOT_DONE': str(root / 'godot-done'),
             'EXTENSION_LIST': str(extension_list),
+            'GODOT_STARTS': str(root / 'godot-starts'),
+            'GODOT_UP': str(root / 'godot-up'),
             'HOME': str(root / 'home'),
             'IMPORT_CALLED': str(root / 'import-called'),
             'KITTY_ARGS': str(root / 'kitty-args'),
             'KITTY_IOSURFACE': str(root / 'kitty-iosurface'),
             'KITTY_READY': str(root / 'kitty-ready'),
+            'KITTY_DEATHS': str(kitty_deaths),
+            'KITTY_STARTS': str(root / 'kitty-starts'),
             'LAUNCH_ARGS': str(root / 'launch-args'),
             'PATH': f'{fake_bin}:/usr/bin:/bin',
             'COVE_SANDBOX_EXEC': sandbox_exec,
@@ -154,6 +180,7 @@ class RunRecoveryTest(unittest.TestCase):
             self.spawn(['/bin/sh', str(kitty), '--title', 'cove'], {
                 **env, 'KITTY_ARGS': str(root / 'stuck-args'),
                 'KITTY_READY': str(root / 'stuck-ready'), 'KITTY_COVE_DIR': str(root / 'stuck'),
+                'KITTY_STARTS': str(root / 'stuck-starts'),
             })
         lock_file = None
         if lock_held:
@@ -162,7 +189,7 @@ class RunRecoveryTest(unittest.TestCase):
         try:
             result = subprocess.run(
                 ['/bin/bash', str(launcher)], cwd=repo, env=env,
-                text=True, capture_output=True, timeout=30, check=False,
+                text=True, capture_output=True, timeout=timeout, check=False,
             )
         finally:
             if lock_file is not None:
@@ -230,6 +257,33 @@ class RunRecoveryTest(unittest.TestCase):
                 f'@ --to unix:{root / "runtime/cove-kitty"} resize-os-window --match all --unit cells --incremental --width=-1',
             ],
         )
+
+    def test_kitty_death_is_reported_and_restarted(self) -> None:
+        result, root = self.run_launcher(['cove-111', 'cove-222'], kitty_deaths=1, timeout=90)
+        runtime = root / 'runtime' / 'cove'
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r'kitty \(pid \d+\) died: signal 9 \(KILL\)')
+        self.assertIn('restarting kitty and Godot', result.stderr)
+        self.assertIn('died: signal 9 (KILL)', (root / 'home/Library/Logs/cove.log').read_text())
+        self.assertEqual(len((root / 'kitty-starts').read_text().splitlines()), 2)
+        self.assertEqual(len((root / 'godot-starts').read_text().splitlines()), 2)
+        # The fresh kitty reattaches the sessions and keeps the saved layout.
+        self.assertEqual(
+            (root / 'kitty-args').read_text().splitlines()[-3:],
+            [str(root / 'repo/cove/bin/abduco'), '-a', 'cove-111'],
+        )
+        self.assertEqual((runtime / 'state.json').read_text(), 'saved-layout\n')
+
+    def test_repeated_kitty_deaths_stop_restarting(self) -> None:
+        result, root = self.run_launcher(['cove-111'], kitty_deaths=3, timeout=90)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (root / 'home/Library/Logs/cove.log').read_text()
+        self.assertEqual(log.count('died: signal 9 (KILL)'), 3)
+        self.assertIn('not restarting', log)
+        self.assertEqual(len((root / 'kitty-starts').read_text().splitlines()), 3)
+        self.assertEqual(len((root / 'godot-starts').read_text().splitlines()), 3)
 
     def test_sessions_attached_elsewhere_are_skipped(self) -> None:
         result, root = self.run_launcher(['cove-111'], attached=['cove-444'])
