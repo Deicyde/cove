@@ -91,7 +91,11 @@ def classify(procs):
     has_child = {p["ppid"] for p in procs.values()}
     masters, clients = {}, []
     for pid, p in procs.items():
-        if "abduco" not in p["cmd"]:
+        # The program itself must be abduco. kitty's own command line names the
+        # session it opened first (`kitty ... abduco -a cove-N`) and kitty has a
+        # tty, so matching anywhere in the command took kitty for a spinning
+        # client and SIGTERMed it, taking every termling with it.
+        if os.path.basename(p["cmd"].split()[0]) != "abduco":
             continue
         sess = session_token(p["cmd"])
         if not sess:
