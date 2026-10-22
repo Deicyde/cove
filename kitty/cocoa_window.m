@@ -1027,6 +1027,9 @@ cocoa_get_workspace_ids(void *w, size_t *workspace_ids, size_t array_sz) {
     if (!window) return 0;
     NSArray *window_array = @[ @([window windowNumber]) ];
     CFArrayRef spaces = CGSCopySpacesForWindows(_CGSDefaultConnection(), kCGSSpaceAll, (__bridge CFArrayRef)window_array);
+    // NULL when the WindowServer call fails, e.g. while WindowServer is stalled
+    // under heavy load; CFArrayGetCount(NULL) would segfault the whole process.
+    if (!spaces) return 0;
     CFIndex ans = CFArrayGetCount(spaces);
     if (ans > 0) {
         for (CFIndex i = 0; i < MIN(ans, (CFIndex)array_sz); i++) {
