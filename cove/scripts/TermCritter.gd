@@ -30,6 +30,8 @@ var zoom := BASE_ZOOM
 @onready var screen: Sprite2D = $Screen
 @onready var _nameplate: Label = get_node_or_null("Nameplate")
 @onready var _border: Panel = get_node_or_null("Border")
+const GcBadge := preload("res://scripts/GcBadge.gd")
+var _gc_badge: Node2D = null   # hourglass while marked for auto-delete (set_gc)
 
 var term_id := -1        # kitty OS-window id (from the file name)
 var pane_id := 0         # kitty window/pane id (for `@ --match id:`)
@@ -330,6 +332,22 @@ func _layout_decorations() -> void:
 	if _nameplate:
 		_nameplate.position = Vector2(-half.x, -half.y - 22.0)
 		_update_nameplate()
+	if _gc_badge:
+		_gc_badge.position = Vector2(half.x - 8.0, -half.y - 12.0)
+
+
+# Marked for auto-delete: show an hourglass whose sand has run frac of the way.
+func set_gc(marked: bool, frac: float) -> void:
+	if not marked:
+		if _gc_badge:
+			_gc_badge.queue_free()
+			_gc_badge = null
+		return
+	if _gc_badge == null:
+		_gc_badge = GcBadge.new()
+		add_child(_gc_badge)
+		_layout_decorations()
+	_gc_badge.frac = frac
 
 
 func _border_width() -> Vector2:

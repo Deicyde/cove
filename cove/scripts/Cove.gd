@@ -161,6 +161,8 @@ var _deleting_sessions := {} # term_id -> {session, until}: pending permanent de
 const DELETE_PENDING_MS := 10000
 var _pos_by_session := {}    # session -> [x,y], to restore across a kitty restart
 var _name_by_session := {}   # session -> custom name, ditto
+var _gc_term_mark := {}      # session -> true: auto-delete once unused (see _gc_run)
+var _gc_term_used := {}      # session -> unix time you last focused it, ditto
 var _name_pending_session := {} # term_id -> explicitly assigned before its session was learned
 var _pos_restored := {}      # term_id -> true once its position has been restored
 var _win_rect := {}          # last-known *windowed* os-window rect {pos,size} (not while maximized)
@@ -439,6 +441,7 @@ func _process(delta: float) -> void:
 	if _target_id != -1 and not _groups.has(_target_id):
 		_end_target(false)
 	_bd_tick(delta)
+	_gc_tick(delta)
 	_state_accum += delta
 	if _state_accum > 0.2:
 		_state_accum = 0.0
@@ -998,32 +1001,38 @@ func _expire_failed_deletions() -> void:
 
 
 func _delete_focused_term() -> void:
+	_delete_term(_focused_id)
+
+
+# Permanently delete a local termling: end its abduco session too, so crash
+# recovery doesn't bring it back. Returns whether the deletion started.
+func _delete_term(id: int) -> bool:
 	_expire_failed_deletions()
-	var id := _focused_id
 	if id == -1 or not _groups.has(id):
-		return
+		return false
 	var g = _groups[id]
 	if g.terminal.page or g.terminal.remote:
-		return
+		return false
 	if _delete_pending(id):
-		return
+		return false
 	var sess := str(_sessions.get(id, ""))
 	if sess == "" or _session_token(sess) != sess:
 		push_warning("cove: cannot delete termling %d until its session is known" % id)
-		return
+		return false
 	# run.sh lets kitty quit when its final window closes. Keep one local terminal
 	# so Cmd+N and the rest of the Cove remain usable.
 	if _local_terminal_count() <= 1:
 		push_warning("cove: cannot delete the last local termling; create another first")
-		return
+		return false
 	var helper_pid := _terminate_session(sess)
 	if helper_pid <= 0:
 		push_warning("cove: could not start session cleanup for termling %d" % id)
-		return
+		return false
 	_deleting_sessions[id] = {
 		"session": sess, "pid": helper_pid,
 		"until": Time.get_ticks_msec() + DELETE_PENDING_MS, "pending": true,
 	}
+	return true
 
 
 # dismiss: this is you attending to it, so its notification goes. Focus that
@@ -1204,6 +1213,13 @@ func _input(event: InputEvent) -> void:
 			and _focused_id != -1 and _groups.has(_focused_id) \
 			and not _groups[_focused_id].terminal.page and not _groups[_focused_id].terminal.remote:
 		_delete_focused_term()
+		get_viewport().set_input_as_handled()
+		return
+	if event.keycode == KEY_G and event.meta_pressed and event.shift_pressed \
+			and not event.ctrl_pressed and not event.alt_pressed \
+			and _focused_id != -1 and _groups.has(_focused_id) \
+			and not _groups[_focused_id].terminal.page and not _groups[_focused_id].terminal.remote:
+		_gc_toggle_term(_focused_id)
 		get_viewport().set_input_as_handled()
 		return
 	# Cmd+C / Cmd+V: clipboard in and out of the focused termling. Copy grabs
@@ -2288,6 +2304,10 @@ func _load_durable() -> void:
 			_pos_by_session[sess] = rec["pos"]
 		if rec.get("zone", null) != null:
 			_zone_by_session[sess] = str(rec["zone"])
+		if bool(rec.get("gc", false)):
+			_gc_term_mark[sess] = true
+		if rec.get("used", null) != null:
+			_gc_term_used[sess] = float(rec["used"])
 	var bc = d.get("by_critter", {})
 	if typeof(bc) == TYPE_DICTIONARY:
 		for k in bc:
@@ -2307,6 +2327,14 @@ func _write_durable() -> void:
 	for sess in _zone_by_session:
 		var r: Dictionary = by.get(sess, {})
 		r["zone"] = _zone_by_session[sess]
+		by[sess] = r
+	for sess in _gc_term_mark:
+		var r: Dictionary = by.get(sess, {})
+		r["gc"] = true
+		by[sess] = r
+	for sess in _gc_term_used:
+		var r: Dictionary = by.get(sess, {})
+		r["used"] = _gc_term_used[sess]
 		by[sess] = r
 	for id in _groups:
 		var sess := str(_sessions.get(id, ""))
@@ -3369,7 +3397,10 @@ func _exec_command(c: Dictionary) -> String:
 					var tr = _bd_term_rect(_bd_term_key(ng.term_id))
 					var nr: Rect2 = tr if tr != null else Rect2(ng.position, Vector2.ZERO)
 					bc["near_pos"] = [nr.end.x + 60.0, nr.position.y]
-			return _bd_command(bc)
+			var err := _bd_command(bc)
+			if err == "" and str(bc.get("op", "")) == "update":
+				_gc_touch(_bd_lookup(str(bc.get("id", bc.get("name", "")))))
+			return err
 		"spawn_place":
 			# An agent launched this kitty window for a child termling (cove_mcp's
 			# spawn): put it in its frame the moment it shows up, not wherever new
@@ -5418,6 +5449,7 @@ const BD_HELP := """Board keys work while no termling has focus: click empty gro
   ⌘Z undo   ⇧⌘Z redo   ⌘A select all   ⌘D duplicate   ⌘C ⌘X ⌘V copy/cut/paste
   ⌘G group   ⇧⌘G ungroup   ⌫ delete   arrows nudge (⇧ ×10)   ↵ edit text
   ] to front   [ to back   ⌥] forward   ⌥[ backward   ⇧H ⇧V flip   ⇧L lock
+  ⇧G auto-delete when unused (⇧⌘G on the focused termling; right-click ground to restore or set the delay)
   ⇧1 zoom to fit   ⇧2 zoom to selection   ⇧0 zoom to 100%   ⌘= ⌘- zoom
   ⇧. ⇧, rotate 15° (⇧⌥ for 1°)   ⌘⌥G frame the selection   ⌘U insert image
   ⌥A ⌥H ⌥D align left/centre/right   ⌥W ⌥V ⌥S align top/middle/bottom
@@ -5745,6 +5777,7 @@ func _bd_new(type: String) -> Dictionary:
 func _bd_add(s: Dictionary) -> void:
 	_bd_dirty = true
 	var id := str(s["id"])
+	_gc_touch(id)
 	if not _bd_by_id.has(id):
 		_bd_forget_term_fallbacks(id)
 	_bd_shapes.append(s)
@@ -7651,6 +7684,8 @@ func _bd_draw_shape(ci: CanvasItem, s: Dictionary) -> void:
 			_bd_draw_free(ci, s)
 	if rot != 0.0:
 		ci.draw_set_transform_matrix(Transform2D.IDENTITY)
+	if bool(s.get("gc", false)):
+		_gc_draw_badge(ci, s)
 	_bd_alpha = 1.0
 
 
@@ -7989,6 +8024,8 @@ func _bd_key(ev: InputEventKey) -> bool:
 				_bd_flip(false)
 			KEY_L:
 				_bd_toggle_lock()
+			KEY_G:
+				_bd_toggle_gc()
 			KEY_D:
 				_bd_set_tool("highlight")
 			KEY_SLASH:
@@ -8669,7 +8706,8 @@ func _bd_save_now() -> void:
 				var id := _bd_term_id(key)
 				if id != -1:
 					s["bind_" + e] = _bd_term_key(id)
-	var txt := JSON.stringify({"version": 1, "next": _bd_next, "ui_scale": _bd_ui_user, "shapes": _bd_shapes})
+	var txt := JSON.stringify({"version": 1, "next": _bd_next, "ui_scale": _bd_ui_user, "shapes": _bd_shapes,
+		"used": _gc_used, "trash": _gc_trash, "gc_days": _gc_days})
 	for path in [BOARD_SAVE, BOARD_MIRROR]:
 		_write_atomic(path, txt)
 
@@ -8688,7 +8726,13 @@ func _bd_load() -> bool:
 	_bd_shapes = d["shapes"]
 	_bd_next = int(d.get("next", 1))
 	_bd_ui_user = clampf(float(d.get("ui_scale", 1.0)), 0.6, 2.5)
+	var used = d.get("used", {})
+	_gc_used = used if typeof(used) == TYPE_DICTIONARY else {}
+	var trash = d.get("trash", [])
+	_gc_trash = trash if typeof(trash) == TYPE_ARRAY else []
+	_gc_days = clampf(float(d.get("gc_days", GC_DAYS_DEFAULT)), 1.0, 365.0)
 	_bd_reindex()
+	_gc_start_clocks()
 	return true
 
 
@@ -9242,6 +9286,8 @@ func _bd_context_menu(p: Vector2, screen: Vector2) -> void:
 		m.add_item("Flip horizontal   ⇧H", 9)
 		m.add_item("Flip vertical   ⇧V", 10)
 		m.add_item("Lock / unlock   ⇧L", 11)
+		m.add_check_item("Auto-delete when unused   ⇧G", 60)
+		m.set_item_checked(m.get_item_index(60), _bd_sel.all(func(i): return bool(_bd_by_id[i].get("gc", false))))
 		m.add_item("Rotate 15°   ⇧.", 18)
 		m.add_item("Frame selection   ⌘⌥G", 19)
 		if _bd_sel.size() >= 2:
@@ -9258,6 +9304,10 @@ func _bd_context_menu(p: Vector2, screen: Vector2) -> void:
 	_fs_menu_items(m)
 	m.add_item("Calendar", 40)
 	m.add_item("Reminders", 41)
+	m.add_separator()
+	if not _gc_trash.is_empty():
+		m.add_item("Restore auto-deleted (%d)" % _gc_trash.size(), 61)
+	m.add_submenu_node_item("Auto-delete after", _gc_days_menu())
 	m.add_separator()
 	m.add_item("Paste   ⌘V", 13)
 	m.add_item("Select all   ⌘A", 14)
@@ -9297,6 +9347,10 @@ func _bd_menu_pick(id: int) -> void:
 			_bd_flip(false)
 		11:
 			_bd_toggle_lock()
+		60:
+			_bd_toggle_gc()
+		61:
+			_gc_restore_trash()
 		12:
 			_bd_delete_selected()
 		13:
@@ -9908,6 +9962,7 @@ func _bd_unfurl_poll() -> void:
 
 
 func _bd_bm_open(s: Dictionary) -> void:
+	_gc_touch(str(s["id"]))
 	var url := str(s.get("url", ""))
 	if _bd_is_url(url):
 		OS.shell_open(url)
@@ -12648,3 +12703,290 @@ func _fs_draw_ghost(o: CanvasItem) -> void:
 	o.draw_style_box(_cal_box(Color(0.15, 0.16, 0.19, 0.95), true, 5.0), r)
 	o.draw_string(f, Vector2(r.position.x + 10.0 / z, r.get_center().y + f.get_ascent(px) * 0.38), name,
 		HORIZONTAL_ALIGNMENT_LEFT, -1, px, BD_BM_TEXT)
+
+
+# --- garbage collector -----------------------------------------------------------
+# Objects you mark (⇧G on board shapes, ⇧⌘G on the focused termling) are deleted
+# once nothing has used them for _gc_days. A shape is used when it's created,
+# selected, edited, opened or changed by an agent; a termling when you focus it
+# or its agent starts or ends a turn. Collected shapes wait in the trash for
+# GC_TRASH_DAYS (right-click empty ground to restore them). A termling is only
+# collected while idle, nothing running and nobody waiting on it, and its screen
+# is saved first. Locked shapes are never collected.
+
+const GcBadge := preload("res://scripts/GcBadge.gd")
+const GC_DAYS_DEFAULT := 14.0
+const GC_DAY_CHOICES := [1, 3, 7, 14, 30]
+const GC_TRASH_DAYS := 7.0
+const GC_CHECK_S := 600.0        # how often to look for due objects
+const GC_TOUCH_S := 60.0         # coalesce "used" updates, and the saves they cause
+const GC_BADGE := 18.0           # hourglass height on the board, world units
+const GC_SCREENS := "user://trash"
+var _gc_days := GC_DAYS_DEFAULT
+var _gc_used := {}               # shape id -> unix time it was last used
+var _gc_trash := []              # [{"shape": {...}, "at": unix time collected}]
+var _gc_accum := GC_CHECK_S - 60.0   # first pass a minute in, once the ls poll has run
+var _gc_touch_accum := 0.0
+
+
+func _gc_now() -> float:
+	return Time.get_unix_time_from_system()
+
+
+# Shapes from before the collector, or with no record, start their clock now
+# instead of counting as unused forever.
+func _gc_start_clocks() -> void:
+	var now := _gc_now()
+	for s in _bd_shapes:
+		var id := str(s["id"])
+		if not _gc_used.has(id):
+			_gc_used[id] = now
+
+
+func _gc_touch(id: String) -> void:
+	if id == "":
+		return
+	var now := _gc_now()
+	if now - float(_gc_used.get(id, 0.0)) >= GC_TOUCH_S:
+		_gc_used[id] = now
+		if _bd_save_in < 0.0:
+			_bd_save_in = 5.0
+
+
+func _gc_frac(used: float, now: float) -> float:
+	return clampf((now - used) / (_gc_days * 86400.0), 0.0, 1.0)
+
+
+func _gc_tick(delta: float) -> void:
+	_gc_touch_accum += delta
+	if _gc_touch_accum >= 5.0:
+		_gc_touch_accum = 0.0
+		for i in _bd_sel:
+			_gc_touch(str(i))
+		if _bd_edit_id != "":
+			_gc_touch(_bd_edit_id)
+		if _focused_id != -1:
+			_gc_touch_term(_focused_id)
+		_gc_update_term_badges()
+	_gc_accum += delta
+	if _gc_accum >= GC_CHECK_S:
+		_gc_accum = 0.0
+		_gc_run()
+
+
+func _gc_run() -> void:
+	var now := _gc_now()
+	_gc_purge_trash(now)
+	for id in _gc_used.keys():   # shapes deleted by hand leave no record behind
+		if not _bd_by_id.has(id):
+			_gc_used.erase(id)
+	var gone := _gc_collect_board(now)
+	if not gone.is_empty():
+		_gc_log("auto-deleted %d board object(s) unused for %d+ days; right-click empty ground to restore" \
+			% [gone.size(), int(_gc_days)])
+	_gc_collect_terms(now)
+	_gc_update_term_badges()
+
+
+# --- board shapes
+
+func _bd_toggle_gc() -> void:
+	if _bd_sel.is_empty():
+		return
+	var on := false
+	for i in _bd_sel:
+		if not bool(_bd_by_id[i].get("gc", false)):
+			on = true
+	_bd_begin()
+	var now := _gc_now()
+	for i in _bd_sel:
+		if on:
+			_bd_by_id[i]["gc"] = true
+			_gc_used[str(i)] = now   # marking counts as a use: the clock starts now
+		else:
+			_bd_by_id[i].erase("gc")
+	_bd_commit()
+
+
+func _gc_draw_badge(ci: CanvasItem, s: Dictionary) -> void:
+	var r := _bd_bounds(s)
+	var c := Vector2(r.end.x - GC_BADGE * 0.6, r.position.y + GC_BADGE * 0.7)
+	var now := _gc_now()
+	GcBadge.draw_hourglass(ci, c, GC_BADGE, _gc_frac(float(_gc_used.get(str(s["id"]), now)), now))
+
+
+func _gc_collect_board(now: float) -> Array:
+	var limit := _gc_days * 86400.0
+	var doomed := []
+	for s in _bd_shapes:
+		var id := str(s["id"])
+		if bool(s.get("gc", false)) and not bool(s.get("locked", false)) \
+				and now - float(_gc_used.get(id, now)) >= limit:
+			doomed.append(id)
+	if doomed.is_empty():
+		return doomed
+	_bd_begin()
+	for id in doomed:
+		_gc_trash.append({"shape": _bd_by_id[id].duplicate(true), "at": now})
+		_gc_used.erase(id)
+	_bd_sel = _bd_sel.filter(func(x): return not doomed.has(x))
+	_bd_remove(doomed)
+	_bd_commit()
+	return doomed
+
+
+func _gc_purge_trash(now: float) -> void:
+	_gc_trash = _gc_trash.filter(func(e): return now - float(e.get("at", 0.0)) < GC_TRASH_DAYS * 86400.0)
+
+
+# Not an undoable step: undoing it would drop the shapes with the trash already empty.
+func _gc_restore_trash() -> void:
+	if _gc_trash.is_empty():
+		return
+	var now := _gc_now()
+	for e in _gc_trash:
+		var s: Dictionary = e["shape"]
+		if _bd_by_id.has(str(s["id"])):
+			continue
+		s.erase("gc")   # restoring it says you still want it
+		_bd_add(s)
+		_gc_used[str(s["id"])] = now
+	_gc_trash = []
+	_bd_save_in = 0.4
+
+
+func _gc_days_menu() -> PopupMenu:
+	var sub: PopupMenu = _bd_menu.get_node_or_null("gc_days") if _bd_menu else null
+	if sub == null:
+		sub = PopupMenu.new()
+		sub.name = "gc_days"
+		for i in GC_DAY_CHOICES.size():
+			var d: int = GC_DAY_CHOICES[i]
+			sub.add_radio_check_item("%d day%s" % [d, "" if d == 1 else "s"], i)
+		sub.id_pressed.connect(func(i):
+			_gc_days = float(GC_DAY_CHOICES[i])
+			_bd_dirty = true
+			_bd_save_in = 0.4)
+		_bd_menu.add_child(sub)
+	for i in GC_DAY_CHOICES.size():
+		sub.set_item_checked(i, is_equal_approx(_gc_days, float(GC_DAY_CHOICES[i])))
+	sub.content_scale_factor = _bd_ui_scale
+	return sub
+
+
+# --- termlings
+
+func _gc_session(id: int) -> String:
+	var sess := str(_sessions.get(id, ""))
+	return sess if sess != "" and _session_token(sess) == sess else ""
+
+
+func _gc_toggle_term(id: int) -> void:
+	var sess := _gc_session(id)
+	if sess == "":
+		push_warning("cove: termling %d's session isn't known yet; try again in a moment" % id)
+		return
+	if _gc_term_mark.has(sess):
+		_gc_term_mark.erase(sess)
+	else:
+		_gc_term_mark[sess] = true
+		_gc_term_used[sess] = _gc_now()
+	_gc_update_term_badges()
+
+
+func _gc_touch_term(id: int) -> void:
+	var sess := _gc_session(id)
+	if sess != "" and _gc_now() - float(_gc_term_used.get(sess, 0.0)) >= GC_TOUCH_S:
+		_gc_term_used[sess] = _gc_now()
+
+
+# The later of you focusing it and its agent starting or ending a turn.
+func _gc_term_last_used(sess: String, info: Dictionary) -> float:
+	var t := float(_gc_term_used.get(sess, 0.0))
+	var act: Array = info.get("act", [])
+	if act.size() >= 2:
+		t = maxf(t, float(act[1]))
+	return t if t > 0.0 else _gc_now()
+
+
+# Idle: nothing that collecting it would interrupt. A shell must sit at a bare
+# prompt; an agent's last hook must say its turn ended, with no tool running.
+# Anything unknown counts as busy.
+static func _gc_term_idle(info: Dictionary, attention: bool) -> bool:
+	if attention or str(info.get("remote_host", "")) != "":
+		return false
+	var agent := str(info.get("agent", ""))
+	if agent == "shell":
+		return bool(info.get("idle", false))
+	if agent == "" or bool(info.get("tool", false)):
+		return false
+	var act: Array = info.get("act", [])
+	return act.size() >= 2 and str(act[0]) == "idle"
+
+
+func _gc_update_term_badges() -> void:
+	var now := _gc_now()
+	for id in _groups:
+		var t = _groups[id].terminal
+		var sess := str(_sessions.get(id, ""))
+		var marked := sess != "" and _gc_term_mark.has(sess)
+		var frac := 0.0
+		if marked:
+			frac = _gc_frac(_gc_term_last_used(sess, _agents.get(t.pane_id, {})), now)
+		t.set_gc(marked, frac)
+
+
+func _gc_collect_terms(now: float) -> void:
+	var limit := _gc_days * 86400.0
+	for id in _groups.keys():
+		var sess := _gc_session(id)
+		if sess == "" or not _gc_term_mark.has(sess):
+			continue
+		var t = _groups[id].terminal
+		if t.page or t.remote:
+			continue
+		var info: Dictionary = _agents.get(t.pane_id, {})
+		if not _gc_term_idle(info, _attn_ids.has(id)) or now - _gc_term_last_used(sess, info) < limit:
+			continue
+		var label: String = t.custom_name if t.custom_name != "" else sess
+		var screen := _gc_save_screen(id, sess)
+		if screen == "":
+			_gc_log("kept termling \"%s\": couldn't save its screen first" % label)
+			continue
+		if _delete_term(id):
+			_gc_term_mark.erase(sess)
+			_gc_term_used.erase(sess)
+			_gc_log("auto-deleted termling \"%s\" (%s) unused for %d+ days; its screen is in %s" \
+				% [label, sess, int(_gc_days), screen])
+
+
+# The termling's whole scrollback, with colours, into the trash folder.
+func _gc_save_screen(id: int, sess: String) -> String:
+	var pane: int = _groups[id].terminal.pane_id
+	if kitten_exe == "" or kitty_socket == "" or pane == 0:
+		return ""
+	var out := []
+	var rc := OS.execute(kitten_exe, ["@", "--to", kitty_socket, "get-text", "--ansi", "--extent", "all",
+		"--match", "id:%d" % pane], out, false)
+	if rc != 0 or out.is_empty() or str(out[0]) == "":
+		return ""
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(GC_SCREENS))
+	var path := "%s/%s-%s.ansi" % [GC_SCREENS, sess, Time.get_datetime_string_from_system().replace(":", "-")]
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return ""
+	f.store_string(str(out[0]))
+	f.close()
+	return ProjectSettings.globalize_path(path)
+
+
+# Same log as run.sh's kitty supervisor, so everything that vanished is in one place.
+func _gc_log(msg: String) -> void:
+	var line := "cove: %s %s" % [Time.get_datetime_string_from_system(false, true), msg]
+	print(line)
+	var path := OS.get_environment("HOME") + "/Library/Logs/cove.log"
+	var f := FileAccess.open(path, FileAccess.READ_WRITE if FileAccess.file_exists(path) else FileAccess.WRITE)
+	if f:
+		f.seek_end()
+		f.store_line(line)
+		f.close()
