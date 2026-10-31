@@ -108,6 +108,24 @@ func TestGetParentDirs(t *testing.T) {
 	}
 }
 
+func TestGetSetOfConfigFilesKeepsMissingRoots(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "kitty.conf")
+	got := get_set_of_config_files([]string{missing})
+
+	for _, path := range []string{
+		missing,
+		filepath.Join(dir, "dark-theme.auto.conf"),
+		filepath.Join(dir, "light-theme.auto.conf"),
+		filepath.Join(dir, "no-preference-theme.auto.conf"),
+	} {
+		path = safe_eval_symlinks(resolve_path(path))
+		if !got.Has(path) {
+			t.Errorf("missing explicit config watch path %q", path)
+		}
+	}
+}
+
 func TestGetUniqueDirectories(t *testing.T) {
 	// Empty input
 	if result := get_unique_directories(nil); result != nil {

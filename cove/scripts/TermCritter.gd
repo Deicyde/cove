@@ -30,6 +30,8 @@ var zoom := BASE_ZOOM
 @onready var screen: Sprite2D = $Screen
 @onready var _nameplate: Label = get_node_or_null("Nameplate")
 @onready var _border: Panel = get_node_or_null("Border")
+const GcBadge := preload("res://scripts/GcBadge.gd")
+var _gc_badge: Node2D = null   # hourglass while marked for auto-delete (set_gc)
 
 var term_id := -1        # kitty OS-window id (from the file name)
 var pane_id := 0         # kitty window/pane id (for `@ --match id:`)
@@ -143,6 +145,16 @@ func poll() -> void:
 	var h := int(head.decode_u32(8))
 	var seq := int(head.decode_u32(12))
 	var flags := int(head.decode_u32(20))
+	var seqlocked := (flags & (FLAG_PAGE | FLAG_EMACS | FLAG_GODOT)) == 0
+	if seqlocked and (seq & 1) != 0:
+		return   # kitty is still publishing this mmap frame
+	if seqlocked:
+		# Validate the header before committing any pane/grid/mouse metadata.
+		f.seek(1 << 40)
+		f.seek(12)
+		var header_tail := f.get_buffer(4)
+		if header_tail.size() < 4 or int(header_tail.decode_u32(0)) != seq:
+			return
 	var was_page := page
 	page = (flags & (FLAG_PAGE | FLAG_EMACS)) != 0
 	_renamed_frames = (flags & FLAG_PAGE) != 0
@@ -182,7 +194,6 @@ func poll() -> void:
 			and now - _last_read_ms < UNFOCUSED_READ_MS:
 		return
 	_last_read_ms = now
-	_last_seq = seq
 	# Normalise for kitty's render scale (1x vs 2x Retina) so world size is
 	# stable and a 2x render shows as sharper glyphs, not a bigger window.
 	var render_scale := maxf(1.0, roundf(float(h) / float(maxi(rows, 1)) / BASE_CELL_H))
@@ -195,12 +206,28 @@ func poll() -> void:
 		_layout_decorations()
 
 	if iosurface_id != 0 and not _importers.is_empty():
+		if seqlocked:
+			f.seek(1 << 40)
+			f.seek(12)
+			var tail := f.get_buffer(4)
+			if tail.size() < 4 or int(tail.decode_u32(0)) != seq or (seq & 1) != 0:
+				return
 		_apply_iosurface(w, h, iosurface_id_a, iosurface_id_b, ready_index)
+		_last_seq = seq
 	else:
 		f.seek(HEADER)
 		var px := f.get_buffer(w * h * 4)
 		if px.size() < w * h * 4:
 			return
+		if seqlocked:
+			# The producer marks seq odd before touching pixels and even afterward.
+			# Drop stdio's buffered header before validating the generation again.
+			f.seek(1 << 40)
+			f.seek(12)
+			var tail := f.get_buffer(4)
+			if tail.size() < 4 or int(tail.decode_u32(0)) != seq or (seq & 1) != 0:
+				return
+		_last_seq = seq
 		var img := Image.create_from_data(w, h, false, Image.FORMAT_RGBA8, px)
 		# Bottom-up frames are flipped by the sprite on the GPU: a CPU flip_y of a
 		# 2x frame was the single biggest cost on the main thread.
@@ -305,6 +332,22 @@ func _layout_decorations() -> void:
 	if _nameplate:
 		_nameplate.position = Vector2(-half.x, -half.y - 22.0)
 		_update_nameplate()
+	if _gc_badge:
+		_gc_badge.position = Vector2(half.x - 8.0, -half.y - 12.0)
+
+
+# Marked for auto-delete: show an hourglass whose sand has run frac of the way.
+func set_gc(marked: bool, frac: float) -> void:
+	if not marked:
+		if _gc_badge:
+			_gc_badge.queue_free()
+			_gc_badge = null
+		return
+	if _gc_badge == null:
+		_gc_badge = GcBadge.new()
+		add_child(_gc_badge)
+		_layout_decorations()
+	_gc_badge.frac = frac
 
 
 func _border_width() -> Vector2:

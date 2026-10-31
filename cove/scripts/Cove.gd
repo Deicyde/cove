@@ -46,6 +46,8 @@ var _cam: Camera2D
 var _panning := false
 var _gesture_accum := 0.0     # trackpad pan-gesture steps accumulated for resize
 var _scroll_accum := 0.0      # trackpad pan-gesture steps accumulated for terminal scroll
+var _scroll_target := -1      # term id owning that fractional accumulator
+var _scroll_sign := 0         # reset residue immediately when direction reverses
 var _tracking_id := -1       # term id the camera is following (double-click), or -1
 var _occ_fading := false     # occluder fade is active (fading termlings in front of the tracked one)
 var _press_group: Node2D = null
@@ -58,7 +60,10 @@ var _move_grab := Vector2.ZERO # cursor->ground offset so the grabbed point stay
 # Drag-select on the focused terminal: text selection instead of lifting it.
 var _selecting := false        # this press should select, not lift
 var _sel_started := false      # the selection has actually begun (dragged past the deadzone)
+var _pointer_active := false   # native terminal press sent; must receive release/cancel
+var _scrollbar_active := false # right-edge press routed only to kitty's scrollbar
 var _sel_shift := false        # Shift was held at the press: kitty selects even under mouse tracking
+var _pointer_mods := 0         # GLFW modifier bits captured with the press
 var _hold_armed := false       # a select-press held still for HOLD_MS lifts the termling instead
 var _press_ms := 0
 const HOLD_MS := 250
@@ -87,7 +92,7 @@ var _durable_accum := 0.0
 
 # input transport
 var _sock: RefCounted = null
-var _input_tries := 0
+var _input_retry := 0.0       # seconds until the next input-socket reconnect attempt
 
 # cross-Mac termling handoff (native OS drag over Universal Control)
 var _drag: RefCounted = null   # CoveDrag extension
@@ -123,6 +128,8 @@ var _ls_run := true
 const CWD_SCAN_INTERVAL_MSEC := 5000
 var _child_mutex := Mutex.new()
 var _child_pids: Array[int] = []
+var _pty_fallback_files := {} # fallback kitten pid -> raw input file to remove on exit
+var _pty_fallback_seq := 0
 var _state_accum := 0.0
 var _cmd_accum := 0.0
 var _follows := {}           # follower term_id -> target term_id
@@ -154,7 +161,10 @@ var _deleting_sessions := {} # term_id -> {session, until}: pending permanent de
 const DELETE_PENDING_MS := 10000
 var _pos_by_session := {}    # session -> [x,y], to restore across a kitty restart
 var _name_by_session := {}   # session -> custom name, ditto
+var _gc_term_mark := {}      # session -> true: auto-delete once unused (see _gc_run)
+var _gc_term_used := {}      # session -> unix time you last focused it, ditto
 var _name_pending_session := {} # term_id -> explicitly assigned before its session was learned
+var _seen_by_session := {}   # session -> unix time it was last on the board: after a reboot, what was live
 var _pos_restored := {}      # term_id -> true once its position has been restored
 var _win_rect := {}          # last-known *windowed* os-window rect {pos,size} (not while maximized)
 
@@ -316,6 +326,12 @@ func _set_window_icon() -> void:
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_APPLICATION_FOCUS_IN or what == NOTIFICATION_APPLICATION_FOCUS_OUT:
 		_app_focused = what == NOTIFICATION_APPLICATION_FOCUS_IN
+		if not _app_focused and (_selecting or _pointer_active or _scrollbar_active):
+			_stop_terminal_pointer(true)
+			_press_group = null
+			_selecting = false
+			_sel_started = false
+			_hold_armed = false
 	elif what == NOTIFICATION_WM_CLOSE_REQUEST:
 		if _emacs_focused():
 			_emacs_cmd_key(KEY_Q)
@@ -410,8 +426,7 @@ func _process(delta: float) -> void:
 		_reconcile_async()
 		_apply_spawn_places()
 		_apply_zones()
-	if _sock != null and not _sock.call("is_connected") and _input_tries < 100:
-		_try_connect_sock()
+	_poll_input_socket(delta)
 	_reconcile_poll()
 	_tick_vibefox(delta)
 	_sync_page_focus()
@@ -427,6 +442,7 @@ func _process(delta: float) -> void:
 	if _target_id != -1 and not _groups.has(_target_id):
 		_end_target(false)
 	_bd_tick(delta)
+	_gc_tick(delta)
 	_state_accum += delta
 	if _state_accum > 0.2:
 		_state_accum = 0.0
@@ -444,9 +460,9 @@ func _process(delta: float) -> void:
 		# flying onto holds still instead of juddering against a camera a frame behind.
 		_fly_step.call_deferred(delta)   # owns pan *and* zoom until it lands; then tracking (or the preview) takes over
 	elif _previewing():
-		_cam.position = _cam.position.lerp(_groups[_preview_id].terminal.global_position, 8.0 * delta)
+		_ease_cam(_groups[_preview_id].terminal.global_position, 8.0 * delta)
 	elif _avy_open:
-		_cam.position = _cam.position.lerp(_avy_cam, 8.0 * delta)
+		_ease_cam(_avy_cam, 8.0 * delta)
 	elif _present_id != -1 and _groups.has(_present_id):
 		_present_lock = minf(_present_lock + 3.0 * delta, 1.0)
 		_snap_present_cam.call_deferred(delta)   # after this frame's bob is applied
@@ -459,7 +475,7 @@ func _process(delta: float) -> void:
 		_track_lock = minf(_track_lock + 3.0 * delta, 1.0)
 		_snap_track_cam.call_deferred(delta)   # after this frame's bob is applied
 	elif _cam_return:
-		_cam.position = _cam.position.lerp(_preview_return_cam, 8.0 * delta)
+		_ease_cam(_preview_return_cam, 8.0 * delta)
 		if _cam.position.distance_to(_preview_return_cam) < 2.0:
 			_cam_return = false
 	# Present ("fill the window") mode: zoom the camera so the presented termling
@@ -646,6 +662,12 @@ func _is_page_file(id: int) -> bool:
 
 
 func _remove_group(id: int) -> void:
+	if _press_group != null and _press_group.term_id == id:
+		_stop_terminal_pointer(true)
+		_press_group = null
+		_selecting = false
+		_sel_started = false
+		_hold_armed = false
 	var sess := str(_sessions.get(id, ""))
 	if _groups.has(id):
 		_bd_freeze_term_bindings(id)
@@ -873,8 +895,7 @@ func _detach_inflight(ended: Dictionary) -> void:
 	var id := _inflight_id
 	if id == -1:
 		return
-	if _sock == null or not _sock.call("is_connected") \
-			or not _sock.call("send_detach", id, int(ended.get("sx", 0.0)), int(ended.get("sy", 0.0))):
+	if not _call_input("send_detach", [id, int(ended.get("sx", 0.0)), int(ended.get("sy", 0.0))]):
 		push_warning("cove: detach of termling %d failed (no input socket?)" % id)
 		_cancel_inflight()
 		return
@@ -981,32 +1002,38 @@ func _expire_failed_deletions() -> void:
 
 
 func _delete_focused_term() -> void:
+	_delete_term(_focused_id)
+
+
+# Permanently delete a local termling: end its abduco session too, so crash
+# recovery doesn't bring it back. Returns whether the deletion started.
+func _delete_term(id: int) -> bool:
 	_expire_failed_deletions()
-	var id := _focused_id
 	if id == -1 or not _groups.has(id):
-		return
+		return false
 	var g = _groups[id]
 	if g.terminal.page or g.terminal.remote:
-		return
+		return false
 	if _delete_pending(id):
-		return
+		return false
 	var sess := str(_sessions.get(id, ""))
 	if sess == "" or _session_token(sess) != sess:
 		push_warning("cove: cannot delete termling %d until its session is known" % id)
-		return
+		return false
 	# run.sh lets kitty quit when its final window closes. Keep one local terminal
 	# so Cmd+N and the rest of the Cove remain usable.
 	if _local_terminal_count() <= 1:
 		push_warning("cove: cannot delete the last local termling; create another first")
-		return
+		return false
 	var helper_pid := _terminate_session(sess)
 	if helper_pid <= 0:
 		push_warning("cove: could not start session cleanup for termling %d" % id)
-		return
+		return false
 	_deleting_sessions[id] = {
 		"session": sess, "pid": helper_pid,
 		"until": Time.get_ticks_msec() + DELETE_PENDING_MS, "pending": true,
 	}
+	return true
 
 
 # dismiss: this is you attending to it, so its notification goes. Focus that
@@ -1159,8 +1186,11 @@ func _input(event: InputEvent) -> void:
 			_bd_stop_edit()
 			get_viewport().set_input_as_handled()
 		return
-	# Esc leaves "present" (full-window) mode, swooping the camera back.
-	if event.keycode == KEY_ESCAPE and _present_id != -1:
+	# Shift+Esc leaves "present" (full-window) mode. Plain Esc belongs to the
+	# focused terminal, where interactive programs use it to cancel work.
+	if event.keycode == KEY_ESCAPE and event.shift_pressed \
+			and not event.meta_pressed and not event.ctrl_pressed and not event.alt_pressed \
+			and _present_id != -1:
 		_leave_present()
 		get_viewport().set_input_as_handled()
 		return
@@ -1184,6 +1214,13 @@ func _input(event: InputEvent) -> void:
 			and _focused_id != -1 and _groups.has(_focused_id) \
 			and not _groups[_focused_id].terminal.page and not _groups[_focused_id].terminal.remote:
 		_delete_focused_term()
+		get_viewport().set_input_as_handled()
+		return
+	if event.keycode == KEY_G and event.meta_pressed and event.shift_pressed \
+			and not event.ctrl_pressed and not event.alt_pressed \
+			and _focused_id != -1 and _groups.has(_focused_id) \
+			and not _groups[_focused_id].terminal.page and not _groups[_focused_id].terminal.remote:
+		_gc_toggle_term(_focused_id)
 		get_viewport().set_input_as_handled()
 		return
 	# Cmd+C / Cmd+V: clipboard in and out of the focused termling. Copy grabs
@@ -1271,12 +1308,36 @@ func _begin_move(can_send: bool) -> void:
 # A select-press held still for HOLD_MS lifts the termling: the drag that
 # follows moves it instead of selecting. Motion never arrives while the mouse
 # is still, so this runs from _process.
+func _stop_terminal_pointer(cancel: bool) -> void:
+	if _press_group != null:
+		if _scrollbar_active:
+			_send_scrollbar(_press_group.terminal, _press_group.term_id, _world_mouse(), 2)
+		if _pointer_active:
+			_send_select(_press_group, _world_mouse(), 3 if cancel else 2)
+		_press_group.end_pointer_interaction()
+	_pointer_active = false
+	_scrollbar_active = false
+
+
+func _send_terminal_click_if_needed() -> bool:
+	if not _selecting or _sel_started or _pointer_active or _scrollbar_active \
+			or _press_group == null or _press_group.term_id != _focused_id \
+			or _press_group.terminal.page or _press_dbl:
+		return false
+	# Keep press/release on the same native pixel. The Godot deadzone is in
+	# screen pixels and can exceed kitty's click radius when the Cove is zoomed.
+	_send_select(_press_group, _press_world, 0)
+	_send_select(_press_group, _press_world, 2)
+	return true
+
+
 func _poll_hold() -> void:
 	if not _hold_armed or _press_group == null or _sel_started:
 		return
 	if Time.get_ticks_msec() - _press_ms < HOLD_MS:
 		return
 	_hold_armed = false
+	_stop_terminal_pointer(true)
 	_selecting = false
 	_begin_move(true)
 	_press_group.pickup_hop()
@@ -1284,17 +1345,60 @@ func _poll_hold() -> void:
 
 # Drive kitty's own text selection on the focused terminal. phase: 0 start,
 # 1 drag-update, 2 end (kitty copies the selection to the clipboard on end).
-# Only the fast socket carries this; there's no kitten fallback for selection.
+# Pixel coordinates go through kitty's native mouse path, so its scrollbar,
+# selection rules and every negotiated application mouse protocol stay exact.
+func _send_pointer(t, term_id: int, world: Vector2, phase: int) -> bool:
+	if _sock == null or not _input_has_method("send_raw"):
+		return false
+	var px: Vector2 = t.pixel_at(world)
+	var msg := PackedByteArray()
+	msg.resize(22)
+	msg[0] = 9   # kitty/cove.c MSG_POINTER (targets the OS-window/termling id)
+	msg.encode_u64(1, term_id)
+	msg[9] = phase
+	msg.encode_u32(10, roundi(px.x))
+	msg.encode_u32(14, roundi(px.y))
+	msg.encode_u32(18, _pointer_mods)
+	return _call_input("send_raw", [msg])
+
+
+func _scrollbar_candidate(t, world: Vector2) -> bool:
+	var size: Vector2i = t.native_size()
+	if t.page or size.x <= 0 or t.cols <= 0:
+		return false
+	var px: Vector2 = t.pixel_at(world)
+	var cell_w := float(size.x) / float(t.cols)
+	return px.x >= float(size.x) - maxf(8.0, cell_w * 1.5)
+
+
+func _send_scrollbar(t, term_id: int, world: Vector2, phase: int) -> bool:
+	if _sock == null or not _input_has_method("send_raw"):
+		return false
+	var px: Vector2 = t.pixel_at(world)
+	var msg := PackedByteArray()
+	msg.resize(18)
+	msg[0] = 8   # kitty/cove.c MSG_SCROLLBAR
+	msg.encode_u64(1, term_id)
+	msg[9] = phase
+	msg.encode_u32(10, roundi(px.x))
+	msg.encode_u32(14, roundi(px.y))
+	return _call_input("send_raw", [msg])
+
+
 func _send_select(g: Node2D, world: Vector2, phase: int) -> void:
 	if g != null and g.terminal.godot:
 		_godot_drag(g, world, phase)   # a Godot panel: the editor's own drag, not a text selection
 		return
-	if g == null or g.terminal.page or _sock == null or not _sock.call("is_connected"):
+	if g == null or g.terminal.page or _sock == null:
 		return
 	var t = g.terminal
 	var pane: int = t.pane_id
 	if pane == 0:
 		return
+	if _send_pointer(t, g.term_id, world, phase):
+		return
+	# Compatibility with an older CoveInput/kitty pair during a rolling upgrade.
+	var compat_phase := mini(phase, 2)   # phase 3 is native cancel; legacy only has release
 	var ch: Dictionary = t.cell_and_half(world)
 	var cell: Vector2i = ch["cell"]
 	# An app tracking the mouse (Claude Code's fullscreen TUI, vim, htop) gets the
@@ -1303,9 +1407,9 @@ func _send_select(g: Node2D, world: Vector2, phase: int) -> void:
 	# copy on release. Claude selects and copies on its own. Shift+drag still
 	# makes a kitty selection.
 	if t.mouse_mode != 0 and not _sel_shift:
-		_pty(pane, _drag_bytes(t, cell, phase))
+		_pty(pane, _drag_bytes(t, cell, compat_phase))
 		return
-	_sock.call("send_mouse", pane, phase, cell.x, cell.y, ch["left"])
+	_call_input("send_mouse", [pane, compat_phase, cell.x, cell.y, ch["left"]])
 
 
 # One left-button mouse report for a drag: press (phase 0), motion with the
@@ -1345,6 +1449,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		# Wheel over a terminal: plain scroll goes *into* the terminal; Cmd/Ctrl+
 		# scroll resizes it. Over empty ground: zoom the camera.
 		if event.pressed and event.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN]:
+			_reset_scroll_accumulator()
 			var up: bool = event.button_index == MOUSE_BUTTON_WHEEL_UP
 			var g := _group_at(wpos)
 			if g == null and not event.meta_pressed and _fs_scroll_at(wpos, -66.0 if up else 66.0):
@@ -1390,11 +1495,16 @@ func _unhandled_input(event: InputEvent) -> void:
 				_bd_pointer_up(wpos, event)
 				return
 			if event.pressed:
+				if _selecting or _pointer_active or _scrollbar_active:
+					_stop_terminal_pointer(true)
 				_press_group = _group_at(wpos)
 				_press_pos = event.position
 				_press_world = wpos
 				_sel_started = false
 				_sel_shift = event.shift_pressed
+				_pointer_mods = (1 if event.shift_pressed else 0) \
+					| (2 if event.ctrl_pressed else 0) | (4 if event.alt_pressed else 0) \
+					| (8 if event.meta_pressed else 0)
 				# Drag semantics on a termling: on the focused (or tracked) one a drag
 				# selects its text, but press-and-hold still for HOLD_MS lifts it so the
 				# drag moves it instead. A drag on any other termling moves it straight
@@ -1403,7 +1513,14 @@ func _unhandled_input(event: InputEvent) -> void:
 					and (_press_group.term_id == _focused_id or _press_group.term_id == _tracking_id)
 				if _press_group != null and _press_group.terminal.page and not _press_group.terminal.godot:
 					_selecting = false   # a page has no text selection: a drag moves it, a click clicks the page
-				_hold_armed = _selecting and _press_group.term_id != _present_id  # a presented one stays put
+				_pointer_active = false
+				_scrollbar_active = _selecting and _scrollbar_candidate(_press_group.terminal, _press_world)
+				if _selecting:
+					_press_group.begin_pointer_interaction()
+				if _scrollbar_active:
+					_send_scrollbar(_press_group.terminal, _press_group.term_id, _press_world, 0)
+				_hold_armed = _selecting and not _scrollbar_active \
+					and _press_group.term_id != _present_id  # a presented one stays put
 				_press_dbl = event.double_click
 				_press_ms = Time.get_ticks_msec()
 				_lifting = false
@@ -1418,8 +1535,8 @@ func _unhandled_input(event: InputEvent) -> void:
 							{"x": roundi(dp.x), "y": roundi(dp.y), "button": 0, "clicks": 2})
 					elif _press_group.terminal.page:
 						_page_activate(_press_group)   # and raise the tab in the browser
-				# Triple-click a termling -> present it full-window (click again or Esc
-				# to leave). A click on empty ground also leaves present mode.
+				# Triple-click a termling -> present it full-window (click again or
+				# Shift+Esc to leave). A click on empty ground also leaves present mode.
 				var now_ms := Time.get_ticks_msec()
 				var gid: int = _press_group.term_id if _press_group != null else -1
 				if gid != -1 and gid == _click_last_id and now_ms - _click_last_ms < 450:
@@ -1429,15 +1546,21 @@ func _unhandled_input(event: InputEvent) -> void:
 				_click_last_id = gid
 				_click_last_ms = now_ms
 				if gid != -1 and _click_streak >= 3:
+					_stop_terminal_pointer(true)
+					_selecting = false
 					_toggle_present(_press_group)
 					_click_streak = 0
 					_hold_armed = false
 				elif gid == -1 and _present_id != -1:
 					_leave_present()
 			else:
-				if _sel_started and _press_group != null:
-					_send_select(_press_group, _world_mouse(), 2)  # end drag -> copy selection
-				elif _press_group != null and _lifting:
+				# A focused terminal still owns ordinary clicks. Delay its native
+				# press until release so Cove can distinguish click from hold-to-move;
+				# kitty then runs its normal link/prompt mouse mappings.
+				_send_terminal_click_if_needed()
+				if _selecting:
+					_stop_terminal_pointer(false)
+				if _press_group != null and _lifting:
 					_press_group.drop()
 				elif _press_group != null and _moving:
 					_press_group.end_drag_move()
@@ -1457,14 +1580,15 @@ func _unhandled_input(event: InputEvent) -> void:
 		if _bd_gesture:
 			_bd_pointer_move(_world_mouse(), event)
 		elif _selecting and _press_group != null:
-			# Begin selecting once past the deadzone so a plain click still just
-			# focuses; anchor at the press cell, then track the cursor as we drag.
-			if not _sel_started and event.position.distance_to(_press_pos) > SELECT_DEADZONE:
+			if _scrollbar_active:
+				_send_scrollbar(_press_group.terminal, _press_group.term_id, _world_mouse(), 1)
+			elif not _sel_started and event.position.distance_to(_press_pos) > SELECT_DEADZONE:
 				_sel_started = true
 				_hold_armed = false
-				_send_select(_press_group, _press_world, 0)  # start at the anchor cell
-			if _sel_started:
-				_send_select(_press_group, _world_mouse(), 1)  # drag update
+				_pointer_active = true
+				_send_select(_press_group, _press_world, 0)
+			if _pointer_active:
+				_send_select(_press_group, _world_mouse(), 1)
 		elif _press_group != null:
 			# A drag slides the termling along the ground. A plain drag can fling
 			# it off the window edge to the other Mac (Universal Control carries
@@ -1485,6 +1609,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		# scroll path on macOS.
 		var g := _group_at(_world_mouse())
 		if g == null:
+			_reset_scroll_accumulator()
 			if event.meta_pressed or event.ctrl_pressed:
 				_zoom_by(pow(1.08, -event.delta.y))
 			elif absf(event.delta.y) > absf(event.delta.x) and _fs_scroll_at(_world_mouse(), event.delta.y * 18.0):
@@ -1493,6 +1618,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				_cam.position += event.delta * 18.0 / _cam.zoom.x
 				_bd_camera_changed()
 		elif event.meta_pressed or event.ctrl_pressed:
+			_reset_scroll_accumulator()
 			_gesture_accum += event.delta.y
 			while _gesture_accum >= 1.5:
 				_resize_group(g, -1); _gesture_accum -= 1.5
@@ -1500,11 +1626,9 @@ func _unhandled_input(event: InputEvent) -> void:
 				_resize_group(g, 1); _gesture_accum += 1.5
 		else:
 			# delta.y > 0 = swipe content up = scroll down (wheel-down / newer).
-			_scroll_accum += event.delta.y
-			var n := int(_scroll_accum)
+			var n := _scroll_steps(g.term_id, event.delta.y)
 			if n != 0:
 				_scroll_terminal(g, n < 0, absi(n))
-				_scroll_accum -= n
 	elif event is InputEventMagnifyGesture:
 		# trackpad pinch (event.factor > 1 = fingers spreading = zoom in)
 		_zoom_by(event.factor)
@@ -1622,18 +1746,76 @@ func _encode_key(event: InputEventKey) -> PackedByteArray:
 # --- pty write channel: persistent socket, else kitten fallback -------------
 
 func _try_connect_sock() -> void:
-	_input_tries += 1
-	_sock.call("connect_to", "%s/input.sock" % DIR)
+	# A kitty restart can leave the socket absent for several seconds. Keep
+	# retrying for the life of Cove; a cumulative attempt cap left input on the
+	# slow fallback forever after a sufficiently long reattach.
+	var connected := _connect_input_socket()
+	_input_retry = 0.0 if connected else 0.25
+
+
+func _poll_input_socket(delta: float) -> void:
+	if _sock == null or _input_socket_connected():
+		return
+	_input_retry -= delta
+	if _input_retry <= 0.0:
+		_try_connect_sock()
+
+
+func _connect_input_socket() -> bool:
+	return bool(_sock.call("connect_to", "%s/input.sock" % DIR))
+
+
+func _input_socket_connected() -> bool:
+	return bool(_sock.call("is_connected"))
+
+
+func _input_has_method(method: StringName) -> bool:
+	return _sock.has_method(method)
+
+
+func _call_input_once(method: StringName, args: Array) -> bool:
+	return bool(_sock.callv(method, args))
+
+
+func _call_input(method: StringName, args: Array = []) -> bool:
+	if _sock == null or not _input_has_method(method):
+		return false
+	if _input_socket_connected() and _call_input_once(method, args):
+		return true
+	# is_connected() only knows that it owns an fd; the peer can have gone away.
+	# A failed write closes that stale fd, so reconnect and retry the action once.
+	_try_connect_sock()
+	return _input_socket_connected() and _call_input_once(method, args)
+
+
+func _pty_fallback(pane: int, data: PackedByteArray) -> void:
+	# Legacy X10 mouse reports contain arbitrary bytes (including 0xff), so they
+	# cannot pass through a Godot String or argv. A temporary file also avoids a
+	# partial non-blocking pipe write for a large paste or file-drop payload.
+	_pty_fallback_seq += 1
+	var path := "%s/pty-input-%d-%d.bin" % [DIR, OS.get_process_id(), _pty_fallback_seq]
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return
+	f.store_buffer(data)
+	f.close()
+	var pid := _create_process(kitten_exe, ["@", "--to", kitty_socket,
+		"send-text", "--match", "id:%d" % pane, "--from-file", path], false)
+	if pid <= 0:
+		DirAccess.remove_absolute(path)
+		return
+	_child_mutex.lock()
+	_pty_fallback_files[pid] = path
+	_child_mutex.unlock()
 
 
 func _pty(pane: int, data: PackedByteArray) -> void:
 	if data.is_empty():
 		return
-	if _sock != null and _sock.call("is_connected"):
-		_sock.call("send_bytes", pane, data)
-	elif kitten_exe != "":
-		_create_process(kitten_exe, ["@", "--to", kitty_socket, "send-text",
-			"--match", "id:%d" % pane, data.get_string_from_utf8()], false)
+	if _call_input("send_bytes", [pane, data]):
+		return
+	if kitten_exe != "":
+		_pty_fallback(pane, data)
 
 
 func _focused_pane() -> int:
@@ -1680,8 +1862,7 @@ func _paste_focused() -> void:
 
 func _spawn_terminal() -> void:
 	# Prefer the persistent socket (no kitten process -> much snappier).
-	if _sock != null and _sock.call("is_connected"):
-		_sock.call("spawn")
+	if _call_input("spawn"):
 		return
 	if kitten_exe == "":
 		return
@@ -1692,7 +1873,7 @@ func _spawn_terminal() -> void:
 
 
 # A Cmd+N termling waits here until its first frame arrives, then we present it:
-# the camera zooms to frame it (Esc swoops back). It keeps its default cols/rows.
+# the camera zooms to frame it (Shift+Esc swoops back). It keeps its default cols/rows.
 # Reflowing it to fill the view made giant termlings (200x88 when zoomed in; 320x96
 # when sized to the window's pixels), and every frame of a big terminal is copied
 # through the rgba transport, so size is lag. Ids drop out once framed.
@@ -1856,6 +2037,13 @@ func _ease_zoom(goal: float, delta: float) -> void:
 	_cam.zoom = Vector2(z, z)
 
 
+# Pan the camera toward target. Weights are rate * delta, so a stalled frame asks
+# for more than 1: clamp it, or the camera overshoots, and a run of slow frames
+# compounds the overshoot until it flings the camera off the board.
+func _ease_cam(target: Vector2, weight: float) -> void:
+	_cam.position = _cam.position.lerp(target, clampf(weight, 0.0, 1.0))
+
+
 func _leave_present() -> void:
 	if _present_id == -1:
 		return
@@ -1874,14 +2062,14 @@ func _snap_track_cam(delta: float) -> void:
 	if _tracking_id == -1 or not _groups.has(_tracking_id):
 		return
 	var target: Vector2 = _groups[_tracking_id].terminal.global_position
-	_cam.position = _cam.position.lerp(target, maxf(_track_lock, 6.0 * delta))
+	_ease_cam(target, maxf(_track_lock, 6.0 * delta))
 
 
 func _snap_present_cam(delta: float) -> void:
 	if _present_id == -1 or not _groups.has(_present_id):
 		return
 	var target: Vector2 = _groups[_present_id].terminal.global_position
-	_cam.position = _cam.position.lerp(target, maxf(_present_lock, 6.0 * delta))
+	_ease_cam(target, maxf(_present_lock, 6.0 * delta))
 
 
 # Camera zoom at which g's terminal spans VIEW_FILL of the window. onscreen_size()
@@ -1916,9 +2104,9 @@ func _resize_group(g: Node2D, dir: int) -> void:
 	var nr := clampi(t.rows + dir * 3, 6, 200)
 	if nc == t.cols and nr == t.rows:
 		return
-	if _sock != null and _sock.call("is_connected"):
-		_sock.call("send_resize", g.term_id, nc, nr)
-	elif kitten_exe != "":
+	if _call_input("send_resize", [g.term_id, nc, nr]):
+		return
+	if kitten_exe != "":
 		_create_process(kitten_exe, ["@", "--to", kitty_socket, "resize-os-window",
 			"--match", "id:%d" % t.pane_id, "--unit", "cells",
 			"--width", str(nc), "--height", str(nr)], false)
@@ -1927,7 +2115,38 @@ func _resize_group(g: Node2D, dir: int) -> void:
 # Send `lines` of scroll to a terminal. If the app is grabbing the mouse (vim,
 # less, htop, most agent TUIs) forward wheel events over the fast pty socket so
 # it scrolls its own view. Otherwise scroll kitty's scrollback buffer via remote
-# control (slower, but this is the only path that moves shell history).
+# control. The persistent socket keeps high-resolution gestures ordered and
+# coalesces them on kitty's main thread.
+func _reset_scroll_accumulator() -> void:
+	_scroll_accum = 0.0
+	_scroll_target = -1
+	_scroll_sign = 0
+
+
+func _scroll_steps(target: int, delta: float) -> int:
+	var direction := int(signf(delta))
+	if target != _scroll_target or (direction != 0 and direction != _scroll_sign):
+		_scroll_accum = 0.0
+	_scroll_target = target
+	if direction != 0:
+		_scroll_sign = direction
+	_scroll_accum += delta
+	var steps := int(_scroll_accum)
+	_scroll_accum -= steps
+	return steps
+
+
+func _send_history_scroll(pane: int, lines: int) -> bool:
+	if lines == 0 or _sock == null or not _input_has_method("send_raw"):
+		return false
+	var msg := PackedByteArray()
+	msg.resize(13)
+	msg[0] = 7   # kitty/cove.c MSG_SCROLL
+	msg.encode_u64(1, pane)
+	msg.encode_s32(9, lines)
+	return _call_input("send_raw", [msg])
+
+
 func _scroll_terminal(g: Node2D, up: bool, lines: int) -> void:
 	var t = g.terminal
 	var pane: int = t.pane_id
@@ -1953,6 +2172,8 @@ func _scroll_terminal(g: Node2D, up: bool, lines: int) -> void:
 		for _i in mini(lines, 10):   # cap the burst a fast flick can emit
 			out.append_array(wheel)
 		_pty(pane, out)
+	elif _send_history_scroll(pane, (1 if up else -1) * mini(lines, 10)):
+		return
 	elif kitten_exe != "":
 		# `<n>l` scrolls down, `<n>l-` scrolls up (toward older lines).
 		var amount := "%dl%s" % [mini(lines, 10), "-" if up else ""]
@@ -2072,8 +2293,11 @@ func _load_durable() -> void:
 		return
 	var d = JSON.parse_string(f.get_as_text())
 	f.close()
-	if typeof(d) != TYPE_DICTIONARY:
-		return
+	if typeof(d) == TYPE_DICTIONARY:
+		_apply_durable(d)
+
+
+func _apply_durable(d: Dictionary) -> void:
 	for sess in d.get("by_session", {}):
 		var rec = d["by_session"][sess]
 		if typeof(rec) != TYPE_DICTIONARY:
@@ -2084,6 +2308,12 @@ func _load_durable() -> void:
 			_pos_by_session[sess] = rec["pos"]
 		if rec.get("zone", null) != null:
 			_zone_by_session[sess] = str(rec["zone"])
+		if bool(rec.get("gc", false)):
+			_gc_term_mark[sess] = true
+		if rec.get("used", null) != null:
+			_gc_term_used[sess] = float(rec["used"])
+		if rec.get("seen", null) != null:
+			_seen_by_session[sess] = int(rec["seen"])
 	var bc = d.get("by_critter", {})
 	if typeof(bc) == TYPE_DICTIONARY:
 		for k in bc:
@@ -2091,8 +2321,18 @@ func _load_durable() -> void:
 
 
 func _write_durable() -> void:
+	var by := _durable_by_session(int(Time.get_unix_time_from_system()))
+	var f := FileAccess.open(USER_LAYOUT, FileAccess.WRITE)
+	if f:
+		f.store_string(JSON.stringify({"by_session": by, "by_critter": _zone_by_critter}))
+		f.close()
+
+
+func _durable_by_session(now: int) -> Dictionary:
 	# Start from everything we already know (so sessions not present this run — e.g.
 	# a detached termling — are never dropped), then refresh from the live groups.
+	# "seen" stamps every session on the board, so after a reboot a restore can
+	# tell which termlings were live at the crash, spawned children included.
 	var by := {}
 	for sess in _name_by_session:
 		by[sess] = {"name": _name_by_session[sess]}
@@ -2103,6 +2343,14 @@ func _write_durable() -> void:
 	for sess in _zone_by_session:
 		var r: Dictionary = by.get(sess, {})
 		r["zone"] = _zone_by_session[sess]
+		by[sess] = r
+	for sess in _gc_term_mark:
+		var r: Dictionary = by.get(sess, {})
+		r["gc"] = true
+		by[sess] = r
+	for sess in _gc_term_used:
+		var r: Dictionary = by.get(sess, {})
+		r["used"] = _gc_term_used[sess]
 		by[sess] = r
 	for id in _groups:
 		var sess := str(_sessions.get(id, ""))
@@ -2116,11 +2364,13 @@ func _write_durable() -> void:
 		if _zone_of.has(id):
 			r["zone"] = str(_zone_of[id])
 			_zone_by_session[sess] = str(_zone_of[id])
+		_seen_by_session[sess] = now
 		by[sess] = r
-	var f := FileAccess.open(USER_LAYOUT, FileAccess.WRITE)
-	if f:
-		f.store_string(JSON.stringify({"by_session": by, "by_critter": _zone_by_critter}))
-		f.close()
+	for sess in _seen_by_session:
+		var r: Dictionary = by.get(sess, {})
+		r["seen"] = _seen_by_session[sess]
+		by[sess] = r
+	return by
 
 
 func _restore_after_reconcile() -> void:
@@ -2192,7 +2442,11 @@ func _create_process(path: String, args: PackedStringArray, open_console: bool =
 func _reap_children() -> void:
 	_child_mutex.lock()
 	for i in range(_child_pids.size() - 1, -1, -1):
-		if not OS.is_process_running(_child_pids[i]):
+		var pid: int = _child_pids[i]
+		if not OS.is_process_running(pid):
+			if _pty_fallback_files.has(pid):
+				DirAccess.remove_absolute(str(_pty_fallback_files[pid]))
+				_pty_fallback_files.erase(pid)
 			_child_pids.remove_at(i)
 	_child_mutex.unlock()
 
@@ -2242,7 +2496,11 @@ func _ls_loop() -> void:
 		# Agent/idle/tool state is safety-sensitive and stays at one-second latency.
 		# lsof supplies only cwd data and dominates this poll's cost, so cache it.
 		var pout := []
-		var ps_status := OS.execute("/bin/ps", ["-Ao", "pid=,ppid=,command="], pout, false)
+		# Process argv is an arbitrary byte vector on Unix. In the C locale macOS
+		# ps escapes non-ASCII bytes (M-.../^...) instead of passing them through
+		# to OS.execute's UTF-8 String conversion.
+		var ps_status := OS.execute("/usr/bin/env", ["LC_ALL=C", "/bin/ps", "-Ao",
+			"pid=,ppid=,command="], pout, false)
 		var ptxt: String = pout[0] if pout.size() > 0 else ""
 		if ps_status == 0 and not ptxt.is_empty():
 			sess_info = _scan_sessions(ptxt, cwd_cache)
@@ -2624,7 +2882,7 @@ func _apply_agent_state() -> void:
 	# one-shot camera pan to a terminal that needs input (only if not following)
 	if _pan_once != -1 and _tracking_id == -1 and _groups.has(_pan_once):
 		var tp: Vector2 = _groups[_pan_once].terminal.global_position
-		_cam.position = _cam.position.lerp(tp, 5.0 * get_process_delta_time())
+		_ease_cam(tp, 5.0 * get_process_delta_time())
 		if _cam.position.distance_to(tp) < 24.0:
 			_pan_once = -1
 
@@ -3157,7 +3415,10 @@ func _exec_command(c: Dictionary) -> String:
 					var tr = _bd_term_rect(_bd_term_key(ng.term_id))
 					var nr: Rect2 = tr if tr != null else Rect2(ng.position, Vector2.ZERO)
 					bc["near_pos"] = [nr.end.x + 60.0, nr.position.y]
-			return _bd_command(bc)
+			var err := _bd_command(bc)
+			if err == "" and str(bc.get("op", "")) == "update":
+				_gc_touch(_bd_lookup(str(bc.get("id", bc.get("name", "")))))
+			return err
 		"spawn_place":
 			# An agent launched this kitty window for a child termling (cove_mcp's
 			# spawn): put it in its frame the moment it shows up, not wherever new
@@ -5206,6 +5467,7 @@ const BD_HELP := """Board keys work while no termling has focus: click empty gro
   ⌘Z undo   ⇧⌘Z redo   ⌘A select all   ⌘D duplicate   ⌘C ⌘X ⌘V copy/cut/paste
   ⌘G group   ⇧⌘G ungroup   ⌫ delete   arrows nudge (⇧ ×10)   ↵ edit text
   ] to front   [ to back   ⌥] forward   ⌥[ backward   ⇧H ⇧V flip   ⇧L lock
+  ⇧G auto-delete when unused (⇧⌘G on the focused termling; right-click ground to restore or set the delay)
   ⇧1 zoom to fit   ⇧2 zoom to selection   ⇧0 zoom to 100%   ⌘= ⌘- zoom
   ⇧. ⇧, rotate 15° (⇧⌥ for 1°)   ⌘⌥G frame the selection   ⌘U insert image
   ⌥A ⌥H ⌥D align left/centre/right   ⌥W ⌥V ⌥S align top/middle/bottom
@@ -5533,6 +5795,7 @@ func _bd_new(type: String) -> Dictionary:
 func _bd_add(s: Dictionary) -> void:
 	_bd_dirty = true
 	var id := str(s["id"])
+	_gc_touch(id)
 	if not _bd_by_id.has(id):
 		_bd_forget_term_fallbacks(id)
 	_bd_shapes.append(s)
@@ -7439,6 +7702,8 @@ func _bd_draw_shape(ci: CanvasItem, s: Dictionary) -> void:
 			_bd_draw_free(ci, s)
 	if rot != 0.0:
 		ci.draw_set_transform_matrix(Transform2D.IDENTITY)
+	if bool(s.get("gc", false)):
+		_gc_draw_badge(ci, s)
 	_bd_alpha = 1.0
 
 
@@ -7777,6 +8042,8 @@ func _bd_key(ev: InputEventKey) -> bool:
 				_bd_flip(false)
 			KEY_L:
 				_bd_toggle_lock()
+			KEY_G:
+				_bd_toggle_gc()
 			KEY_D:
 				_bd_set_tool("highlight")
 			KEY_SLASH:
@@ -8457,7 +8724,8 @@ func _bd_save_now() -> void:
 				var id := _bd_term_id(key)
 				if id != -1:
 					s["bind_" + e] = _bd_term_key(id)
-	var txt := JSON.stringify({"version": 1, "next": _bd_next, "ui_scale": _bd_ui_user, "shapes": _bd_shapes})
+	var txt := JSON.stringify({"version": 1, "next": _bd_next, "ui_scale": _bd_ui_user, "shapes": _bd_shapes,
+		"used": _gc_used, "trash": _gc_trash, "gc_days": _gc_days})
 	for path in [BOARD_SAVE, BOARD_MIRROR]:
 		_write_atomic(path, txt)
 
@@ -8476,7 +8744,13 @@ func _bd_load() -> bool:
 	_bd_shapes = d["shapes"]
 	_bd_next = int(d.get("next", 1))
 	_bd_ui_user = clampf(float(d.get("ui_scale", 1.0)), 0.6, 2.5)
+	var used = d.get("used", {})
+	_gc_used = used if typeof(used) == TYPE_DICTIONARY else {}
+	var trash = d.get("trash", [])
+	_gc_trash = trash if typeof(trash) == TYPE_ARRAY else []
+	_gc_days = clampf(float(d.get("gc_days", GC_DAYS_DEFAULT)), 1.0, 365.0)
 	_bd_reindex()
+	_gc_start_clocks()
 	return true
 
 
@@ -9030,6 +9304,8 @@ func _bd_context_menu(p: Vector2, screen: Vector2) -> void:
 		m.add_item("Flip horizontal   ⇧H", 9)
 		m.add_item("Flip vertical   ⇧V", 10)
 		m.add_item("Lock / unlock   ⇧L", 11)
+		m.add_check_item("Auto-delete when unused   ⇧G", 60)
+		m.set_item_checked(m.get_item_index(60), _bd_sel.all(func(i): return bool(_bd_by_id[i].get("gc", false))))
 		m.add_item("Rotate 15°   ⇧.", 18)
 		m.add_item("Frame selection   ⌘⌥G", 19)
 		if _bd_sel.size() >= 2:
@@ -9046,6 +9322,10 @@ func _bd_context_menu(p: Vector2, screen: Vector2) -> void:
 	_fs_menu_items(m)
 	m.add_item("Calendar", 40)
 	m.add_item("Reminders", 41)
+	m.add_separator()
+	if not _gc_trash.is_empty():
+		m.add_item("Restore auto-deleted (%d)" % _gc_trash.size(), 61)
+	m.add_submenu_node_item("Auto-delete after", _gc_days_menu())
 	m.add_separator()
 	m.add_item("Paste   ⌘V", 13)
 	m.add_item("Select all   ⌘A", 14)
@@ -9085,6 +9365,10 @@ func _bd_menu_pick(id: int) -> void:
 			_bd_flip(false)
 		11:
 			_bd_toggle_lock()
+		60:
+			_bd_toggle_gc()
+		61:
+			_gc_restore_trash()
 		12:
 			_bd_delete_selected()
 		13:
@@ -9696,6 +9980,7 @@ func _bd_unfurl_poll() -> void:
 
 
 func _bd_bm_open(s: Dictionary) -> void:
+	_gc_touch(str(s["id"]))
 	var url := str(s.get("url", ""))
 	if _bd_is_url(url):
 		OS.shell_open(url)
@@ -12436,3 +12721,290 @@ func _fs_draw_ghost(o: CanvasItem) -> void:
 	o.draw_style_box(_cal_box(Color(0.15, 0.16, 0.19, 0.95), true, 5.0), r)
 	o.draw_string(f, Vector2(r.position.x + 10.0 / z, r.get_center().y + f.get_ascent(px) * 0.38), name,
 		HORIZONTAL_ALIGNMENT_LEFT, -1, px, BD_BM_TEXT)
+
+
+# --- garbage collector -----------------------------------------------------------
+# Objects you mark (⇧G on board shapes, ⇧⌘G on the focused termling) are deleted
+# once nothing has used them for _gc_days. A shape is used when it's created,
+# selected, edited, opened or changed by an agent; a termling when you focus it
+# or its agent starts or ends a turn. Collected shapes wait in the trash for
+# GC_TRASH_DAYS (right-click empty ground to restore them). A termling is only
+# collected while idle, nothing running and nobody waiting on it, and its screen
+# is saved first. Locked shapes are never collected.
+
+const GcBadge := preload("res://scripts/GcBadge.gd")
+const GC_DAYS_DEFAULT := 14.0
+const GC_DAY_CHOICES := [1, 3, 7, 14, 30]
+const GC_TRASH_DAYS := 7.0
+const GC_CHECK_S := 600.0        # how often to look for due objects
+const GC_TOUCH_S := 60.0         # coalesce "used" updates, and the saves they cause
+const GC_BADGE := 18.0           # hourglass height on the board, world units
+const GC_SCREENS := "user://trash"
+var _gc_days := GC_DAYS_DEFAULT
+var _gc_used := {}               # shape id -> unix time it was last used
+var _gc_trash := []              # [{"shape": {...}, "at": unix time collected}]
+var _gc_accum := GC_CHECK_S - 60.0   # first pass a minute in, once the ls poll has run
+var _gc_touch_accum := 0.0
+
+
+func _gc_now() -> float:
+	return Time.get_unix_time_from_system()
+
+
+# Shapes from before the collector, or with no record, start their clock now
+# instead of counting as unused forever.
+func _gc_start_clocks() -> void:
+	var now := _gc_now()
+	for s in _bd_shapes:
+		var id := str(s["id"])
+		if not _gc_used.has(id):
+			_gc_used[id] = now
+
+
+func _gc_touch(id: String) -> void:
+	if id == "":
+		return
+	var now := _gc_now()
+	if now - float(_gc_used.get(id, 0.0)) >= GC_TOUCH_S:
+		_gc_used[id] = now
+		if _bd_save_in < 0.0:
+			_bd_save_in = 5.0
+
+
+func _gc_frac(used: float, now: float) -> float:
+	return clampf((now - used) / (_gc_days * 86400.0), 0.0, 1.0)
+
+
+func _gc_tick(delta: float) -> void:
+	_gc_touch_accum += delta
+	if _gc_touch_accum >= 5.0:
+		_gc_touch_accum = 0.0
+		for i in _bd_sel:
+			_gc_touch(str(i))
+		if _bd_edit_id != "":
+			_gc_touch(_bd_edit_id)
+		if _focused_id != -1:
+			_gc_touch_term(_focused_id)
+		_gc_update_term_badges()
+	_gc_accum += delta
+	if _gc_accum >= GC_CHECK_S:
+		_gc_accum = 0.0
+		_gc_run()
+
+
+func _gc_run() -> void:
+	var now := _gc_now()
+	_gc_purge_trash(now)
+	for id in _gc_used.keys():   # shapes deleted by hand leave no record behind
+		if not _bd_by_id.has(id):
+			_gc_used.erase(id)
+	var gone := _gc_collect_board(now)
+	if not gone.is_empty():
+		_gc_log("auto-deleted %d board object(s) unused for %d+ days; right-click empty ground to restore" \
+			% [gone.size(), int(_gc_days)])
+	_gc_collect_terms(now)
+	_gc_update_term_badges()
+
+
+# --- board shapes
+
+func _bd_toggle_gc() -> void:
+	if _bd_sel.is_empty():
+		return
+	var on := false
+	for i in _bd_sel:
+		if not bool(_bd_by_id[i].get("gc", false)):
+			on = true
+	_bd_begin()
+	var now := _gc_now()
+	for i in _bd_sel:
+		if on:
+			_bd_by_id[i]["gc"] = true
+			_gc_used[str(i)] = now   # marking counts as a use: the clock starts now
+		else:
+			_bd_by_id[i].erase("gc")
+	_bd_commit()
+
+
+func _gc_draw_badge(ci: CanvasItem, s: Dictionary) -> void:
+	var r := _bd_bounds(s)
+	var c := Vector2(r.end.x - GC_BADGE * 0.6, r.position.y + GC_BADGE * 0.7)
+	var now := _gc_now()
+	GcBadge.draw_hourglass(ci, c, GC_BADGE, _gc_frac(float(_gc_used.get(str(s["id"]), now)), now))
+
+
+func _gc_collect_board(now: float) -> Array:
+	var limit := _gc_days * 86400.0
+	var doomed := []
+	for s in _bd_shapes:
+		var id := str(s["id"])
+		if bool(s.get("gc", false)) and not bool(s.get("locked", false)) \
+				and now - float(_gc_used.get(id, now)) >= limit:
+			doomed.append(id)
+	if doomed.is_empty():
+		return doomed
+	_bd_begin()
+	for id in doomed:
+		_gc_trash.append({"shape": _bd_by_id[id].duplicate(true), "at": now})
+		_gc_used.erase(id)
+	_bd_sel = _bd_sel.filter(func(x): return not doomed.has(x))
+	_bd_remove(doomed)
+	_bd_commit()
+	return doomed
+
+
+func _gc_purge_trash(now: float) -> void:
+	_gc_trash = _gc_trash.filter(func(e): return now - float(e.get("at", 0.0)) < GC_TRASH_DAYS * 86400.0)
+
+
+# Not an undoable step: undoing it would drop the shapes with the trash already empty.
+func _gc_restore_trash() -> void:
+	if _gc_trash.is_empty():
+		return
+	var now := _gc_now()
+	for e in _gc_trash:
+		var s: Dictionary = e["shape"]
+		if _bd_by_id.has(str(s["id"])):
+			continue
+		s.erase("gc")   # restoring it says you still want it
+		_bd_add(s)
+		_gc_used[str(s["id"])] = now
+	_gc_trash = []
+	_bd_save_in = 0.4
+
+
+func _gc_days_menu() -> PopupMenu:
+	var sub: PopupMenu = _bd_menu.get_node_or_null("gc_days") if _bd_menu else null
+	if sub == null:
+		sub = PopupMenu.new()
+		sub.name = "gc_days"
+		for i in GC_DAY_CHOICES.size():
+			var d: int = GC_DAY_CHOICES[i]
+			sub.add_radio_check_item("%d day%s" % [d, "" if d == 1 else "s"], i)
+		sub.id_pressed.connect(func(i):
+			_gc_days = float(GC_DAY_CHOICES[i])
+			_bd_dirty = true
+			_bd_save_in = 0.4)
+		_bd_menu.add_child(sub)
+	for i in GC_DAY_CHOICES.size():
+		sub.set_item_checked(i, is_equal_approx(_gc_days, float(GC_DAY_CHOICES[i])))
+	sub.content_scale_factor = _bd_ui_scale
+	return sub
+
+
+# --- termlings
+
+func _gc_session(id: int) -> String:
+	var sess := str(_sessions.get(id, ""))
+	return sess if sess != "" and _session_token(sess) == sess else ""
+
+
+func _gc_toggle_term(id: int) -> void:
+	var sess := _gc_session(id)
+	if sess == "":
+		push_warning("cove: termling %d's session isn't known yet; try again in a moment" % id)
+		return
+	if _gc_term_mark.has(sess):
+		_gc_term_mark.erase(sess)
+	else:
+		_gc_term_mark[sess] = true
+		_gc_term_used[sess] = _gc_now()
+	_gc_update_term_badges()
+
+
+func _gc_touch_term(id: int) -> void:
+	var sess := _gc_session(id)
+	if sess != "" and _gc_now() - float(_gc_term_used.get(sess, 0.0)) >= GC_TOUCH_S:
+		_gc_term_used[sess] = _gc_now()
+
+
+# The later of you focusing it and its agent starting or ending a turn.
+func _gc_term_last_used(sess: String, info: Dictionary) -> float:
+	var t := float(_gc_term_used.get(sess, 0.0))
+	var act: Array = info.get("act", [])
+	if act.size() >= 2:
+		t = maxf(t, float(act[1]))
+	return t if t > 0.0 else _gc_now()
+
+
+# Idle: nothing that collecting it would interrupt. A shell must sit at a bare
+# prompt; an agent's last hook must say its turn ended, with no tool running.
+# Anything unknown counts as busy.
+static func _gc_term_idle(info: Dictionary, attention: bool) -> bool:
+	if attention or str(info.get("remote_host", "")) != "":
+		return false
+	var agent := str(info.get("agent", ""))
+	if agent == "shell":
+		return bool(info.get("idle", false))
+	if agent == "" or bool(info.get("tool", false)):
+		return false
+	var act: Array = info.get("act", [])
+	return act.size() >= 2 and str(act[0]) == "idle"
+
+
+func _gc_update_term_badges() -> void:
+	var now := _gc_now()
+	for id in _groups:
+		var t = _groups[id].terminal
+		var sess := str(_sessions.get(id, ""))
+		var marked := sess != "" and _gc_term_mark.has(sess)
+		var frac := 0.0
+		if marked:
+			frac = _gc_frac(_gc_term_last_used(sess, _agents.get(t.pane_id, {})), now)
+		t.set_gc(marked, frac)
+
+
+func _gc_collect_terms(now: float) -> void:
+	var limit := _gc_days * 86400.0
+	for id in _groups.keys():
+		var sess := _gc_session(id)
+		if sess == "" or not _gc_term_mark.has(sess):
+			continue
+		var t = _groups[id].terminal
+		if t.page or t.remote:
+			continue
+		var info: Dictionary = _agents.get(t.pane_id, {})
+		if not _gc_term_idle(info, _attn_ids.has(id)) or now - _gc_term_last_used(sess, info) < limit:
+			continue
+		var label: String = t.custom_name if t.custom_name != "" else sess
+		var screen := _gc_save_screen(id, sess)
+		if screen == "":
+			_gc_log("kept termling \"%s\": couldn't save its screen first" % label)
+			continue
+		if _delete_term(id):
+			_gc_term_mark.erase(sess)
+			_gc_term_used.erase(sess)
+			_gc_log("auto-deleted termling \"%s\" (%s) unused for %d+ days; its screen is in %s" \
+				% [label, sess, int(_gc_days), screen])
+
+
+# The termling's whole scrollback, with colours, into the trash folder.
+func _gc_save_screen(id: int, sess: String) -> String:
+	var pane: int = _groups[id].terminal.pane_id
+	if kitten_exe == "" or kitty_socket == "" or pane == 0:
+		return ""
+	var out := []
+	var rc := OS.execute(kitten_exe, ["@", "--to", kitty_socket, "get-text", "--ansi", "--extent", "all",
+		"--match", "id:%d" % pane], out, false)
+	if rc != 0 or out.is_empty() or str(out[0]) == "":
+		return ""
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(GC_SCREENS))
+	var path := "%s/%s-%s.ansi" % [GC_SCREENS, sess, Time.get_datetime_string_from_system().replace(":", "-")]
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return ""
+	f.store_string(str(out[0]))
+	f.close()
+	return ProjectSettings.globalize_path(path)
+
+
+# Same log as run.sh's kitty supervisor, so everything that vanished is in one place.
+func _gc_log(msg: String) -> void:
+	var line := "cove: %s %s" % [Time.get_datetime_string_from_system(false, true), msg]
+	print(line)
+	var path := OS.get_environment("HOME") + "/Library/Logs/cove.log"
+	var f := FileAccess.open(path, FileAccess.READ_WRITE if FileAccess.file_exists(path) else FileAccess.WRITE)
+	if f:
+		f.seek_end()
+		f.store_line(line)
+		f.close()

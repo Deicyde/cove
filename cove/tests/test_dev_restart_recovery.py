@@ -31,6 +31,10 @@ class DevRestartRecoveryTest(unittest.TestCase):
         self.assertNotIn('/tmp/cove', source)
         target = repo / 'cove' / name
         self.write_executable(target, source)
+        self.write_executable(
+            repo / 'cove' / 'launch-context.sh',
+            (REPO_ROOT / 'cove' / 'launch-context.sh').read_text(),
+        )
         helper = repo / 'cove' / 'cove-iosurface.sh'
         self.write_executable(helper, (REPO_ROOT / 'cove' / 'cove-iosurface.sh').read_text())
         probe = repo / 'cove' / 'scripts' / 'IOSurfaceProbe.gd'
@@ -89,6 +93,7 @@ class DevRestartRecoveryTest(unittest.TestCase):
                     'GODOT': str(godot),
                     'HOME': str(root / 'home'),
                     'PATH': f'{fake_bin}:/usr/bin:/bin',
+                    'COVE_SANDBOX_EXEC': '/usr/bin/true',
                     'SHELL': '/bin/zsh',
                 },
                 text=True,
@@ -117,6 +122,7 @@ class DevRestartRecoveryTest(unittest.TestCase):
 
     def run_cold_start(
         self, *, kitty_answers: bool, ready_polls: int | None = None,
+        sandbox_rejected: bool = False,
         iosurface: str | None = None,
     ) -> dict:
         """Run dev.sh with no sessions, so it cold-starts a fake kitty.
@@ -188,6 +194,13 @@ while True:
         self.write_executable(fake_bin / 'pkill', '#!/bin/sh\nexit 1\n')
         self.write_executable(fake_bin / 'ps', '#!/bin/sh\nexit 0\n')
         self.write_executable(fake_bin / 'sleep', '#!/bin/sh\nexec /bin/sleep 0.01\n')
+        sandbox_exec = '/usr/bin/true'
+        if sandbox_rejected:
+            sandbox_exec = str(fake_bin / 'sandbox-exec')
+            self.write_executable(
+                Path(sandbox_exec),
+                '#!/bin/sh\necho "sandbox-exec: sandbox_apply: Operation not permitted" >&2\nexit 71\n',
+            )
         (repo / 'cove' / '.godot').mkdir(parents=True)
         (repo / 'cove' / '.godot' / 'extension_list.cfg').write_text('res://cove.gdextension\n')
         runtime.parent.mkdir(parents=True)
@@ -199,6 +212,7 @@ while True:
             'KITTY_PID': str(kitty_pid),
             'KITTY_IOSURFACE': str(root / 'kitty-iosurface'),
             'PATH': f'{fake_bin}:/usr/bin:/bin',
+            'COVE_SANDBOX_EXEC': sandbox_exec,
             'PROBE_CALLED': str(probe_called),
             'RUNTIME': str(runtime),
             'SHELL': '/bin/zsh',
@@ -221,6 +235,17 @@ while True:
             'godot_started': godot_started, 'remote_started': remote_started,
             'kitty_iosurface': root / 'kitty-iosurface', 'probe_called': probe_called,
         }
+
+    def test_dev_refuses_nested_sandbox_before_starting_anything(self) -> None:
+        run = self.run_cold_start(kitty_answers=True, sandbox_rejected=True)
+        result = run['result']
+
+        self.assertEqual(result.returncode, 71)
+        self.assertIn('refusing to launch kitty', result.stderr)
+        self.assertIn('Nothing was stopped', result.stderr)
+        self.assertFalse(run['kitty_pid'].exists())
+        self.assertFalse(run['godot_started'].exists())
+        self.assertFalse(run['remote_started'].exists())
 
     def kill_fake_kitty(self, kitty_pid: Path) -> None:
         if kitty_pid.exists():
@@ -511,6 +536,7 @@ print(json.dumps([{{"tabs": [{{"windows": windows}}]}}], indent=2, sort_keys=Tru
                 'OTHER_GODOT_PID': str(other_godot.pid),
                 'APP': str(repo / 'cove'),
                 'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'COVE_SANDBOX_EXEC': '/usr/bin/true',
                 'PROBE_CALLED': str(root / 'probe-called'),
                 'LAUNCH_TIMES_OUT': '1' if launch_times_out else '0',
                 'LAUNCH_LANDS_LATE': '1' if launch_lands_late else '0',

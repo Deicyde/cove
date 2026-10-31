@@ -73,6 +73,10 @@ cleanup_startup() {
 [ -e "$KITTY" ] || { echo "kitty not built ($KITTY). Run cove/dev.sh first." >&2; exit 1; }
 [ -x "$KITTEN" ] || { echo "kitten not built ($KITTEN)" >&2; exit 1; }
 [ -x "$ABDUCO" ] || { echo "abduco not found at $ABDUCO" >&2; exit 1; }
+# Refuse before taking the launch lock, saving screens, or stopping anything.
+# shellcheck disable=SC1091
+source "$REPO/cove/launch-context.sh"
+cove_require_clean_launch_context "$REPO" "cove/reload-kitty.sh"
 # One launch at a time (run.sh and dev.sh take the same lock; dev.sh passes it
 # down when it hands off to us).
 if [ "${COVE_LAUNCH_LOCK_HELD:-}" != 1 ]; then

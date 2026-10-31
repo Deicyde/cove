@@ -24,6 +24,9 @@ ABDUCO="$APP/bin/abduco"
 [ -x "$KITTEN" ] || { echo "kitten not built ($KITTEN)" >&2; exit 1; }
 command -v "$GODOT" >/dev/null 2>&1 || { echo "godot not found; set GODOT=/path/to/godot" >&2; exit 1; }
 [ -x "$ABDUCO" ] || { echo "abduco not found at $ABDUCO" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "$APP/launch-context.sh"
+cove_require_clean_launch_context "$REPO" "cove/dev.sh"
 exec 9>/tmp/cove-launch.lock
 if ! /usr/bin/lockf -s -t 0 9; then
     echo "another Cove launch is already in progress" >&2

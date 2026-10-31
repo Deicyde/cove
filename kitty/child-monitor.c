@@ -2116,7 +2116,11 @@ write_to_peer(Peer *peer) {
         peer->write.failed = true;
     } else if (n < 0) {
         if (errno != EINTR) {
-            log_error("write() to peer socket failed with error: %s", strerror(errno));
+            // A remote-control client can time out or exit while its response
+            // is being queued (common during a multi-session Cove reattach).
+            // EPIPE is a normal disconnect; still retire the peer, without
+            // flooding the application log.
+            if (errno != EPIPE) log_error("write() to peer socket failed with error: %s", strerror(errno));
             peer->write.used = 0;
             peer->write.failed = true;
         }
