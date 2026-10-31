@@ -24,5 +24,13 @@ never move the user's termlings or change focus. The 'cove' MCP tools, for when 
   If you were spawned by another agent (whoami 'parent'), report() to it.
 Nothing is required at startup."
 
+# The board conventions every termling shares, Claude and Codex alike. Claude
+# and Codex both run this through the ~/.claude/hooks symlink, so resolve it to
+# find the repo's copy.
+COVE_MD="$(dirname "$(readlink -f "$0")")/../COVE.md"
+[ -r "$COVE_MD" ] && MSG="$MSG
+
+$(cat "$COVE_MD")"
+
 jq -cn --arg m "$MSG" \
   '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $m}}'
