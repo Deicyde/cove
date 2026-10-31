@@ -150,6 +150,7 @@ var _saved := {}             # layout restored from the previous run's state.jso
 var _sessions := {}          # term_id -> abduco session name (once learned from ls)
 var _pos_by_session := {}    # session -> [x,y], to restore across a kitty restart
 var _name_by_session := {}   # session -> custom name, ditto
+var _seen_by_session := {}   # session -> unix time it was last on the board: after a reboot, what was live
 var _pos_restored := {}      # term_id -> true once its position has been restored
 var _win_rect := {}          # last-known *windowed* os-window rect {pos,size} (not while maximized)
 
@@ -1973,8 +1974,11 @@ func _load_durable() -> void:
 		return
 	var d = JSON.parse_string(f.get_as_text())
 	f.close()
-	if typeof(d) != TYPE_DICTIONARY:
-		return
+	if typeof(d) == TYPE_DICTIONARY:
+		_apply_durable(d)
+
+
+func _apply_durable(d: Dictionary) -> void:
 	for sess in d.get("by_session", {}):
 		var rec = d["by_session"][sess]
 		if typeof(rec) != TYPE_DICTIONARY:
@@ -1985,6 +1989,8 @@ func _load_durable() -> void:
 			_pos_by_session[sess] = rec["pos"]
 		if rec.get("zone", null) != null:
 			_zone_by_session[sess] = str(rec["zone"])
+		if rec.get("seen", null) != null:
+			_seen_by_session[sess] = int(rec["seen"])
 	var bc = d.get("by_critter", {})
 	if typeof(bc) == TYPE_DICTIONARY:
 		for k in bc:
@@ -1992,8 +1998,18 @@ func _load_durable() -> void:
 
 
 func _write_durable() -> void:
+	var by := _durable_by_session(int(Time.get_unix_time_from_system()))
+	var f := FileAccess.open(USER_LAYOUT, FileAccess.WRITE)
+	if f:
+		f.store_string(JSON.stringify({"by_session": by, "by_critter": _zone_by_critter}))
+		f.close()
+
+
+func _durable_by_session(now: int) -> Dictionary:
 	# Start from everything we already know (so sessions not present this run — e.g.
 	# a detached termling — are never dropped), then refresh from the live groups.
+	# "seen" stamps every session on the board, so after a reboot a restore can
+	# tell which termlings were live at the crash, spawned children included.
 	var by := {}
 	for sess in _name_by_session:
 		by[sess] = {"name": _name_by_session[sess]}
@@ -2017,11 +2033,13 @@ func _write_durable() -> void:
 		if _zone_of.has(id):
 			r["zone"] = str(_zone_of[id])
 			_zone_by_session[sess] = str(_zone_of[id])
+		_seen_by_session[sess] = now
 		by[sess] = r
-	var f := FileAccess.open(USER_LAYOUT, FileAccess.WRITE)
-	if f:
-		f.store_string(JSON.stringify({"by_session": by, "by_critter": _zone_by_critter}))
-		f.close()
+	for sess in _seen_by_session:
+		var r: Dictionary = by.get(sess, {})
+		r["seen"] = _seen_by_session[sess]
+		by[sess] = r
+	return by
 
 
 func _restore_after_reconcile() -> void:
