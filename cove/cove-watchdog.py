@@ -27,6 +27,7 @@ with nothing to do writes nothing.
 import fcntl
 import json
 import os
+import shutil
 import signal
 import struct
 import subprocess
@@ -147,10 +148,16 @@ def flush_and_repaint(tty_path, pids):
 def respawn_window(sess):
     kitten = os.environ.get("COVE_KITTEN", "")
     sock = os.environ.get("COVE_KITTY_SOCKET", "unix:/tmp/cove-kitty")
-    abduco = "/opt/homebrew/bin/abduco"
+    # The patched abduco (build-abduco.sh), with run.sh's fallback.
+    abduco = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "abduco")
+    if not os.access(abduco, os.X_OK):
+        abduco = shutil.which("abduco")
     shell = os.environ.get("SHELL", "/bin/zsh")
     if not kitten or not os.path.exists(kitten):
         log("respawn %s skipped: no kitten (COVE_KITTEN=%r)" % (sess, kitten))
+        return
+    if not abduco:
+        log("respawn %s skipped: no abduco" % sess)
         return
     subprocess.run(
         [kitten, "@", "--to", sock, "launch", "--type=os-window",
