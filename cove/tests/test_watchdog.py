@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 WATCHDOG = Path(os.environ.get('COVE_WATCHDOG', Path(__file__).resolve().parents[1] / 'cove-watchdog.py'))
@@ -42,6 +46,37 @@ class ClassifyTest(unittest.TestCase):
 
         self.assertEqual(clients, [(200, sess)])
         self.assertEqual(masters, {sess: 300})
+
+
+class RespawnTest(unittest.TestCase):
+    # A missing binary leaves a "Failed to launch child" window that can't be
+    # deleted, and the session it was meant to reattach stays hidden.
+    def respawn(self, with_abduco: bool) -> tuple[Path, mock.Mock]:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        shutil.copy(WATCHDOG, tmp / 'cove-watchdog.py')
+        abduco = tmp / 'bin' / 'abduco'
+        if with_abduco:
+            abduco.parent.mkdir()
+            abduco.write_text('#!/bin/sh\n')
+            abduco.chmod(0o755)
+        spec = importlib.util.spec_from_file_location('cove_watchdog_tmp', tmp / 'cove-watchdog.py')
+        wd = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wd)
+        with mock.patch.dict(os.environ, {'COVE_KITTEN': sys.executable}), \
+                mock.patch.object(wd.shutil, 'which', return_value=None), \
+                mock.patch.object(wd.subprocess, 'run') as run, \
+                mock.patch.object(wd, 'log'):
+            wd.respawn_window('cove-1')
+        return abduco, run
+
+    def test_respawn_uses_the_cove_abduco(self) -> None:
+        abduco, run = self.respawn(with_abduco=True)
+        self.assertIn(str(abduco), run.call_args.args[0])
+
+    def test_no_abduco_opens_no_window(self) -> None:
+        _, run = self.respawn(with_abduco=False)
+        run.assert_not_called()
 
 
 if __name__ == '__main__':
